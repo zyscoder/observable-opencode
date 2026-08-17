@@ -239,7 +239,7 @@ export OPENCODE_MODELS_FETCH_TIMEOUT_MS=2500
 | `OPENCODE_CASE_TRACE_DIR` | 推荐 | Trace 根目录；未设置时使用 OpenCode 数据目录下的 `case-traces/`。 |
 | `OPENCODE_CASE_ID` | 推荐 | case 的稳定标识，建议使用 benchmark case ID。 |
 | `OPENCODE_CASE_TRACE_QUIET` | 否 | 设为 `1` 隐藏退出时的 Trace 路径提示，不影响落盘。 |
-| `OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS` | 否 | TUI 退出后等待 worker 清理资源并完成 journal close 的最大时长（毫秒）；启用 Trace 时默认 `3600000`，未启用时默认 `5000`。它不限制 Agent 或 LLM 的执行时长。 |
+| `OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS` | 否 | TUI worker 完成资源清理后，等待独立 journal-close RPC 的最大时长（毫秒）；启用 Trace 时默认 `3600000`，未启用时默认 `5000`。worker 资源清理另有固定 `5000` 毫秒上限；该变量不限制 materializer、Agent 或 LLM 的执行时长。 |
 | `OPENCODE_SERVER_PASSWORD` | HTTP 推荐 | 为 `opencode serve` 启用 Basic Auth，用户名固定为 `opencode`。 |
 
 高级变量 `OPENCODE_CASE_TRACE_MAX_FIELD_LENGTH` 控制结构化记录中内联字段的预览长度，
@@ -306,12 +306,15 @@ worker 先释放 Session、Tool、MCP 和内部 Server，只向当前 segment jo
 最后发布 root `trace.json`。完整 Causal IR、provenance 和 legacy projection 不在 Agent worker 的
 退出堆内构造。
 
-`OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS` 只限制 worker 资源清理和 journal close，启用 Trace 时默认
-`3600000`，未启用时默认 `5000`。它不是 LLM、Tool 或整个 case 的执行超时；worker close 完成
-后会立即进入独立 materialization。确需覆盖时可使用：
+parent 首先等待 worker 释放 Session、Tool、MCP 和内部 Server；这一步有独立且不可配置的
+`5000` 毫秒清理上限。清理成功后才调用 journal-close RPC。`OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS`
+只限制这次 journal close，启用 Trace 时默认 `3600000`，未启用时默认 `5000`。它不是 LLM、
+Tool 或整个 case 的执行超时。journal close 完成后 parent 终止 worker，再启动独立 materializer；
+materializer 不受该变量限制，TUI 会等待其子进程完成，但 materializer 失败仍只降低 observability。
+确需覆盖 journal-close 上限时可使用：
 
 ```bash
-# 允许复杂长 session 在 Ctrl-C 后最多用两小时完成资源清理和 journal close
+# 允许复杂长 session 在 Ctrl-C 后最多用两小时完成 journal close
 export OPENCODE_TUI_SHUTDOWN_TIMEOUT_MS=7200000
 ```
 

@@ -864,6 +864,100 @@ test("writes POSIX manifest paths and resolves them safely with Win32 path behav
   }
 })
 
+test("rejects symlinked protected trace components without reading or writing outside the case root", async () => {
+  for (const attack of [
+    "session.json",
+    "segment-directory",
+    "segment.json",
+    "records.jsonl",
+    "artifacts",
+    "index.sqlite",
+    "legacy-trace.json",
+  ] as const) {
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), `opencode-trace-symlink-${attack.replace(".", "-")}-`))
+    try {
+      const segment = openTraceSegment({
+        rootDir: traceRoot,
+        logicalCaseID: "symlink-case",
+        sessionID: "ses_symlink",
+        runID: "run_symlink",
+      })
+      await writeClosedSegment(segment, {
+        runID: "run_symlink",
+        marker: "protected",
+        caseID: "symlink-case",
+        terminal: { manifest: { status: "success", run_id: "run_symlink" }, metrics: {} },
+      })
+
+      const victim =
+        attack === "session.json"
+          ? segment.sessionFile
+          : attack === "segment-directory"
+            ? segment.segmentDir
+            : path.join(segment.segmentDir, attack)
+      const outside = path.join(traceRoot, `outside-${attack.replaceAll(".", "-")}`)
+      if (attack === "index.sqlite") await fs.writeFile(outside, "outside index bytes")
+      else await fs.rename(victim, outside)
+      await fs.symlink(outside, victim)
+      const outsideStats = await fs.stat(outside)
+      const outsideBefore = outsideStats.isDirectory() ? await treeHash(outside) : await sha256(outside)
+      const outputDir = path.join(traceRoot, "materialized")
+
+      expect(() => materializeTrace({ caseDir: segment.logicalRoot, outputDir }), attack).toThrow(/symbolic link/)
+      expect(await fileExists(outputDir), attack).toBe(false)
+      expect(outsideStats.isDirectory() ? await treeHash(outside) : await sha256(outside), attack).toBe(outsideBefore)
+
+      if (attack !== "legacy-trace.json") {
+        expect(
+          () =>
+            openTraceSegment({
+              rootDir: traceRoot,
+              logicalCaseID: "symlink-case",
+              sessionID: "ses_symlink",
+              runID: `run_after_${attack.replaceAll(".", "_")}`,
+            }),
+          attack,
+        ).toThrow(/symbolic link/)
+        expect(outsideStats.isDirectory() ? await treeHash(outside) : await sha256(outside), attack).toBe(
+          outsideBefore,
+        )
+      }
+    } finally {
+      await fs.rm(traceRoot, { recursive: true, force: true })
+    }
+  }
+})
+
+test("rejects symlinked publication directories without writing outside the case root", async () => {
+  for (const attack of [".derived", "partial"] as const) {
+    const label = attack.replace(/^\./, "")
+    const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), `opencode-publication-symlink-${label}-`))
+    try {
+      const segment = openTraceSegment({
+        rootDir: traceRoot,
+        logicalCaseID: "publication-symlink-case",
+        sessionID: "ses_publication_symlink",
+        runID: "run_publication_symlink",
+      })
+      await writeClosedSegment(segment, {
+        runID: "run_publication_symlink",
+        marker: "publication",
+        caseID: "publication-symlink-case",
+      })
+      const outside = path.join(traceRoot, `outside-${label}`)
+      await fs.mkdir(outside)
+      await fs.writeFile(path.join(outside, "sentinel"), "outside bytes")
+      await fs.symlink(outside, path.join(segment.logicalRoot, attack))
+      const outsideBefore = await treeHash(outside)
+
+      expect(() => materializeTrace({ caseDir: segment.logicalRoot }), attack).toThrow(/symbolic link/)
+      expect(await treeHash(outside), attack).toBe(outsideBefore)
+    } finally {
+      await fs.rm(traceRoot, { recursive: true, force: true })
+    }
+  }
+})
+
 test("globally serializes concurrent late bindings without duplicate session roots", async () => {
   const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-global-bind-"))
   try {
@@ -2116,6 +2210,50 @@ test("publishes each derived compatibility set through one atomic generation ind
   } finally {
     if (previousFailure === undefined) delete process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP
     else process.env.OPENCODE_TRACE_DERIVED_FAIL_STEP = previousFailure
+    await fs.rm(traceRoot, { recursive: true, force: true })
+  }
+})
+
+test("retains only the current and rollback generations while open readers keep immutable bytes", async () => {
+  const traceRoot = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-derived-retention-"))
+  let openReader: Awaited<ReturnType<typeof fs.open>> | undefined
+  try {
+    const generationTargets: string[] = []
+    let logicalRoot = ""
+    for (let index = 1; index <= 3; index += 1) {
+      const segment = openTraceSegment({
+        rootDir: traceRoot,
+        logicalCaseID: "retention-case",
+        sessionID: "ses_retention",
+        runID: `run_retention_${index}`,
+      })
+      logicalRoot = segment.logicalRoot
+      await writeClosedSegment(segment, {
+        runID: `run_retention_${index}`,
+        marker: `generation-${index}`,
+        caseID: "retention-case",
+      })
+      materializeTrace({ caseDir: logicalRoot })
+      generationTargets.push(await fs.readlink(path.join(logicalRoot, ".derived", "current")))
+      if (index === 2)
+        openReader = await fs.open(path.join(logicalRoot, ".derived", generationTargets[0]!, "trace.json"), "r")
+    }
+
+    const generationsDir = path.join(logicalRoot, ".derived", "generations")
+    const retained = (await fs.readdir(generationsDir, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+      .map((entry) => entry.name)
+      .sort()
+    expect(retained).toEqual(
+      generationTargets
+        .slice(-2)
+        .map((target) => path.basename(target))
+        .sort(),
+    )
+    expect(await fileExists(path.join(logicalRoot, ".derived", generationTargets[0]!))).toBe(false)
+    expect(JSON.parse(await openReader!.readFile("utf8")).manifest.run_id).toBe("run_retention_1")
+  } finally {
+    await openReader?.close()
     await fs.rm(traceRoot, { recursive: true, force: true })
   }
 })

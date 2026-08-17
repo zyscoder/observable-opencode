@@ -33,8 +33,10 @@ import {
 } from "./streaming-json-writer"
 import { isFormalRecordType, TRACE_VERSION } from "./trace-semantic-contract"
 import {
+  openTraceFileNoFollow,
   readTraceSessionManifest,
-  resolveTraceManifestPath,
+  readTraceSegmentDescriptor,
+  resolveContainedTraceManifestPath,
   traceSessionLockRootForCase,
   TRACE_MANIFEST_LOCK_KEY,
   withTraceSessionLock,
@@ -1903,7 +1905,7 @@ function readPhysicalLines(
   visit: (line: string, lineNumber: number, recoverableTail: boolean) => void,
   afterLine: (sourceBytes: number) => void,
 ) {
-  const fd = fs.openSync(file, "r")
+  const fd = openTraceFileNoFollow(file)
   const chunk = Buffer.allocUnsafe(64 * 1024)
   let lineBuffer = Buffer.allocUnsafe(64 * 1024)
   let lineLength = 0
@@ -2174,16 +2176,27 @@ function copyFileAtomic(source: string, destination: string) {
     path.dirname(destination),
     `.${path.basename(destination)}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`,
   )
-  let handle: number | undefined
+  let sourceHandle: number | undefined
+  let destinationHandle: number | undefined
   try {
-    fs.copyFileSync(source, temporary)
-    handle = fs.openSync(temporary, "r")
-    fs.fsyncSync(handle)
-    fs.closeSync(handle)
-    handle = undefined
+    sourceHandle = openTraceFileNoFollow(source)
+    destinationHandle = fs.openSync(temporary, "wx")
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    while (true) {
+      const bytes = fs.readSync(sourceHandle, buffer, 0, buffer.length, null)
+      if (!bytes) break
+      let written = 0
+      while (written < bytes) written += fs.writeSync(destinationHandle, buffer, written, bytes - written)
+    }
+    fs.fsyncSync(destinationHandle)
+    fs.closeSync(destinationHandle)
+    destinationHandle = undefined
+    fs.closeSync(sourceHandle)
+    sourceHandle = undefined
     fs.renameSync(temporary, destination)
   } catch (error) {
-    if (handle !== undefined) fs.closeSync(handle)
+    if (destinationHandle !== undefined) fs.closeSync(destinationHandle)
+    if (sourceHandle !== undefined) fs.closeSync(sourceHandle)
     try {
       fs.unlinkSync(temporary)
     } catch {}
@@ -2210,10 +2223,14 @@ function linkFileAtomic(source: string, destination: string) {
 
 function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirectory: string, copyOnly = false) {
   if (!fs.existsSync(sourceDirectory)) return
-  if (!fs.statSync(sourceDirectory).isDirectory()) return
+  const rootStats = fs.lstatSync(sourceDirectory)
+  if (rootStats.isSymbolicLink())
+    throw new Error(`${sourceDirectory}: protected trace path is a symbolic link`)
+  if (!rootStats.isDirectory()) return
   for (const entry of fs.readdirSync(sourceDirectory, { withFileTypes: true })) {
     const source = path.join(sourceDirectory, entry.name)
     const destination = path.join(destinationDirectory, entry.name)
+    if (entry.isSymbolicLink()) throw new Error(`${source}: protected trace path is a symbolic link`)
     if (entry.isDirectory()) {
       fs.mkdirSync(destination, { recursive: true })
       linkCompatibilityArtifacts(source, destination, copyOnly)
@@ -2229,16 +2246,10 @@ function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirector
       fs.linkSync(source, destination)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") continue
-      const temporary = `${destination}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`
       try {
-        fs.copyFileSync(source, temporary, fs.constants.COPYFILE_EXCL)
-        fs.linkSync(temporary, destination)
+        copyFileAtomic(source, destination)
       } catch (copyError) {
         if ((copyError as NodeJS.ErrnoException).code !== "EEXIST") throw copyError
-      } finally {
-        try {
-          fs.unlinkSync(temporary)
-        } catch {}
       }
     }
   }
@@ -2246,7 +2257,7 @@ function linkCompatibilityArtifacts(sourceDirectory: string, destinationDirector
 
 function fileContentHash(file: string) {
   const hash = crypto.createHash("sha256")
-  const handle = fs.openSync(file, "r")
+  const handle = openTraceFileNoFollow(file)
   const buffer = Buffer.allocUnsafe(64 * 1024)
   try {
     while (true) {
@@ -2266,6 +2277,7 @@ function publishCompatibilityArtifacts(sourceDirectory: string, caseDir: string)
   const visit = (directory: string) => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const source = path.join(directory, entry.name)
+      if (entry.isSymbolicLink()) throw new Error(`${source}: protected trace path is a symbolic link`)
       if (entry.isDirectory()) {
         visit(source)
         continue
@@ -2363,8 +2375,48 @@ function derivedPublicationFailure(step: string) {
     throw new Error(`injected derived publication failure: ${step}`)
 }
 
+function assertDerivedDirectory(file: string) {
+  if (!lstatExists(file)) return
+  const stats = fs.lstatSync(file)
+  if (stats.isSymbolicLink()) throw new Error(`${file}: protected trace path is a symbolic link`)
+  if (!stats.isDirectory()) throw new Error(`${file}: expected a derived trace directory`)
+}
+
+function currentGenerationTarget(derivedDir: string, currentLink: string) {
+  if (!lstatExists(currentLink)) return undefined
+  const stats = fs.lstatSync(currentLink)
+  if (!stats.isSymbolicLink()) throw new Error(`${currentLink}: expected a derived generation symbolic link`)
+  const target = fs.readlinkSync(currentLink).replaceAll("\\", "/")
+  const parts = target.split("/")
+  if (parts.length !== 2 || parts[0] !== "generations" || !parts[1] || parts[1] === "." || parts[1] === "..")
+    throw new Error(`${currentLink}: derived generation symbolic link escapes its root`)
+  const targetDirectory = path.join(derivedDir, ...target.split("/"))
+  assertDerivedDirectory(targetDirectory)
+  return target
+}
+
+function reclaimDerivedGenerations(generationsDir: string, current: string, rollback: string | undefined) {
+  const retained = new Set(
+    [current, rollback]
+      .filter((target): target is string => target !== undefined)
+      .map((target) => path.basename(target)),
+  )
+  for (const entry of fs.readdirSync(generationsDir, { withFileTypes: true })) {
+    if (entry.name.startsWith(".") || retained.has(entry.name)) continue
+    const candidate = path.join(generationsDir, entry.name)
+    if (entry.isSymbolicLink()) fs.unlinkSync(candidate)
+    else fs.rmSync(candidate, { recursive: true, force: true })
+  }
+  try {
+    fsyncDirectory(generationsDir)
+  } catch {}
+}
+
 function copyVisibleFile(source: string, destination: string) {
-  if (!fs.existsSync(source) || !fs.statSync(source).isFile()) return
+  if (!fs.existsSync(source)) return
+  const stats = fs.lstatSync(source)
+  if (stats.isSymbolicLink()) throw new Error(`${source}: protected trace path is a symbolic link`)
+  if (!stats.isFile()) return
   copyFileAtomic(source, destination)
 }
 
@@ -2382,16 +2434,21 @@ function ensurePreexistingGeneration(
     "provenance-trace.json",
     "partial/latest.json",
   ]
-  const hasVisibleSet = relativeFiles.some((relative) => fs.existsSync(path.join(caseDir, relative)))
+  const sources = relativeFiles.map((relative) => ({
+    relative,
+    file: resolveContainedTraceManifestPath(caseDir, relative, { allowMissing: true }),
+  }))
+  const hasVisibleSet = sources.some((source) => fs.existsSync(source.file))
   if (!hasVisibleSet) return undefined
   const name = `preexisting-${crypto.randomUUID()}`
   const generationDir = path.join(derivedDir, "generations", name)
   try {
     fs.mkdirSync(generationDir, { recursive: true })
-    for (const relative of relativeFiles)
-      copyVisibleFile(path.join(caseDir, relative), path.join(generationDir, relative))
-    if (includeArtifacts)
-      linkCompatibilityArtifacts(path.join(caseDir, "artifacts"), path.join(generationDir, "artifacts"))
+    for (const source of sources) copyVisibleFile(source.file, path.join(generationDir, source.relative))
+    if (includeArtifacts) {
+      const artifacts = resolveContainedTraceManifestPath(caseDir, "artifacts", { allowMissing: true })
+      linkCompatibilityArtifacts(artifacts, path.join(generationDir, "artifacts"))
+    }
     swapSymlink(currentLink, path.posix.join("generations", name))
   } catch (error) {
     try {
@@ -2429,6 +2486,8 @@ function installRootCompatibilityLinks(caseDir: string, relativeFiles: string[])
       )
         continue
       const parent = path.dirname(destination)
+      const parentRelative = path.relative(caseDir, parent).split(path.sep).join(path.posix.sep) || "."
+      resolveContainedTraceManifestPath(caseDir, parentRelative, { allowMissing: true })
       if (!fs.existsSync(parent)) {
         fs.mkdirSync(parent, { recursive: true })
         transaction.createdDirectories.push(parent)
@@ -2494,10 +2553,14 @@ function publishStagedTrace(stageDir: string, caseDir: string, generation: numbe
   let currentSwapped = false
   let generationInstalled = false
   try {
+    assertDerivedDirectory(derivedDir)
+    assertDerivedDirectory(generationsDir)
+    currentGenerationTarget(derivedDir, currentLink)
     fs.mkdirSync(generationsDir, { recursive: true })
     preexistingGeneration = ensurePreexistingGeneration(caseDir, derivedDir, currentLink, !legacyAuthority)
-    oldCurrent = lstatExists(currentLink) ? fs.readlinkSync(currentLink) : undefined
-    if (!fs.existsSync(generationDir)) {
+    oldCurrent = currentGenerationTarget(derivedDir, currentLink)
+    if (lstatExists(generationDir)) assertDerivedDirectory(generationDir)
+    else {
       fs.mkdirSync(temporaryGeneration, { recursive: true })
       derivedPublicationFailure("generation_copying")
       if (oldCurrent)
@@ -2540,6 +2603,9 @@ function publishStagedTrace(stageDir: string, caseDir: string, generation: numbe
     currentSwapped = true
     derivedPublicationFailure("current_swapped")
     fs.rmSync(links.backupDir, { recursive: true, force: true })
+    try {
+      reclaimDerivedGenerations(generationsDir, path.posix.join("generations", generationName), oldCurrent)
+    } catch {}
   } catch (error) {
     if (currentSwapped) {
       if (oldCurrent) swapSymlink(currentLink, oldCurrent)
@@ -2579,6 +2645,9 @@ type MaterializationSource = {
   caseID?: string
   pathPrefix: string
   recordsFile: string
+  rawEventsFile: string
+  artifactsDirectory: string
+  legacyTraceFile: string
   descriptor?: TraceSegmentDescriptor
 }
 
@@ -2596,17 +2665,60 @@ function materializationSources(caseDir: string, session: TraceSessionManifest |
       {
         key: "legacy-flat",
         pathPrefix: "",
-        recordsFile: path.join(caseDir, "records.jsonl"),
+        recordsFile: resolveContainedTraceManifestPath(caseDir, "records.jsonl", { allowMissing: true }),
+        rawEventsFile: resolveContainedTraceManifestPath(caseDir, "raw-events.jsonl", { allowMissing: true }),
+        artifactsDirectory: resolveContainedTraceManifestPath(caseDir, "artifacts", { allowMissing: true }),
+        legacyTraceFile: resolveContainedTraceManifestPath(caseDir, "legacy-trace.json", { allowMissing: true }),
       },
     ]
-  return session.segments.map((descriptor) => ({
-    key: descriptor.segment_id,
-    runID: descriptor.run_id,
-    caseID: descriptor.case_id,
-    pathPrefix: descriptor.path,
-    recordsFile: resolveTraceManifestPath(caseDir, descriptor.records),
-    descriptor,
-  }))
+  return session.segments.map((descriptor) => {
+    resolveContainedTraceManifestPath(caseDir, descriptor.path)
+    if (descriptor.segment_id !== "legacy-root") {
+      const segmentFile = resolveContainedTraceManifestPath(
+        caseDir,
+        path.posix.join(descriptor.path, "segment.json"),
+      )
+      const physical = readTraceSegmentDescriptor(segmentFile)
+      for (const key of [
+        "segment_id",
+        "run_id",
+        "case_id",
+        "path",
+        "records",
+        "artifacts",
+        "index",
+        "started_at",
+        "continuation_of",
+      ] as const)
+        if (physical[key] !== descriptor[key]) throw new Error(`${segmentFile}: trace segment descriptor changed`)
+    }
+    resolveContainedTraceManifestPath(caseDir, descriptor.index, { allowMissing: true })
+    return {
+      key: descriptor.segment_id,
+      runID: descriptor.run_id,
+      caseID: descriptor.case_id,
+      pathPrefix: descriptor.path,
+      recordsFile: resolveContainedTraceManifestPath(caseDir, descriptor.records, { allowMissing: true }),
+      rawEventsFile: resolveContainedTraceManifestPath(
+        caseDir,
+        path.posix.join(descriptor.path === "." ? "" : descriptor.path, "raw-events.jsonl"),
+        { allowMissing: true },
+      ),
+      artifactsDirectory: resolveContainedTraceManifestPath(caseDir, descriptor.artifacts, { allowMissing: true }),
+      legacyTraceFile: resolveContainedTraceManifestPath(
+        caseDir,
+        path.posix.join(descriptor.path === "." ? "" : descriptor.path, "legacy-trace.json"),
+        { allowMissing: true },
+      ),
+      descriptor,
+    }
+  })
+}
+
+function assertProtectedDirectory(directory: string, label: string) {
+  const stats = fs.lstatSync(directory)
+  if (stats.isSymbolicLink()) throw new Error(`${directory}: protected trace path is a symbolic link`)
+  if (!stats.isDirectory()) throw new Error(`${directory}: expected ${label}`)
 }
 
 function materializeTraceSnapshot(input: {
@@ -2616,10 +2728,11 @@ function materializeTraceSnapshot(input: {
   copyArtifacts?: boolean
 }): TraceMaterializationResult {
   const caseDir = path.resolve(input.caseDir)
-  if (!fs.statSync(caseDir).isDirectory()) throw new Error(`${caseDir}: expected a case directory`)
+  assertProtectedDirectory(caseDir, "a case directory")
   const outputDir = path.resolve(input.outputDir ?? caseDir)
   const session = input.sessionSnapshot ?? undefined
   const sources = materializationSources(caseDir, session)
+  if (fs.existsSync(outputDir)) assertProtectedDirectory(outputDir, "an output directory")
   fs.mkdirSync(outputDir, { recursive: true })
   const indexPath = path.join(
     outputDir,
@@ -2642,7 +2755,7 @@ function materializeTraceSnapshot(input: {
       discoverSegmentEntityIDs(source.recordsFile, scope)
       index.beginSegment(scope)
       const recovered = recoverJournal(source.recordsFile, index, source.descriptor !== undefined)
-      index.ingestLegacyRuntimeFile(path.join(path.dirname(source.recordsFile), "raw-events.jsonl"))
+      index.ingestLegacyRuntimeFile(source.rawEventsFile)
       const identities = index.identities
       if (source.runID && identities.runID !== source.runID)
         throw new Error(`${source.recordsFile}: descriptor run identity does not match journal`)
@@ -2898,13 +3011,11 @@ function materializeTraceSnapshot(input: {
     memoryPhase("partial_complete", journalBytes)
     writeStreamingJsonObjectAtomic(provenanceFile, provenanceMembers(index, manifest, metrics))
     memoryPhase("provenance_complete", journalBytes)
-    const legacySource = fs.existsSync(path.join(path.dirname(terminal.source.recordsFile), "legacy-trace.json"))
-      ? terminal
-      : undefined
+    const legacySource = fs.existsSync(terminal.source.legacyTraceFile) ? terminal : undefined
     if (legacySource) {
-      copyFileAtomic(path.join(path.dirname(legacySource.source.recordsFile), "legacy-trace.json"), legacyFile)
+      copyFileAtomic(legacySource.source.legacyTraceFile, legacyFile)
       linkCompatibilityArtifacts(
-        path.join(path.dirname(legacySource.source.recordsFile), "artifacts"),
+        legacySource.source.artifactsDirectory,
         path.join(outputDir, "artifacts"),
         input.copyArtifacts === true,
       )
@@ -2923,22 +3034,28 @@ function materializeTraceSnapshot(input: {
 export function materializeTrace(input: {
   caseDir: string
   outputDir?: string
-  _lockHeld?: boolean
 }): TraceMaterializationResult {
   const caseDir = path.resolve(input.caseDir)
+  assertProtectedDirectory(caseDir, "a case directory")
   const locked = <T>(operation: () => T) =>
-    input._lockHeld
-      ? operation()
-      : withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, operation)
-  if (input.outputDir)
-    return locked(() =>
-      materializeTraceSnapshot({
+    withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, operation)
+  const sameSession = (left: TraceSessionManifest | null, right: TraceSessionManifest | null) =>
+    left?.generation === right?.generation && left?.session_id === right?.session_id
+  if (input.outputDir) {
+    let session = locked(() => readSession(caseDir) ?? null)
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const result = materializeTraceSnapshot({
         caseDir,
         outputDir: input.outputDir,
-        sessionSnapshot: readSession(caseDir) ?? null,
+        sessionSnapshot: session,
         copyArtifacts: true,
-      }),
-    )
+      })
+      const latest = locked(() => readSession(caseDir) ?? null)
+      if (sameSession(session, latest)) return result
+      session = latest
+    }
+    throw new Error(`${caseDir}: trace session changed repeatedly during materialization`)
+  }
 
   const initial = locked(() => {
     const session = readSession(caseDir)

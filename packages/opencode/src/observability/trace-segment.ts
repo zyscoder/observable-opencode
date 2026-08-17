@@ -99,6 +99,80 @@ export function resolveTraceManifestPath(root: string, relative: string) {
   return resolved
 }
 
+function symbolicLinkError(file: string) {
+  return new Error(`${file}: protected trace path is a symbolic link`)
+}
+
+function lstatIfPresent(file: string) {
+  try {
+    return fs.lstatSync(file)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+    throw error
+  }
+}
+
+function assertWithinRealRoot(root: string, candidate: string, relative: string) {
+  const fromRoot = path.relative(root, candidate)
+  if (fromRoot === ".." || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot))
+    throw new Error(`${relative}: path escapes trace root ${root}`)
+}
+
+export function resolveContainedTraceManifestPath(
+  root: string,
+  relative: string,
+  options: { allowMissing?: boolean } = {},
+) {
+  const lexical = resolveTraceManifestPath(root, relative)
+  if (usesWin32Paths(root) && path.sep !== "\\") return lexical
+  const rootStats = lstatIfPresent(root)
+  if (!rootStats) throw new Error(`${root}: trace root is missing`)
+  if (rootStats.isSymbolicLink()) throw symbolicLinkError(root)
+  if (!rootStats.isDirectory()) throw new Error(`${root}: expected a trace directory`)
+  const realRoot = fs.realpathSync(root)
+  let candidate = realRoot
+  for (const part of relative === "." ? [] : relative.split(path.posix.sep)) {
+    candidate = path.join(candidate, part)
+    const stats = lstatIfPresent(candidate)
+    if (!stats) {
+      if (options.allowMissing) return lexical
+      throw new Error(`${candidate}: protected trace path is missing`)
+    }
+    if (stats.isSymbolicLink()) throw symbolicLinkError(candidate)
+    const physical = fs.realpathSync(candidate)
+    assertWithinRealRoot(realRoot, physical, relative)
+    candidate = physical
+  }
+  return lexical
+}
+
+export function openTraceFileNoFollow(file: string) {
+  const stats = lstatIfPresent(file)
+  if (!stats) throw new Error(`${file}: protected trace file is missing`)
+  if (stats.isSymbolicLink()) throw symbolicLinkError(file)
+  const noFollow = (fs.constants as typeof fs.constants & { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0
+  try {
+    const handle = fs.openSync(file, fs.constants.O_RDONLY | noFollow)
+    if (!fs.fstatSync(handle).isFile()) {
+      fs.closeSync(handle)
+      throw new Error(`${file}: expected a protected trace file`)
+    }
+    return handle
+  } catch (error) {
+    if (["ELOOP", "EMLINK"].includes((error as NodeJS.ErrnoException).code ?? "")) throw symbolicLinkError(file)
+    throw error
+  }
+}
+
+function readTraceFileNoFollow(file: string) {
+  const handle = openTraceFileNoFollow(file)
+  try {
+    return fs.readFileSync(handle, "utf8")
+  } finally {
+    fs.closeSync(handle)
+  }
+}
+
 function pathIsWithinDescriptor(descriptorPath: string, candidate: string) {
   if (descriptorPath === ".") return validRelativePath(candidate)
   return candidate.startsWith(`${descriptorPath}/`) && validRelativePath(candidate)
@@ -140,8 +214,10 @@ function parseSegmentDescriptor(input: unknown, file: string): TraceSegmentDescr
 }
 
 export function readTraceSessionManifest(file: string): TraceSessionManifest | undefined {
-  if (!fs.existsSync(file)) return undefined
-  const manifest = JSON.parse(fs.readFileSync(file, "utf8")) as unknown
+  const stats = lstatIfPresent(file)
+  if (!stats) return undefined
+  if (stats.isSymbolicLink()) throw symbolicLinkError(file)
+  const manifest = JSON.parse(readTraceFileNoFollow(file)) as unknown
   if (
     !isRecord(manifest) ||
     manifest.schema_version !== "1.0" ||
@@ -179,13 +255,13 @@ export function readTraceSessionManifest(file: string): TraceSessionManifest | u
   }
 }
 
-function readSegmentDescriptor(file: string) {
-  if (!fs.existsSync(file)) throw new Error(`${file}: missing immutable trace segment descriptor`)
-  return parseSegmentDescriptor(JSON.parse(fs.readFileSync(file, "utf8")) as unknown, file)
+export function readTraceSegmentDescriptor(file: string) {
+  if (!lstatIfPresent(file)) throw new Error(`${file}: missing immutable trace segment descriptor`)
+  return parseSegmentDescriptor(JSON.parse(readTraceFileNoFollow(file)) as unknown, file)
 }
 
 function readFirstJournalEntry(file: string) {
-  const handle = fs.openSync(file, "r")
+  const handle = openTraceFileNoFollow(file)
   const chunk = Buffer.allocUnsafe(64 * 1024)
   const parts: Buffer[] = []
   try {
@@ -210,7 +286,7 @@ function readFirstJournalEntry(file: string) {
 }
 
 function readLastJournalEntry(file: string) {
-  const handle = fs.openSync(file, "r")
+  const handle = openTraceFileNoFollow(file)
   try {
     const size = fs.fstatSync(handle).size
     const chunk = Buffer.allocUnsafe(64 * 1024)
@@ -253,7 +329,9 @@ function readLastJournalEntry(file: string) {
 
 function legacyRootDescriptor(logicalRoot: string, sessionID: string | undefined): TraceSegmentDescriptor | undefined {
   const recordsFile = path.join(logicalRoot, "records.jsonl")
-  if (!fs.existsSync(recordsFile)) return undefined
+  const recordsStats = lstatIfPresent(recordsFile)
+  if (!recordsStats) return undefined
+  if (recordsStats.isSymbolicLink()) throw symbolicLinkError(recordsFile)
   const first = readFirstJournalEntry(recordsFile)
   const last = readLastJournalEntry(recordsFile)
   const terminal = last?.operation === "case.runtime_closed" || last?.operation === "case.finalized"
@@ -453,14 +531,23 @@ function resolveLogicalRoot(rootDir: string, requestedCaseID: string, sessionID:
 
 function validateLogicalRoot(logicalRoot: string, sessionID: string | undefined) {
   if (!fs.existsSync(logicalRoot)) return { current: undefined, legacy: undefined }
-  if (!fs.statSync(logicalRoot).isDirectory()) throw new Error(`${logicalRoot}: expected a logical trace directory`)
+  const rootStats = fs.lstatSync(logicalRoot)
+  if (rootStats.isSymbolicLink()) throw symbolicLinkError(logicalRoot)
+  if (!rootStats.isDirectory()) throw new Error(`${logicalRoot}: expected a logical trace directory`)
   const current = readTraceSessionManifest(path.join(logicalRoot, "session.json"))
   if (current?.session_id && sessionID && current.session_id !== sessionID)
     throw new Error(`${logicalRoot}: session identity changed`)
   for (const descriptor of current?.segments ?? []) {
+    resolveContainedTraceManifestPath(logicalRoot, descriptor.records, { allowMissing: true })
+    resolveContainedTraceManifestPath(logicalRoot, descriptor.artifacts, { allowMissing: true })
+    resolveContainedTraceManifestPath(logicalRoot, descriptor.index, { allowMissing: true })
     if (descriptor.segment_id === "legacy-root") continue
-    const segmentFile = resolveTraceManifestPath(logicalRoot, path.posix.join(descriptor.path, "segment.json"))
-    const physical = readSegmentDescriptor(segmentFile)
+    resolveContainedTraceManifestPath(logicalRoot, descriptor.path)
+    const segmentFile = resolveContainedTraceManifestPath(
+      logicalRoot,
+      path.posix.join(descriptor.path, "segment.json"),
+    )
+    const physical = readTraceSegmentDescriptor(segmentFile)
     for (const key of [
       "segment_id",
       "run_id",
@@ -571,6 +658,9 @@ export function openTraceSegment(input: {
     const existingSegments = [...(legacy ? [legacy] : []), ...(current?.segments ?? [])]
     if (existingSegments.some((segment) => segment.run_id === input.runID))
       throw new Error(`${sessionFile}: run ${input.runID} already exists`)
+    const segmentsStats = lstatIfPresent(segmentsDir)
+    if (segmentsStats?.isSymbolicLink()) throw symbolicLinkError(segmentsDir)
+    if (segmentsStats && !segmentsStats.isDirectory()) throw new Error(`${segmentsDir}: expected a trace directory`)
     fs.mkdirSync(segmentsDir, { recursive: true })
     const baseSegmentID = safePart(input.runID, "run")
     let ordinal = 1

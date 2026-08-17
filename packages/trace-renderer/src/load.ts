@@ -18,6 +18,7 @@ import {
 } from "opencode/observability/causal-ir"
 import { materializeTrace } from "opencode/observability/trace-materializer"
 import {
+  openTraceFileNoFollow,
   readTraceSessionManifest,
   traceSessionLockRootForCase,
   TRACE_MANIFEST_LOCK_KEY,
@@ -183,7 +184,7 @@ function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument
 function materializeReadOnly(caseDir: string) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-trace-renderer-"))
   try {
-    const materialized = materializeTrace({ caseDir, outputDir: temporary, _lockHeld: true })
+    const materialized = materializeTrace({ caseDir, outputDir: temporary })
     return {
       file: materialized.traceFile,
       caseDir,
@@ -237,9 +238,35 @@ function selectSource(input: string): { file: string; caseDir: string; source: T
   return { file: target, caseDir: path.dirname(target), source }
 }
 
+function protectedRendererReadPath(file: string) {
+  const stats = fs.lstatSync(file)
+  if (!stats.isSymbolicLink()) return file
+  const caseDir = path.dirname(file)
+  const physicalCaseDir = fs.realpathSync(caseDir)
+  const physical = fs.realpathSync(file)
+  const relative = path.relative(physicalCaseDir, physical)
+  const insideDerivedGeneration =
+    relative.startsWith(`.derived${path.sep}generations${path.sep}`) &&
+    relative.split(path.sep).length >= 4 &&
+    path.basename(file) === "trace.json"
+  if (!insideDerivedGeneration)
+    throw new Error(`${file}: protected renderer source is a symbolic link that escapes its case directory`)
+  return physical
+}
+
+function readProtectedFile(file: string) {
+  const source = protectedRendererReadPath(file)
+  const handle = openTraceFileNoFollow(source)
+  try {
+    return fs.readFileSync(handle, "utf8")
+  } finally {
+    fs.closeSync(handle)
+  }
+}
+
 function readJSON(file: string) {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as unknown
+    return JSON.parse(readProtectedFile(file)) as unknown
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
     throw new Error(`${file}: invalid JSON (${detail})`)
@@ -310,7 +337,7 @@ function projectCompatibilityDocument(document: CompatibilityTraceDocument): Com
 }
 
 function readJournal(file: string) {
-  const content = fs.readFileSync(file, "utf8")
+  const content = readProtectedFile(file)
   const lines = content.split(/\r?\n/)
   if (lines.at(-1) === "") lines.pop()
   if (!lines.length) throw new Error(`${file}:1: journal is empty`)
@@ -361,7 +388,7 @@ function recoveryMetrics(trace: CausalIRTraceDocument | undefined): Record<strin
   }
 }
 
-function loadRenderableTraceLocked(input: string): RenderableTraceLoadResult {
+function loadRenderableTraceSnapshot(input: string): RenderableTraceLoadResult {
   const selected = selectSource(input)
   try {
     if (selected.source === "trace.json") {
@@ -423,11 +450,45 @@ function loadRenderableTraceLocked(input: string): RenderableTraceLoadResult {
   }
 }
 
+function flatTraceRevision(caseDir: string) {
+  return ["trace.json", "records.jsonl"].map((relative) => {
+    const file = path.join(caseDir, relative)
+    try {
+      const stats = fs.statSync(file, { bigint: true })
+      return [relative, String(stats.dev), String(stats.ino), String(stats.size), String(stats.mtimeNs)]
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [relative, "missing"]
+      throw error
+    }
+  })
+}
+
+function loadRevision(caseDir: string) {
+  const session = readTraceSessionManifest(path.join(caseDir, "session.json"))
+  if (session) return JSON.stringify(["session", session.session_id ?? null, session.generation])
+  return JSON.stringify(["flat", flatTraceRevision(caseDir)])
+}
+
 export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
   const target = path.resolve(input)
+  if (fs.lstatSync(target).isSymbolicLink()) protectedRendererReadPath(target)
   const stats = fs.statSync(target)
   const caseDir = stats.isDirectory() ? target : path.dirname(target)
-  return withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, () =>
-    loadRenderableTraceLocked(target),
-  )
+  const locked = <T>(operation: () => T) =>
+    withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, operation)
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const before = locked(() => loadRevision(caseDir))
+    let result: RenderableTraceLoadResult | undefined
+    let failure: unknown
+    try {
+      result = loadRenderableTraceSnapshot(target)
+    } catch (error) {
+      failure = error
+    }
+    const after = locked(() => loadRevision(caseDir))
+    if (after !== before) continue
+    if (failure) throw failure
+    return result!
+  }
+  throw new Error(`${caseDir}: trace session changed repeatedly while loading`)
 }

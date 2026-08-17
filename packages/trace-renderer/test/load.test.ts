@@ -11,9 +11,11 @@ import {
 } from "opencode/observability/causal-ir"
 import {
   acquireTraceSessionLock,
+  openTraceSegment,
   traceSessionLockRootForCase,
   TRACE_MANIFEST_LOCK_KEY,
 } from "opencode/observability/trace-segment"
+import { materializeTrace } from "opencode/observability/trace-materializer"
 import { loadRenderableTrace } from "../src/load"
 
 function withCaseDirectory(run: (caseDir: string) => void) {
@@ -241,6 +243,15 @@ function segmentedJournal(runID: string, marker: string, complete = true) {
   return journal
 }
 
+async function waitForFile(file: string, timeoutMilliseconds = 5_000) {
+  const deadline = Date.now() + timeoutMilliseconds
+  while (Date.now() < deadline) {
+    if (fs.existsSync(file)) return true
+    await Bun.sleep(10)
+  }
+  return fs.existsSync(file)
+}
+
 describe("loadRenderableTrace", () => {
   test("holds the global trace-root lock while reading a legacy-flat snapshot", () => {
     const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
@@ -258,6 +269,118 @@ describe("loadRenderableTrace", () => {
         else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
       }
       expect(treeHashes(caseDir)).toEqual(before)
+    })
+  })
+
+  test("releases the allocation lock while reading and retries after the session generation changes", async () => {
+    const traceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trace-renderer-generation-lock-"))
+    const readyFile = path.join(traceRoot, "renderer.ready")
+    const gateFile = path.join(traceRoot, "renderer.gate")
+    const resultFile = path.join(traceRoot, "renderer.result.json")
+    const previousWait = process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+    let child: ReturnType<typeof Bun.spawn> | undefined
+    try {
+      const first = openTraceSegment({
+        rootDir: traceRoot,
+        logicalCaseID: "segmented-renderer",
+        sessionID: "ses_segmented_renderer",
+        runID: "run_renderer_first",
+      })
+      fs.writeFileSync(
+        path.join(first.segmentDir, "records.jsonl"),
+        segmentedJournal("run_renderer_first", "first").map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+      )
+      expect(first.finalize("completed")).toBe(true)
+      materializeTrace({ caseDir: first.logicalRoot })
+
+      const script = [
+        'import fs from "node:fs"',
+        `const traceFile = ${JSON.stringify(path.join(first.logicalRoot, "trace.json"))}`,
+        "const physicalTraceFile = fs.realpathSync(traceFile)",
+        `const readyFile = ${JSON.stringify(readyFile)}`,
+        `const gateFile = ${JSON.stringify(gateFile)}`,
+        `const resultFile = ${JSON.stringify(resultFile)}`,
+        "const originalOpenSync = fs.openSync.bind(fs)",
+        "let paused = false",
+        "fs.openSync = function(file, ...args) {",
+        "  const value = originalOpenSync(file, ...args)",
+        "  if (!paused && String(file) === physicalTraceFile) {",
+        "    paused = true",
+        '    fs.writeFileSync(readyFile, "ready")',
+        "    while (!fs.existsSync(gateFile)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5)",
+        "  }",
+        "  return value",
+        "}",
+        `const { loadRenderableTrace } = await import(${JSON.stringify(new URL("../src/load.ts", import.meta.url).href)})`,
+        `const loaded = loadRenderableTrace(${JSON.stringify(first.logicalRoot)})`,
+        "fs.writeFileSync(resultFile, JSON.stringify({",
+        "  incomplete: loaded.incomplete,",
+        "  runID: loaded.trace.manifest.run_id,",
+        "  sessionGeneration: loaded.trace.manifest.session_generation,",
+        "}))",
+      ].join("\n")
+      child = Bun.spawn([process.execPath, "-e", script], {
+        cwd: import.meta.dir,
+        stdout: "pipe",
+        stderr: "pipe",
+      })
+      expect(await waitForFile(readyFile)).toBe(true)
+
+      process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = "200"
+      const second = openTraceSegment({
+        rootDir: traceRoot,
+        logicalCaseID: "segmented-renderer",
+        sessionID: "ses_segmented_renderer",
+        runID: "run_renderer_second",
+      })
+      fs.writeFileSync(
+        path.join(second.segmentDir, "records.jsonl"),
+        segmentedJournal("run_renderer_second", "second", false)
+          .map((entry) => JSON.stringify(entry))
+          .join("\n") + "\n",
+      )
+      fs.writeFileSync(gateFile, "continue")
+
+      expect(await child.exited).toBe(0)
+      expect(JSON.parse(fs.readFileSync(resultFile, "utf8"))).toEqual({
+        incomplete: true,
+        runID: "run_renderer_second",
+        sessionGeneration: 3,
+      })
+    } finally {
+      fs.writeFileSync(gateFile, "continue")
+      if (child && child.exitCode === null) child.kill()
+      if (previousWait === undefined) delete process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS
+      else process.env.OPENCODE_TRACE_SEGMENT_LOCK_WAIT_MS = previousWait
+      fs.rmSync(traceRoot, { recursive: true, force: true })
+    }
+  })
+
+  test("rejects renderer source symlinks that escape the case directory", () => {
+    withCaseDirectory((caseDir) => {
+      const outsideTrace = `${caseDir}-outside-trace.json`
+      const outsideJournal = `${caseDir}-outside-records.jsonl`
+      try {
+        fs.writeFileSync(
+          outsideTrace,
+          JSON.stringify({
+            trace_schema_version: "1.3",
+            case_id: "outside-case",
+            records: [],
+            dataflow_edges: [],
+          }),
+        )
+        fs.symlinkSync(outsideTrace, path.join(caseDir, "trace.json"))
+        expect(() => loadRenderableTrace(caseDir)).toThrow(/symbolic link|escapes/)
+
+        fs.unlinkSync(path.join(caseDir, "trace.json"))
+        fs.writeFileSync(outsideJournal, createJournal().journal.map((entry) => JSON.stringify(entry)).join("\n"))
+        fs.symlinkSync(outsideJournal, path.join(caseDir, "records.jsonl"))
+        expect(() => loadRenderableTrace(caseDir)).toThrow(/symbolic link|escapes/)
+      } finally {
+        fs.rmSync(outsideTrace, { force: true })
+        fs.rmSync(outsideJournal, { force: true })
+      }
     })
   })
 
@@ -289,6 +412,8 @@ describe("loadRenderableTrace", () => {
           ...(index === 1 ? { continuation_of: "run_renderer_first" } : {}),
         }
       })
+      for (const descriptor of descriptors)
+        fs.writeFileSync(path.join(caseDir, descriptor.path, "segment.json"), JSON.stringify(descriptor) + "\n")
       fs.writeFileSync(
         path.join(caseDir, "session.json"),
         JSON.stringify({
@@ -309,7 +434,7 @@ describe("loadRenderableTrace", () => {
       expect(result).toMatchObject({ caseDir, source: "trace.json", incomplete: true })
       expect(result.trace.manifest).toMatchObject({
         case_id: "segmented-renderer",
-        run_id: "run_renderer_first",
+        run_id: "run_renderer_second",
         historical_interruptions: true,
       })
       expect(
@@ -358,6 +483,8 @@ describe("loadRenderableTrace", () => {
           ...(index ? { continuation_of: "run_renderer_first" } : {}),
         }
       })
+      for (const descriptor of descriptors)
+        fs.writeFileSync(path.join(caseDir, descriptor.path, "segment.json"), JSON.stringify(descriptor) + "\n")
       fs.writeFileSync(
         path.join(caseDir, "session.json"),
         JSON.stringify({

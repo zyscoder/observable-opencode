@@ -130,3 +130,37 @@ Memory and semantic evidence:
 - Predeclaration uses SQLite JSON queries over each bounded physical line, avoiding a graph-retaining JavaScript parse pass. Entity existence and typed alias owners are stored in `WITHOUT ROWID` tables; aliases preserve unique-owner and ambiguity behavior.
 - The high-cardinality fixture repeats all local node IDs across two immutable segments, includes three typed aliases per node, compacts each segment to a small terminal snapshot, and verifies exact namespace resolution after replay. This exercises high cardinality without weakening the 1 GiB journal or loading a synthetic 1 GiB derived JSON document into the renderer.
 - The measured child is a plain production Bun process; the parent `bun test` process builds the fixture, verifies bytes/RSS/exit status, and validates the child-reported semantic assertions without adding test-runner memory to the materializer envelope.
+
+## Checkpoint 5: Short renderer locks, contained paths, generation retention, and timeout documentation
+
+Status: complete and ready for its coherent checkpoint commit. The exact SHA is recorded in the final commit mapping after Git creates this commit.
+
+Findings covered:
+
+- Important: renderer reads and read-only materialization capture a manifest generation under the allocation lock, perform parse/replay/materialization outside it, and recheck before return; a changed generation retries from immutable evidence.
+- Important: protected session, descriptor, journal, raw-event, artifact, compatibility, renderer-source, and publication paths reject symlink traversal. Existing paths are realpath-contained and protected files use no-follow opens where available.
+- Minor: successful publication retains only the current and immediately previous derived generation. An already-open reader keeps valid immutable bytes when the oldest directory is reclaimed.
+- Minor: README timeout guidance now distinguishes fixed 5,000 ms worker cleanup, configurable journal close, and the independently awaited materializer process.
+
+RED evidence:
+
+- `bun test test/load.test.ts` in `packages/trace-renderer`: the new allocation-concurrency case failed after the parent hit the configured 200 ms trace-session-lock timeout while a child renderer was paused in `trace.json` reading.
+- `bun test test/observability/trace-segment.test.ts --test-name-pattern "symlinked protected|symlinked derived|retains only"`: 0 pass, 3 fail. A symlinked `session.json` and `.derived` root were followed, and generations `2`, `4`, and `6` all remained instead of only rollback/current `4` and `6`.
+- `bun test test/load.test.ts --test-name-pattern "source symlinks"`: 0 pass, 1 fail. Renderer loading accepted an out-of-root `trace.json` symlink and projected its bytes.
+- `bun test test/observability/trace-segment.test.ts --test-name-pattern "symlinked publication"`: 0 pass, 1 fail. A symlinked `partial/` directory redirected compatibility publication outside the case root.
+
+GREEN evidence:
+
+- `bun test test/observability/trace-segment.test.ts test/observability/trace-materializer.test.ts test/observability/trace-materializer-diagnostics.test.ts --timeout 30000`: 46 pass, 0 fail, 792 expectations in 8.88 s.
+- `bun test test/load.test.ts --timeout 30000` in `packages/trace-renderer`: 25 pass, 0 fail, 93 expectations in 198 ms. The paused renderer allowed allocation, observed generation `3`, retried, and returned the latest interrupted run in 69.50 ms.
+- `bun test test/cli/tui/thread.test.ts test/cli/tui/trace-materializer-process.test.ts --timeout 30000`: 8 pass, 0 fail, 17 expectations in 6.56 s.
+- `bun run typecheck` in `packages/trace-renderer`: exit 0.
+- `bun run typecheck` in `packages/opencode`: exit 2 with exactly the established 22 unrelated diagnostics and no diagnostics in touched observability or test files.
+- `git diff --check`: pass.
+
+Concurrency, path, and retention evidence:
+
+- The renderer concurrency child pauses after opening the exact immutable generation file. A competing `openTraceSegment()` succeeds under a 200 ms deadline; the renderer's generation recheck discards the stale result and retries against generation `3`.
+- The malicious-tree matrix covers symlinked `session.json`, segment directory, `segment.json`, `records.jsonl`, `artifacts`, `index.sqlite`, `legacy-trace.json`, `.derived`, `partial/`, and renderer `trace.json`/`records.jsonl`. Outside-file/tree hashes remain unchanged.
+- Manifest-relative paths remain lexical after realpath validation, preserving stable `/var`-relative recovery metadata on macOS while containment checks use canonical `/private/var` paths.
+- The retention test publishes three generations, observes only the latest two directories, confirms the oldest directory is removed, and reads the oldest generation successfully through a file descriptor opened before reclamation.
