@@ -81,6 +81,40 @@ test("trace sufficiency review marks missing evidence as insufficient", () => {
   assert.ok(review.evidence_found.every((item) => item.status === "missing"))
 })
 
+test("changed_path accepts an absolute traced path for a relative assertion", () => {
+  const caseDefinition = {
+    case_id: "absolute-changed-path",
+    required_trace_evidence: [],
+    sufficiency_questions: [],
+    acceptance_assertions: [
+      {
+        id: "pricing_changed",
+        type: "changed_path",
+        path: "src/pricing.mjs",
+        should_change: true,
+      },
+    ],
+  }
+  const trace = {
+    manifest: { case_id: caseDefinition.case_id },
+    records: [
+      {
+        record_id: "change_1",
+        event_type: "change",
+        component: "tool",
+        data: {
+          files: ["/tmp/fixture/src/pricing.mjs"],
+        },
+      },
+    ],
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+
+  assert.equal(review.actual_case_outcome.status, "pass")
+  assert.deepEqual(review.actual_case_outcome.assertions[0].record_refs, ["record:change_1"])
+})
+
 test("trace summary handles missing trace reviews and subset analysis", () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-stress-subset-"))
   const traces = path.join(temp, "traces")

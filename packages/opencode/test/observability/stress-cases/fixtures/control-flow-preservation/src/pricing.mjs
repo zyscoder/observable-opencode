@@ -13,7 +13,7 @@ export function renewalQuote(input) {
   const regionDiscount = region === "EU" ? 0.02 : region === "NA" ? 0.01 : 0
   const enterpriseBonus = payload.enterprise === true ? 0.01 : 0
 
-  const discount = Math.min(loyaltyDiscount + volumeDiscount + regionDiscount + enterpriseBonus, 0.15)
+  const discount = Math.min(loyaltyDiscount + volumeDiscount + regionDiscount + enterpriseBonus, 0.2)
   return Math.round(base * seats * (1 - discount))
 }
 

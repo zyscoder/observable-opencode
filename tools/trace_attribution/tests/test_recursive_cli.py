@@ -56,6 +56,236 @@ def output_config():
 
 
 class RecursiveCliTest(unittest.TestCase):
+    def test_load_graph_combines_sibling_session_segments_without_id_collisions(self):
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            main = root / "context-case"
+            resumed = root / "context-case--ses_second--abc123"
+            main.mkdir()
+            resumed.mkdir()
+            (main / "trace.json").write_text(
+                json.dumps(
+                    {
+                        "manifest": {
+                            "case_id": "context-case",
+                            "session_id": "ses_first",
+                            "started_at": "2026-08-20T00:00:00Z",
+                        },
+                        "records": [
+                            {
+                                "record_id": "action",
+                                "component": "tool",
+                                "event_type": "tool.call",
+                                "timestamp": "2026-08-20T00:00:01Z",
+                                "data": {"call_id": "call_1", "tool_name": "write"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (resumed / "trace.json").write_text(
+                json.dumps(
+                    {
+                        "manifest": {
+                            "case_id": "context-case--ses_second--abc123",
+                            "session_id": "ses_second",
+                            "started_at": "2026-08-20T00:01:00Z",
+                        },
+                        "records": [
+                            {
+                                "record_id": "action",
+                                "component": "mcp",
+                                "event_type": "mcp.call",
+                                "timestamp": "2026-08-20T00:01:01Z",
+                                "data": {
+                                    "call_id": "call_1",
+                                    "input": {"tool": "yocto_build_execute"},
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            graph = service.load_graph(main / "trace.json")
+
+            self.assertEqual(graph.case_id, "context-case")
+            self.assertEqual(len(graph.nodes), 2)
+            self.assertEqual(
+                graph.raw_trace["manifest"]["logical_segment_count"], 2
+            )
+            self.assertEqual(
+                {node.data.get("call_id") for node in graph.nodes.values()},
+                {"seg_0__call_1", "seg_1__call_1"},
+            )
+            self.assertTrue(
+                any("yocto_build_execute" in str(node.data) for node in graph.nodes.values())
+            )
+
+    def test_question_premise_gate_uses_direct_facts_and_can_reject_a_false_omission(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "premise-gate",
+                "records": [
+                    {
+                        "record_id": "execute",
+                        "component": "mcp",
+                        "event_type": "mcp.call",
+                        "data": {
+                            "input": {
+                                "server": "build",
+                                "tool": "yocto_build_execute",
+                            },
+                            "status": "success",
+                        },
+                    }
+                ],
+            }
+        )
+        question = AttributionQuestion.create(
+            "为什么没有调用 yocto_build_execute？"
+        )
+        bound = service.bind_question_hypothesis(graph, question)
+
+        class FakeTransport:
+            def __init__(self):
+                self.prompt = ""
+
+            def create_message_text(self, *, system, messages, max_tokens):
+                self.prompt = messages[0]["content"]
+                return json.dumps(
+                    {
+                        "status": "contradicted",
+                        "expected_behavior": "Call yocto_build_execute.",
+                        "alleged_actual_behavior": "The tool was not called.",
+                        "reason": "The trace contains a successful MCP call.",
+                        "evidence_refs": ["record:execute"],
+                        "missing_evidence": [],
+                        "confidence": 0.99,
+                    }
+                )
+
+        transport = FakeTransport()
+        assessment = service.assess_question_premise(
+            transport,
+            bound,
+            question,
+            seed_ref=bound.default_start_refs()[0],
+        )
+
+        self.assertEqual(assessment["status"], "contradicted")
+        self.assertEqual(assessment["evidence_refs"], ["record:execute"])
+        self.assertIn("yocto_build_execute", transport.prompt)
+        self.assertLess(len(transport.prompt.encode("utf-8")), 64_000)
+
+    def test_contradicted_premise_report_is_a_grounded_no_defect_result(self):
+        report = service.question_premise_no_defect_report(
+            case_id="premise-report",
+            objective="Why was the tool omitted?",
+            seed_ref="record:offline_question",
+            assessment={
+                "status": "contradicted",
+                "expected_behavior": "Call the tool.",
+                "alleged_actual_behavior": "The tool was omitted.",
+                "reason": "The recorded tool call disproves the omission.",
+                "evidence_refs": ["record:tool_call"],
+                "missing_evidence": [],
+                "confidence": 0.98,
+            },
+        )
+
+        self.assertEqual(report["analysis_outcome"], "no_defect")
+        self.assertEqual(report["seed_results"][0]["outcome"], "no_defect")
+        self.assertEqual(
+            report["seed_results"][0]["decisive_evidence_refs"],
+            ["record:tool_call"],
+        )
+        self.assertEqual(report["premise_assessment"]["status"], "contradicted")
+
+    def test_question_creates_an_offline_expectation_gap_seed_over_relevant_trace_facts(self):
+        duplicated_context = [
+            {
+                "record_id": "context_{0}".format(index),
+                "component": "context",
+                "event_type": "context.transform",
+                "data": {
+                    "text": (
+                        "为什么调用了 yocto_build_plan，却没有继续调用它要求的 "
+                        "yocto_build_execute？"
+                    )
+                },
+            }
+            for index in range(40)
+        ]
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "question-hypothesis",
+                "records": [
+                    {
+                        "record_id": "plan",
+                        "component": "mcp",
+                        "event_type": "mcp.call",
+                        "data": {"tool_name": "yocto_build_plan"},
+                    },
+                    {
+                        "record_id": "execute",
+                        "component": "mcp",
+                        "event_type": "mcp.call",
+                        "source_refs": ["record:plan"],
+                        "data": {"tool_name": "yocto_build_execute"},
+                    },
+                    *duplicated_context,
+                    {
+                        "record_id": "answer",
+                        "component": "result",
+                        "event_type": "response.claim",
+                        "source_refs": ["record:execute"],
+                        "data": {"text": "Yocto build completed."},
+                    },
+                ],
+            }
+        )
+        question = AttributionQuestion.create(
+            "为什么调用了 yocto_build_plan，却没有继续调用 yocto_build_execute？"
+        )
+
+        bound = service.bind_question_hypothesis(graph, question)
+        starts = bound.default_start_refs()
+
+        self.assertEqual(len(starts), 1)
+        seed = bound.nodes[starts[0]]
+        self.assertEqual(seed.event_type, "case.observed_defect")
+        self.assertEqual(seed.data["hypothesis_origin"], "user_question")
+        self.assertEqual(seed.data["premise_status"], "unverified")
+        self.assertIn("record:plan", bound.upstream_refs(seed.ref))
+        self.assertIn("record:execute", bound.upstream_refs(seed.ref))
+        self.assertNotIn(seed.ref, graph.nodes)
+
+    def test_no_defect_question_projection_reports_a_contradicted_premise(self):
+        graph = TraceGraph.from_trace({"case_id": "no-defect", "records": []})
+        question = AttributionQuestion.create("为什么没有调用构建工具？")
+
+        payload = service.question_bound_output_payload(
+            {
+                "analysis_outcome": "no_defect",
+                "confirmed_roots": [],
+                "co_roots": [],
+                "root_causes": [],
+                "unresolved_refs": [],
+            },
+            graph,
+            binding=question,
+            starts=("record:offline_question",),
+        )
+
+        self.assertEqual(payload["question_premise_status"], "contradicted")
+        self.assertIn("not supported", payload["conclusion"])
+        self.assertNotIn(
+            "no_confirmed_root_cause",
+            {item.get("kind") for item in payload["unresolved_gaps"]},
+        )
     def test_question_is_accepted_and_mutually_exclusive_with_objective(self):
         args = parse_args(
             [

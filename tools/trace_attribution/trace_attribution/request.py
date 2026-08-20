@@ -136,7 +136,7 @@ class AttributionOptions:
     base_url: str = ""
     base_url_env: str = "ANTHROPIC_BASE_URL"
     judge_timeout_sec: float = field(default_factory=default_judge_timeout_seconds)
-    judge_max_tokens: int = 4096
+    judge_max_tokens: int = 8192
     thinking_mode: str = "auto"
     provider_error_threshold: int = 3
 

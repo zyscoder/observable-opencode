@@ -87,7 +87,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-max-tokens",
         type=int,
-        default=4096,
+        default=8192,
         help="Max output tokens for each judge call; reasoning models may need extra room for JSON text.",
     )
     parser.add_argument(

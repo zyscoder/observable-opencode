@@ -137,7 +137,11 @@ function evaluateAcceptanceAssertion(assertion, trace, index) {
     const changed = records.filter((record) => record.event_type === "change").filter((record) =>
       (Array.isArray(record.data?.files) ? record.data.files : []).some((file) => {
         const normalized = normalizePath(String(file))
-        return normalized === target || normalized.startsWith(`${target}/`)
+        return (
+          normalized === target ||
+          normalized.startsWith(`${target}/`) ||
+          normalized.endsWith(`/${target}`)
+        )
       }),
     )
     const shouldChange = assertion.should_change !== false
