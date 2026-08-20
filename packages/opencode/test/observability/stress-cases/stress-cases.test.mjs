@@ -12,7 +12,7 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url))
 test("stress cases define grounded root-cause and semantic quality scenarios with fixtures", () => {
   const cases = loadCases(rootDir)
 
-  assert.equal(cases.length, 11)
+  assert.equal(cases.length, 14)
   assert.deepEqual(
     cases.map((item) => item.case_id),
     [
@@ -23,6 +23,9 @@ test("stress cases define grounded root-cause and semantic quality scenarios wit
       "subagent-misleading-summary",
       "insufficient-verification",
       "tool-failure-hallucination",
+      "context-restart-artifact-contamination",
+      "control-flow-preservation",
+      "nested-skill-chain",
       "design-quality-regression",
       "semantic-requirement-priority",
       "semantic-architecture-boundary",
@@ -225,6 +228,12 @@ test("stress runner supports explicit multi-step HTTP flows for compaction scena
   assert.equal(flowActions[1].auto, false)
   assert.match(flowActions[2].text, /上一轮|前一轮/)
   assert.doesNotMatch(flowActions[2].text, /src\/payment/)
+
+  const contextRecoveryCase = loadCases(rootDir).find((item) => item.case_id === "context-restart-artifact-contamination")
+  const contextFlowActions = runner.planCaseActions(contextRecoveryCase)
+  assert.deepEqual(contextFlowActions.map((item) => item.type), ["prompt", "new_session", "prompt"])
+  assert.match(contextFlowActions[0].text, /stale_run\.md/)
+  assert.match(contextFlowActions[2].text, /15%/)
 })
 
 test("trace sufficiency review marks mechanism-missing cases as ineffective", () => {

@@ -81,13 +81,22 @@
         "type": "array",
         "minItems": 1,
         "items": {
-          "oneOf": [
+    "oneOf": [
             {
               "type": "object",
               "required": ["type", "text"],
               "properties": {
                 "type": { "const": "prompt" },
                 "text": { "type": "string" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["type"],
+              "properties": {
+                "type": { "const": "new_session" },
+                "title": { "type": "string" }
               },
               "additionalProperties": false
             },
