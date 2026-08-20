@@ -30,6 +30,14 @@ from .checkpoint import (
     publish_output_transaction,
 )
 from .claude import ClaudeJudgeClient, parse_json_object
+from .defect_explanation import (
+    DEFECT_EXPLANATION_PROMPT_SCHEMA_VERSION,
+    build_defect_evolution,
+    explanation_output_path,
+    publish_defect_explanation,
+    render_defect_explanation_markdown,
+    synthesize_defect_evolution,
+)
 from .errors import AttributionInputError
 from .graph import TraceGraph, artifact_root_for_trace_path
 from .models import stable_json
@@ -150,8 +158,18 @@ def analyze(request: AttributionRequest) -> AttributionResult:
                 binding=request.question_binding,
                 starts=starts,
             )
+            report_payload = enrich_attribution_explanation(
+                report_payload,
+                graph,
+                transport=transport,
+            )
             atomic_write_json(out, report_payload)
             atomic_write_json(lineage_out, graph.message_lineage)
+            publish_defect_explanation(
+                out,
+                report_payload,
+                report_payload["defect_evolution"],
+            )
             return AttributionResult(
                 output_path=out,
                 lineage_path=lineage_out,
@@ -186,8 +204,18 @@ def analyze(request: AttributionRequest) -> AttributionResult:
             binding=request.question_binding,
             starts=starts,
         )
+        report_payload = enrich_attribution_explanation(
+            report_payload,
+            graph,
+            transport=transport,
+        )
         atomic_write_json(out, report_payload)
         atomic_write_json(lineage_out, graph.message_lineage)
+        publish_defect_explanation(
+            out,
+            report_payload,
+            report_payload["defect_evolution"],
+        )
 
     return AttributionResult(
         output_path=out,
@@ -228,6 +256,7 @@ def _run_recursive_analysis(
             "fusion_mode": options.fusion_mode,
             "global_judgment_contract": GLOBAL_CANDIDATE_PERSISTENCE_CONTRACT_VERSION,
             "root_confirmation_contract": ROOT_CONFIRMATION_PERSISTENCE_CONTRACT_VERSION,
+            "defect_explanation_contract": DEFECT_EXPLANATION_PROMPT_SCHEMA_VERSION,
         }
     )
     checkpoint_config = build_checkpoint_config(
@@ -282,6 +311,11 @@ def _run_recursive_analysis(
             binding=request.question_binding,
             starts=starts,
         )
+        report_payload = enrich_attribution_explanation(
+            report_payload,
+            graph,
+            transport=transport,
+        )
         output_commit = checkpoint.completed_replay_output_commit(
             attribution_path=out,
             lineage_path=lineage_out,
@@ -313,7 +347,32 @@ def _run_recursive_analysis(
                     report=report_payload,
                     output_commit=output_commit,
                 )
+        publish_defect_explanation(
+            out,
+            report_payload,
+            report_payload["defect_evolution"],
+        )
     return report_payload
+
+
+def enrich_attribution_explanation(
+    report: Mapping[str, Any],
+    graph: TraceGraph,
+    *,
+    transport: ClaudeJudgeClient | None,
+) -> dict[str, Any]:
+    """Attach a grounded defect-evolution projection to a published report."""
+    payload = _json_safe_copy(report)
+    evolution = build_defect_evolution(payload, graph)
+    if transport is not None and evolution.get("steps") and (
+        payload.get("confirmed_roots") or payload.get("co_roots")
+    ):
+        evolution = synthesize_defect_evolution(
+            evolution,
+            transport=transport,
+        )
+    payload["defect_evolution"] = evolution
+    return payload
 
 
 def analysis_start_refs(

@@ -1041,7 +1041,13 @@ class AttributionRequestTest(unittest.TestCase):
             ):
                 api_result = service.analyze(api_request)
 
-            self.assertEqual(stdout.getvalue(), str(cli_output) + "\n")
+            self.assertEqual(
+                stdout.getvalue(),
+                str(cli_output)
+                + "\n"
+                + str(cli_output.with_name(cli_output.stem + ".explanation.md"))
+                + "\n",
+            )
             self.assertTrue(cli_output.is_file())
             self.assertTrue(api_result.output_path.is_file())
             self.assertTrue(
@@ -1514,7 +1520,13 @@ class AttributionRequestTest(unittest.TestCase):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
-            self.assertEqual(stdout.getvalue(), str(output_path) + "\n")
+            self.assertEqual(
+                stdout.getvalue(),
+                str(output_path)
+                + "\n"
+                + str(output_path.with_name(output_path.stem + ".explanation.md"))
+                + "\n",
+            )
             self.assertEqual(stderr.getvalue(), "")
             self.assertEqual(
                 payload["conclusion"],

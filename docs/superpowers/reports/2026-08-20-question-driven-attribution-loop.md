@@ -153,3 +153,62 @@
 2. 测试通过但 AST/控制流不变量被破坏的语义变更。
 
 对应评估应同时记录：人工根因、候选召回、最终根因一致性、证据链完整性、日志缩减比例和模型请求数。实现仍应以通用的证据来源、时间顺序、变更语义和调用契约为基础，避免针对 case 名称、固定 Skill 名称或问题关键词写规则。
+
+## 第三轮：缺陷演化过程解释
+
+### 问题
+
+上一轮能够确认 `dec_24` 是根因，但 `dec_24 -> dec_26 -> offline_question` 只是一条索引路径，不能单独解释：
+
+- 正确契约从哪里产生；
+- 契约是否进入模型上下文；
+- 哪个节点如何改变了语义；
+- 错误决策如何转化为动作；
+- 后续补偿为什么不能修复已发生的偏差；
+- 哪些组件已被排除，以及如何改进。
+
+### 实施方案
+
+新增 `defect_evolution/v1` 投影。离线模块先根据 Causal IR、问题前提、确认根因、递归路径、step judgment、message transform 和实际动作序列确定性重建事实步骤，再允许 LLM 对不可变步骤补充中文解释。
+
+每一步结构化记录：
+
+- `node_ref`、语义组件和运行时组件；
+- `input_refs` 与输入语义；
+- 当前节点发生的语义转换；
+- 输出语义或动作；
+- `defect_before -> defect_after`；
+- 因果角色、原因、原始证据和 evidence refs。
+
+LLM 必须保留全部步骤的节点和顺序，不能修改 stage、缺陷状态或证据 provenance。主路径外的引用只允许来自确定性事实包已经提供的排除项、贡献条件和根因证据。输出越界、缺步或重排时自动回退为确定性解释。
+
+CLI 现在同时生成：
+
+- `<out>.json`：包含 `defect_evolution` 的结构化报告；
+- `<out-stem>.explanation.md`：面向人工阅读的完整过程说明。
+
+### 真实 Trace 结果
+
+对 `nested-skill-implicit-dependency` 的既有真实 Trace 重建出 9 个阶段：
+
+1. plan tool result 形成 `next_tool=yocto_build_execute` 契约；
+2. MCP observation 记录契约结果；
+3. `model_messages_built` 构造模型消息；
+4. `llm_request_ready` 形成 LLM 请求；
+5. Provider transform 生成最终 prompt；
+6. `dec_24` 用“先修改再验证”的自生成假设覆盖显式顺序，缺陷由 absent 变为 present；
+7. `dec_26` 把错误决策物化为 edit 动作；
+8. `dec_30` 迟到调用 execute，但不能撤销顺序偏差；
+9. `offline_question` 记录用户观察到的偏差。
+
+DeepSeek V4 Flash 用 1 次物理请求成功生成受约束中文解释，未改变 9 个节点、阶段或缺陷状态。结果文件：
+
+- `/tmp/observable-opencode-v87-defect-evolution/nested-order.explained.json`
+- `/tmp/observable-opencode-v87-defect-evolution/nested-order.explained.explanation.md`
+
+### 验证
+
+- 新增解释专项测试：10 项通过；
+- Python 全量归因测试：1795 项通过，1 项跳过；
+- `git diff --check`：通过；
+- 真实 DeepSeek 合成：`llm_grounded_synthesis`，9 个步骤，1 次物理请求。

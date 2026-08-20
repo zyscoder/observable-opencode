@@ -505,6 +505,12 @@ python -m trace_attribution \
 - `rejected_hypotheses`：被排除的候选及原因；
 - `confidence`：已确认根因的置信度；
 - `unresolved_gaps`：Trace 缺失或仍无法判定的语义信息。
+- `defect_evolution`：从行为契约、上下文传递、缺陷首次引入、动作物化、迟到补偿到用户观察的逐步语义演化；每一步都包含节点引用、输入语义、语义转换、输出语义、缺陷状态变化和原始证据。
+
+对于已确认根因，模块会先根据 Causal IR、递归路径和数据流边确定性重建
+`defect_evolution`，再调用同一个离线 Judge 对这些不可变步骤生成中文解释。LLM 只能补充说明，
+不能增加、删除、合并或重排节点，也不能修改缺陷状态和证据引用；若输出违反约束，会自动回退
+到确定性解释。该过程只读取 Trace，不改变 Agent、OpenCode session 或 Trace 采集行为。
 
 如果没有足够证据，模块会返回
 `no_confirmed_root_cause / evidence_insufficient`，不会为了给出答案而虚构根因。
@@ -517,14 +523,15 @@ Trace 引用收窄起点；若不知道节点，保持自动候选检索即可�
 
 若 `--out` 为 `/data/evo-bench/attribution/case-001.json`，归因过程中会同时维护结果、
 message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程重启后，可使用相同
-参数继续分析，避免重复消耗已经完成的 Judge 请求。分析正常结束后，CLI 会在终端最后一行
-打印 `--out` 指定的路径；该 JSON 是最终归因报告，也是查看分析结果的首要入口。
+参数继续分析，避免重复消耗已经完成的 Judge 请求。分析正常结束后，CLI 会依次打印
+`--out` 指定的 JSON 路径和面向人工阅读的 Markdown 解释路径。
 
 以上述 `--out` 为例，默认会得到：
 
 ```text
 /data/evo-bench/attribution/
-├── case-001.json                       # 最终归因报告，主要查看它
+├── case-001.json                       # 最终结构化归因报告
+├── case-001.explanation.md             # 完整缺陷描述和逐节点产生过程
 ├── case-001.message-lineage.json       # 离线重建的消息、上下文和数据流
 ├── case-001.judge-cache.jsonl          # 已完成的 LLM Judge 判断缓存
 └── case-001.checkpoint/                # 递归分析断点，用于中断续跑
@@ -532,6 +539,16 @@ message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程
 
 `trace.html` 只用于人工查看 Agent 的原始执行流程，不承载归因结论。归因结果中的 Trace 引用
 可以回到同一 case 的 `trace.html` 或 `trace.json` 核验，但不要把 HTML 当作归因输入。
+
+直接阅读完整的缺陷产生过程：
+
+```bash
+cat /data/evo-bench/attribution/case-001.explanation.md
+```
+
+Markdown 会按数据流顺序展示：用户或 Skill 形成的行为契约、契约如何进入模型上下文、哪个节点
+首次引入缺陷、缺陷如何传播并转化为动作、后续操作为何不能修复既有偏差、用户最终观察到了
+什么，以及直接根因、系统性诱因、已排除原因、反事实和改进建议。
 
 #### 查看分析结果
 
@@ -549,6 +566,7 @@ jq '{
   analysis_outcome,
   conclusion,
   confidence,
+  defect_evolution,
   causal_chain,
   supporting_evidence_refs,
   rejected_hypotheses,

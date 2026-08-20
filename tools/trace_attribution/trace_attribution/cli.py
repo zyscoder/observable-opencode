@@ -14,6 +14,7 @@ from .service import (
     analyze,
     attribution_output_payload,
     atomic_write_json,
+    explanation_output_path,
     judge_cache_output_path,
     lineage_output_path,
     load_graph,
@@ -172,6 +173,7 @@ def main() -> int:
     except AttributionInputError as exc:
         raise SystemExit("error: {0}".format(exc)) from exc
     print(args.out)
+    print(explanation_output_path(Path(args.out)))
     return 0
 
 

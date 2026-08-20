@@ -538,7 +538,7 @@ class RecursiveCliTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertIs(getattr(cli, name), getattr(service, name))
 
-    def test_main_constructs_shared_request_and_prints_only_result_path(self):
+    def test_main_constructs_shared_request_and_prints_result_and_explanation_paths(self):
         from trace_attribution import cli
 
         result = AttributionResult(
@@ -580,7 +580,10 @@ class RecursiveCliTest(unittest.TestCase):
         self.assertEqual(request.options.model, "offline-model")
         self.assertEqual(request.options.judge_timeout_sec, 12.5)
         self.assertEqual(request.options.thinking_mode, "disabled")
-        self.assertEqual(stdout.getvalue(), "/tmp/result.json\n")
+        self.assertEqual(
+            stdout.getvalue(),
+            "/tmp/result.json\n/tmp/result.explanation.md\n",
+        )
 
     def test_main_prints_original_relative_out_and_preserves_duplicate_start_refs(self):
         from trace_attribution import cli
@@ -613,7 +616,10 @@ class RecursiveCliTest(unittest.TestCase):
             request.start_refs,
             ("record:failure", "record:failure"),
         )
-        self.assertEqual(stdout.getvalue(), "result.json\n")
+        self.assertEqual(
+            stdout.getvalue(),
+            "result.json\nresult.explanation.md\n",
+        )
 
     def test_main_does_not_rewrite_service_value_error(self):
         from trace_attribution import cli
