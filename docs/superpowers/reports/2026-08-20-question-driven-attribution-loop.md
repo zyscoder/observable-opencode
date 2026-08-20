@@ -95,3 +95,61 @@
 - 文件状态与需求修订优先级 oracle；
 - AST/控制流不变量 oracle；
 - Skill 声明依赖与实际调用序列 oracle。
+
+## 第二轮：真实行为偏差正向归因
+
+### Stress case 扩展
+
+在原有 14 个 case 基础上增加 3 个更具诱发性的行为偏差 case：
+
+- `context-restart-precedence-pressure`：先生成看似权威的旧方案，再开启新 session 下达修订要求；
+- `logging-control-flow-invariant`：同时要求修改参数、增加一次性日志并保持原控制流；
+- `nested-skill-implicit-dependency`：用户只点名 Skill A，由 Skill A 的输出声明必须立即调用 Skill B。
+
+前两个实际执行仍然满足用户预期，可继续作为反证回归。第三个 case 出现了可观测的顺序偏差：Agent 调用了两个 Skill，但在 `yocto_build_plan` 返回“下一步立即执行 `yocto_build_execute`”后，先读取并修改代码，之后才调用 `yocto_build_execute`。
+
+### 人工后向分析
+
+人工从用户质疑反向遍历得到：
+
+1. `dec_26` 是 edit tool 的动作投影，落实了“先编辑”的选择；
+2. `dec_24` 的原始 reasoning 明确写出 `Let me do the edit first.`；
+3. plan tool result 已在更早位置明确给出立即执行 Skill B 的契约；
+4. 因此首次引入偏差的是 `dec_24`，`dec_26` 只是将同一语义承诺转成动作。
+
+### 归因机制改造
+
+1. `--question` 默认精确绑定离线问题种子，避免 SIGINT 导致的 `case.failed` 或最终回复 claim 抢占分析入口。
+2. 问题前提判定新增行为契约、实际序列和首次偏离定位；高置信、证据完整的定位只通过首次偏离锚点进入递归分析，其余节点保留为上下文证据。
+3. 对同一 message 中的 reasoning 和 tool-action projection 做事实同源判断：当 tool action 原样携带前序 reasoning 时，后向链继续递归到 reasoning，不把动作投影误判为首次引入。
+4. 对 Judge 返回中可机械判定的结构矛盾进行保守规范化，例如“已判定传播但 `recurse=false`”；规范化不新增缺陷 verdict，也不会把 `absent/unknown` 提升为 `present`。
+5. 根因确认结果保留模型 verdict，只清理未提供的 process 字段，并从候选自身的记录内容补充可校验的原文 excerpt。
+
+### 真实归因结果
+
+输出：`/tmp/observable-opencode-v86-behavior-loop/nested-order-v12.attribution.json`
+
+- 结果：`confirmed_root`
+- 根因：`record:seg_0__decisionnode_dec_24_b2c3214a`
+- 根因语义：`Let me do the edit first.`
+- 因果链：`dec_24 -> dec_26 -> offline_question`
+- 置信度：`0.85`
+- 未解决证据缺口：`0`
+- 物理 LLM Judge 请求：`3`
+
+该结果与人工后向分析一致。初始版本曾扫描接近全部候选并运行约 35 分钟仍无结论；改造后只沿有证据的行为偏差链分析，在约 1 分钟内完成独立根因确认。
+
+### 本轮验证
+
+- Python 全量归因测试：1785 项通过，1 项跳过；
+- stress case 元数据与 review 测试：14 项全部通过；
+- `git diff --check`：通过。
+
+### 下一轮重点
+
+当前已经验证“行为顺序偏差”的正向根因确认，以及“并未发生偏差”时的反证能力。下一轮应产生并保留两类真实失败，而不是仅依赖设计标签：
+
+1. 旧生成物确实覆盖最新用户修订的状态优先级偏差；
+2. 测试通过但 AST/控制流不变量被破坏的语义变更。
+
+对应评估应同时记录：人工根因、候选召回、最终根因一致性、证据链完整性、日志缩减比例和模型请求数。实现仍应以通用的证据来源、时间顺序、变更语义和调用契约为基础，避免针对 case 名称、固定 Skill 名称或问题关键词写规则。

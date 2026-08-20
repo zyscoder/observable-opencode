@@ -12,7 +12,7 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url))
 test("stress cases define grounded root-cause and semantic quality scenarios with fixtures", () => {
   const cases = loadCases(rootDir)
 
-  assert.equal(cases.length, 14)
+  assert.equal(cases.length, 17)
   assert.deepEqual(
     cases.map((item) => item.case_id),
     [
@@ -26,6 +26,9 @@ test("stress cases define grounded root-cause and semantic quality scenarios wit
       "context-restart-artifact-contamination",
       "control-flow-preservation",
       "nested-skill-chain",
+      "context-restart-precedence-pressure",
+      "logging-control-flow-invariant",
+      "nested-skill-implicit-dependency",
       "design-quality-regression",
       "semantic-requirement-priority",
       "semantic-architecture-boundary",

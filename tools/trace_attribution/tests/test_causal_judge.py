@@ -24,6 +24,8 @@ from trace_attribution.causal_judge import (
     OfflineJudgeCapability,
     RootConfirmationRequest,
     _factor_role_allowed_refs_from_facts,
+    _canonicalize_causal_step_payload,
+    _canonicalize_root_confirmation_payload,
     _repair_constraints,
     build_causal_step_prompt,
     build_factor_role_prompt,
@@ -542,6 +544,137 @@ class ScriptedTransport:
 
 
 class CausalJudgeValidationTest(unittest.TestCase):
+    def test_canonicalizer_prefers_grounded_recursive_predecessor_over_conflicting_introduction(self):
+        request = sample_step_request()
+        payload = valid_step_payload()
+        payload["candidate_introduction"] = True
+        payload["suggested_investigation"] = {
+            "action": "request_root_confirmation",
+            "arguments": {
+                "hypothesis_id": "hyp:wrong",
+                "candidate_ref": request.current_node.ref,
+                "defect_fingerprint": request.defect_state.fingerprint,
+            },
+            "reason": "Conflicting confirmation request.",
+        }
+
+        normalized = _canonicalize_causal_step_payload(
+            payload, request=request
+        )
+        judgment = validate_causal_step_payload(normalized, request=request)
+
+        self.assertFalse(judgment.candidate_introduction)
+        self.assertTrue(judgment.predecessors[0].recurse)
+        self.assertIsNone(judgment.suggested_investigation)
+
+    def test_canonicalizer_enables_recursion_for_a_present_propagated_defect(self):
+        request = sample_step_request()
+        payload = valid_step_payload(
+            relation="same_defect_propagation",
+            recurse=False,
+        )
+
+        normalized = _canonicalize_causal_step_payload(payload, request=request)
+        judgment = validate_causal_step_payload(normalized, request=request)
+
+        self.assertEqual(judgment.current_defect_status, "present")
+        self.assertTrue(judgment.predecessors[0].recurse)
+
+    def test_canonicalizer_does_not_invent_a_defect_from_a_conflicting_relation(self):
+        request = sample_step_request()
+        payload = valid_step_payload(
+            relation="defect_transformation",
+            recurse=True,
+        )
+        payload["current_defect_status"] = "absent"
+
+        normalized = _canonicalize_causal_step_payload(payload, request=request)
+        judgment = validate_causal_step_payload(normalized, request=request)
+
+        self.assertEqual(judgment.current_defect_status, "absent")
+        self.assertEqual(judgment.predecessors[0].relation, "unknown")
+        self.assertFalse(judgment.predecessors[0].recurse)
+        self.assertIsNone(judgment.predecessors[0].upstream_defect)
+
+    def test_canonicalizer_traces_a_tool_action_back_to_identical_same_turn_reasoning(self):
+        base = sample_step_request()
+        reasoning_text = (
+            "The required next action is execute, but I will edit first."
+        )
+        current = TraceNode(
+            ref="record:tool_decision",
+            record_id="tool_decision",
+            component="processor",
+            event_type="decision",
+            data={
+                "decision_type": "llm_tool_call",
+                "rationale": {
+                    "tool": "edit",
+                    "recent_reasoning": reasoning_text,
+                },
+                "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+            },
+        )
+        reasoning = TraceNode(
+            ref="record:reasoning",
+            record_id="reasoning",
+            component="processor",
+            event_type="decision",
+            data={
+                "decision_type": "reasoning_block",
+                "rationale": reasoning_text,
+                "metadata": {"sessionID": "ses_1", "messageID": "msg_1"},
+            },
+        )
+        candidate = CausalCandidate(
+            ref=reasoning.ref,
+            node=reasoning,
+            source="confirmed_edge",
+            evidence_refs=(reasoning.ref,),
+        )
+        context = dict(base.recursive_context)
+        context["current_ref"] = current.ref
+        context["candidate_predecessors"] = [
+            {
+                "ref": reasoning.ref,
+                "reference": {
+                    "raw_ref": reasoning.ref,
+                    "resolved_ref": reasoning.ref,
+                    "resolution_status": "resolved",
+                },
+                "edge_evidence_references": [],
+                "node": reasoning.compact(),
+                "artifact_hydration": {
+                    "hydrated_artifacts": [],
+                    "hydrated_artifact_hash": "evidence-hash",
+                },
+            }
+        ]
+        request = CausalStepRequest(
+            recursive_context=context,
+            current_node=current,
+            defect_state=base.defect_state,
+            candidates=(candidate,),
+        )
+        payload = valid_step_payload(
+            predecessor_ref=reasoning.ref,
+            relation="contributing_condition",
+            recurse=False,
+        )
+        payload["current_node_ref"] = current.ref
+        payload["candidate_introduction"] = True
+        payload["predecessors"][0]["evidence_refs"] = [reasoning.ref]
+
+        normalized = _canonicalize_causal_step_payload(payload, request=request)
+        judgment = validate_causal_step_payload(normalized, request=request)
+
+        self.assertFalse(judgment.candidate_introduction)
+        self.assertEqual(
+            judgment.predecessors[0].relation,
+            "same_defect_propagation",
+        )
+        self.assertTrue(judgment.predecessors[0].recurse)
+
     def test_evidence_only_nodes_cannot_be_recursive_introduction_candidates(self):
         base = sample_step_request()
         for event_type in (
@@ -1030,6 +1163,43 @@ class CausalJudgeValidationTest(unittest.TestCase):
 
 
 class RootConfirmationValidationTest(unittest.TestCase):
+    def test_confirmation_canonicalizer_uses_an_exact_candidate_excerpt_and_drops_unoffered_process_fields(self):
+        rationale = (
+            "The required next action is execute.\n\n"
+            "Let me do the edit first."
+        )
+        request = sample_confirmation_request(
+            candidate_reference={
+                **reference_envelope("record:decision"),
+                "fact_kind": "candidate_fact",
+                "decisive": True,
+                "content": json.dumps(
+                    {
+                        "component": "processor",
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": rationale,
+                        },
+                    }
+                ),
+            }
+        )
+        payload = valid_confirmation_payload()
+        payload["excerpt"] = "The agent chose to edit before executing."
+        payload["process_confirmation_assessment"] = {
+            "candidate_role": "action_selection"
+        }
+
+        normalized = _canonicalize_root_confirmation_payload(
+            payload,
+            request=request,
+        )
+        judgment = validate_recursive_confirmation(normalized, request=request)
+
+        self.assertEqual(judgment.status, "confirmed")
+        self.assertEqual(judgment.excerpt, "Let me do the edit first.")
+        self.assertEqual(judgment.process_confirmation_assessment, {})
+
     def test_zero_confidence_cannot_confirm_or_reject_a_root(self):
         payload = valid_confirmation_payload()
         payload["confidence"] = 0.0

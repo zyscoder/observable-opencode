@@ -180,6 +180,123 @@ class RecursiveCliTest(unittest.TestCase):
         self.assertIn("yocto_build_execute", transport.prompt)
         self.assertLess(len(transport.prompt.encode("utf-8")), 64_000)
 
+    def test_supported_question_premise_binds_a_grounded_first_deviation(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "localized-premise",
+                "records": [
+                    {
+                        "record_id": "plan",
+                        "component": "mcp",
+                        "event_type": "tool.result",
+                        "data": {"next_tool": "yocto_build_execute"},
+                    },
+                    {
+                        "record_id": "reasoning",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"rationale": "Edit first, then execute."},
+                    },
+                    {
+                        "record_id": "edit",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                        "data": {"tool_name": "edit"},
+                    },
+                    {
+                        "record_id": "execute",
+                        "component": "mcp",
+                        "event_type": "mcp.call",
+                        "data": {"tool": "yocto_build_execute"},
+                    },
+                ],
+            }
+        )
+        question = AttributionQuestion.create(
+            "为什么先 edit，之后才调用 yocto_build_execute？"
+        )
+        bound = service.bind_question_hypothesis(graph, question)
+        seed_ref = bound.default_start_refs()[0]
+        assessment = service._validate_question_premise_assessment(
+            {
+                "status": "supported",
+                "expected_behavior": "Execute the plan before editing.",
+                "alleged_actual_behavior": "The edit happened first.",
+                "reason": "The recorded order violates the plan.",
+                "evidence_refs": ["record:reasoning", "record:edit", "record:execute"],
+                "missing_evidence": [],
+                "confidence": 0.97,
+                "deviation_type": "action_order",
+                "contract_source_refs": ["record:plan"],
+                "actual_sequence_refs": ["record:edit", "record:execute"],
+                "first_deviation_ref": "record:reasoning",
+                "upstream_influence_refs": ["record:plan"],
+                "localization_reason": "The reasoning first commits to the reversed order.",
+            },
+            allowed_refs=frozenset(
+                {"record:plan", "record:reasoning", "record:edit", "record:execute"}
+            ),
+        )
+
+        localized = service.bind_question_premise_assessment(bound, assessment)
+        projection = localized.raw_trace["offline_question_projection"]
+        seed = localized.nodes[seed_ref]
+
+        self.assertEqual(projection["first_deviation_ref"], "record:reasoning")
+        self.assertEqual(seed.data["failure_type"], "action_order")
+        self.assertNotIn("failure_signature", seed.data)
+        self.assertEqual(seed.data["deviation_type"], "action_order")
+        self.assertEqual(seed.data["expected"], "Execute the plan before editing.")
+        self.assertEqual(seed.data["actual"], "The edit happened first.")
+        self.assertEqual(
+            seed.data["contract_source_refs"], ["record:plan"]
+        )
+
+    def test_question_analysis_start_uses_the_bound_seed_even_with_a_case_failure(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "question-start-precedence",
+                "records": [
+                    {
+                        "record_id": "case_failed",
+                        "component": "process",
+                        "event_type": "case.failed",
+                        "data": {
+                            "failure_signature": {
+                                "kind": "signal",
+                                "signal": "SIGINT",
+                            }
+                        },
+                    }
+                ],
+            }
+        )
+        question = AttributionQuestion.create(
+            "为什么没有先执行计划返回的下一步？"
+        )
+        bound = service.bind_question_hypothesis(graph, question)
+
+        starts = service.question_analysis_start_refs(
+            bound,
+            explicit_refs=(),
+            question=question.normalized,
+        )
+
+        self.assertEqual(
+            starts,
+            (bound.raw_trace["offline_question_projection"]["seed_ref"],),
+        )
+        self.assertNotIn("record:case_failed", starts)
+
+        self.assertEqual(
+            service.question_analysis_start_refs(
+                bound,
+                explicit_refs=("record:case_failed",),
+                question=question.normalized,
+            ),
+            ("record:case_failed",),
+        )
+
     def test_contradicted_premise_report_is_a_grounded_no_defect_result(self):
         report = service.question_premise_no_defect_report(
             case_id="premise-report",

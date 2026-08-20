@@ -86,7 +86,7 @@ def analyze(request: AttributionRequest) -> AttributionResult:
     )
     if request.question_binding is not None and not request.start_refs:
         graph = bind_question_hypothesis(graph, request.question_binding)
-    starts = analysis_start_refs(
+    starts = question_analysis_start_refs(
         graph,
         request.start_refs,
         question=request.normalized_question,
@@ -133,7 +133,7 @@ def analyze(request: AttributionRequest) -> AttributionResult:
                 "confidence": 0.0,
             }
         graph = bind_question_premise_assessment(graph, premise_assessment)
-        starts = analysis_start_refs(
+        starts = question_analysis_start_refs(
             graph,
             request.start_refs,
             question=request.normalized_question,
@@ -350,6 +350,28 @@ def analysis_start_refs(
     return resolved
 
 
+def question_analysis_start_refs(
+    graph: TraceGraph,
+    explicit_refs: Iterable[str],
+    *,
+    question: str = "",
+) -> tuple[str, ...]:
+    """Select the bound user-question seed unless the caller chose explicit starts."""
+    requested = tuple(explicit_refs)
+    if requested or not question:
+        return analysis_start_refs(graph, requested, question=question)
+
+    projection = graph.raw_trace.get("offline_question_projection")
+    if not isinstance(projection, Mapping):
+        raise AttributionInputError("offline question projection is missing")
+    seed_ref = str(projection.get("seed_ref") or "")
+    resolved_ref = graph.resolve(seed_ref) or seed_ref
+    seed = graph.nodes.get(resolved_ref)
+    if seed is None or seed.data.get("hypothesis_origin") != "user_question":
+        raise AttributionInputError("question premise seed is missing or invalid")
+    return (resolved_ref,)
+
+
 def bind_question_hypothesis(
     graph: TraceGraph, binding: AttributionQuestion
 ) -> TraceGraph:
@@ -372,10 +394,6 @@ def bind_question_hypothesis(
         "data": {
             "seed_id": binding.question_id,
             "failure_type": "user_reported_expectation_gap",
-            "failure_signature": {
-                "kind": "user_reported_expectation_gap",
-                "question_id": binding.question_id,
-            },
             "expected": (
                 "The recorded execution satisfies the user expectation expressed "
                 "by the attribution question."
@@ -450,6 +468,8 @@ def assess_question_premise(
                 "Return supported when trace facts substantiate the alleged deviation.",
                 "Return unknown when the provided facts cannot decide the premise.",
                 "Judge only whether the question premise is true; do not perform root-cause attribution yet.",
+                "When status is supported, localize the recorded behavioral contract without assigning root cause: cite the contract source, the actual event sequence, and the earliest offered ref where behavior first diverges.",
+                "When an earlier reasoning or planning decision explicitly commits to the wrong order or action, use that decision as first_deviation_ref rather than the later tool call that merely materializes it.",
                 "Use only offered refs in evidence_refs and return one JSON object with no markdown.",
             ],
             "required_output": {
@@ -460,6 +480,12 @@ def assess_question_premise(
                 "evidence_refs": ["offered trace ref"],
                 "missing_evidence": ["string"],
                 "confidence": "number from 0 to 1",
+                "deviation_type": "action_order|action_omission|state_precedence|semantic_change|tool_choice|output_quality|other",
+                "contract_source_refs": ["offered trace ref"],
+                "actual_sequence_refs": ["offered trace ref in chronological order"],
+                "first_deviation_ref": "offered trace ref or empty string",
+                "upstream_influence_refs": ["offered trace ref"],
+                "localization_reason": "string",
             },
         }
     )
@@ -498,6 +524,28 @@ def _validate_question_premise_assessment(
     reason = str(value.get("reason") or "").strip()
     if not reason:
         raise ValueError("question premise reason is required")
+    def grounded_refs(field: str) -> list[str]:
+        return _dedupe_report_values(
+            ref
+            for ref in value.get(field) or ()
+            if isinstance(ref, str) and ref in allowed_refs
+        )
+
+    first_deviation_ref = str(value.get("first_deviation_ref") or "").strip()
+    if first_deviation_ref not in allowed_refs:
+        first_deviation_ref = ""
+    deviation_type = str(value.get("deviation_type") or "").strip().lower()
+    if deviation_type not in {
+        "action_order",
+        "action_omission",
+        "state_precedence",
+        "semantic_change",
+        "tool_choice",
+        "output_quality",
+        "other",
+    }:
+        deviation_type = "other"
+    localization_reason = str(value.get("localization_reason") or "").strip()
     return {
         "schema": "question-premise-assessment/v1",
         "status": status,
@@ -513,6 +561,12 @@ def _validate_question_premise_assessment(
             if str(item).strip()
         ),
         "confidence": confidence,
+        "deviation_type": deviation_type,
+        "contract_source_refs": grounded_refs("contract_source_refs"),
+        "actual_sequence_refs": grounded_refs("actual_sequence_refs"),
+        "first_deviation_ref": first_deviation_ref,
+        "upstream_influence_refs": grounded_refs("upstream_influence_refs"),
+        "localization_reason": localization_reason,
         "analysis_mode": "offline_read_only",
     }
 
@@ -544,10 +598,46 @@ def bind_question_premise_assessment(
             data = record.setdefault("data", {})
             data["premise_status"] = str(assessment.get("status") or "unknown")
             data["premise_assessment"] = _json_safe_copy(assessment)
+            if assessment.get("status") == "supported":
+                deviation_type = str(
+                    assessment.get("deviation_type") or "user_reported_expectation_gap"
+                )
+                data["failure_type"] = deviation_type
+                data["deviation_type"] = deviation_type
+                data["expected"] = str(
+                    assessment.get("expected_behavior") or data.get("expected") or ""
+                )
+                data["actual"] = str(
+                    assessment.get("alleged_actual_behavior") or data.get("actual") or ""
+                )
+                data["mechanism"] = str(
+                    assessment.get("localization_reason")
+                    or assessment.get("reason")
+                    or data.get("mechanism")
+                    or ""
+                )
+                for field in (
+                    "contract_source_refs",
+                    "actual_sequence_refs",
+                    "upstream_influence_refs",
+                ):
+                    data[field] = list(assessment.get(field) or ())
+                data["first_deviation_ref"] = str(
+                    assessment.get("first_deviation_ref") or ""
+                )
             break
     else:
         raise AttributionInputError("offline question seed record is missing")
     projection["premise_assessment"] = _json_safe_copy(assessment)
+    projection["first_deviation_ref"] = str(
+        assessment.get("first_deviation_ref") or ""
+    )
+    projection["contract_source_refs"] = list(
+        assessment.get("contract_source_refs") or ()
+    )
+    projection["actual_sequence_refs"] = list(
+        assessment.get("actual_sequence_refs") or ()
+    )
     return TraceGraph.from_trace(
         trace,
         artifact_root=getattr(graph, "_artifact_root", None),

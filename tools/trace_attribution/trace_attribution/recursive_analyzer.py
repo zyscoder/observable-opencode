@@ -236,6 +236,51 @@ GLOBAL_NON_ROOT_REVIEW_ROLES = frozenset(
 )
 
 
+def _localized_question_candidate_refs(graph: TraceGraph) -> Tuple[str, ...]:
+    """Return grounded behavioral-localization refs in causal review order."""
+    projection = graph.raw_trace.get("offline_question_projection")
+    if not isinstance(projection, Mapping):
+        return ()
+    assessment = projection.get("premise_assessment")
+    if not isinstance(assessment, Mapping):
+        return ()
+    if str(assessment.get("status") or "") != "supported":
+        return ()
+    confidence = assessment.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return ()
+    if float(confidence) < 0.8 or assessment.get("missing_evidence"):
+        return ()
+    ordered = [
+        str(assessment.get("first_deviation_ref") or ""),
+        *[str(ref) for ref in assessment.get("actual_sequence_refs") or ()],
+        *[str(ref) for ref in assessment.get("contract_source_refs") or ()],
+    ]
+    result: List[str] = []
+    for ref in ordered:
+        resolved = graph.resolve(ref) or ref
+        if not ref or resolved not in graph.nodes or resolved in result:
+            continue
+        result.append(resolved)
+    return tuple(result)
+
+
+def _select_navigation_candidates(
+    graph: TraceGraph,
+    eligible: Sequence[CausalCandidate],
+) -> List[CausalCandidate]:
+    """Enter a supported question branch through its first localized deviation."""
+    localized_refs = _localized_question_candidate_refs(graph)
+    if localized_refs:
+        anchor_ref = localized_refs[0]
+        anchored = [
+            candidate for candidate in eligible if candidate.ref == anchor_ref
+        ]
+        if anchored:
+            return anchored[:1]
+    return list(eligible[:NAVIGATION_ROUTE_CANDIDATE_LIMIT])
+
+
 def _process_confirmation_factual_context(
     *,
     graph: TraceGraph,
@@ -13253,11 +13298,14 @@ class RecursiveAnalysisState:
         max_hypotheses: int,
     ) -> int:
         seed_builder = self._seed_builder_for_item(item)
-        selected = [
+        eligible = [
             candidate
             for candidate in candidates
             if authored_root_candidate_eligible(self.graph, candidate.ref)
-        ][:NAVIGATION_ROUTE_CANDIDATE_LIMIT]
+        ]
+        localized_refs = _localized_question_candidate_refs(self.graph)
+        localized_rank = {ref: index for index, ref in enumerate(localized_refs)}
+        selected = _select_navigation_candidates(self.graph, eligible)
         if not selected:
             self.complete_unresolved(
                 item,
@@ -13267,6 +13315,19 @@ class RecursiveAnalysisState:
             return 0
 
         successors: List[AttributionHypothesis] = []
+        question_projection = self.graph.raw_trace.get(
+            "offline_question_projection"
+        )
+        premise_assessment = (
+            question_projection.get("premise_assessment")
+            if isinstance(question_projection, Mapping)
+            else {}
+        )
+        if not isinstance(premise_assessment, Mapping):
+            premise_assessment = {}
+        first_deviation_ref = str(
+            premise_assessment.get("first_deviation_ref") or ""
+        )
         for candidate in selected:
             self._remember_candidate(candidate)
             commitment_cues = candidate_commitment_cue_context(
@@ -13282,29 +13343,61 @@ class RecursiveAnalysisState:
                     "The navigation route hypothesis budget is exhausted.",
                 )
                 continue
-            upstream_defect = item.defect_state.transformed(
-                label="candidate_local_process_defect",
-                expected=(
-                    "The decision at {0} should use the known evidence and remaining repair window to "
-                    "advance, verify, or correctly reprioritize the required repair, without introducing "
-                    "a defective plan, action choice, false commitment, or responsible non-repair."
-                ).format(candidate.ref, item.defect_state.label),
-                actual=(
-                    "The decision at {0} is a retrieval-only candidate that may contain a candidate-local "
-                    "process defect which transformed into the downstream defect {1}; presence remains "
-                    "unconfirmed until independent semantic judgment."
-                ).format(candidate.ref, item.defect_state.label),
-                mechanism=(
-                    "Judge an erroneous plan, priority drift, action/commitment mismatch, or responsible "
-                    "non-repair at this node separately from the pre-existing downstream functional defect. "
-                    "Offline retrieval is navigation evidence only and is not a causal verdict."
-                ),
-                scope="candidate_local_process_execution",
-                transformation_reason=(
-                    "The progress aggregate is offline routing state, so the downstream failure is transformed "
-                    "into a candidate-local process-defect hypothesis for independent judgment."
-                ),
+            is_localized_deviation = (
+                bool(first_deviation_ref)
+                and candidate.ref == first_deviation_ref
+                and candidate.ref in localized_rank
             )
+            if is_localized_deviation:
+                deviation_type = str(
+                    premise_assessment.get("deviation_type") or "behavior"
+                )
+                upstream_defect = item.defect_state.transformed(
+                    label="localized_{0}_deviation".format(deviation_type),
+                    expected=str(
+                        premise_assessment.get("expected_behavior")
+                        or item.defect_state.expected
+                    ),
+                    actual=str(
+                        premise_assessment.get("alleged_actual_behavior")
+                        or item.defect_state.actual
+                    ),
+                    mechanism=str(
+                        premise_assessment.get("localization_reason")
+                        or premise_assessment.get("reason")
+                        or item.defect_state.mechanism
+                    ),
+                    scope="localized_user_expectation",
+                    transformation_reason=(
+                        "A supported offline premise assessment localized the earliest "
+                        "recorded behavioral divergence at this node; root-cause status "
+                        "still requires independent semantic judgment."
+                    ),
+                )
+            else:
+                upstream_defect = item.defect_state.transformed(
+                    label="candidate_local_process_defect",
+                    expected=(
+                        "The decision at {0} should use the known evidence and remaining repair window to "
+                        "advance, verify, or correctly reprioritize the required repair, without introducing "
+                        "a defective plan, action choice, false commitment, or responsible non-repair."
+                    ).format(candidate.ref, item.defect_state.label),
+                    actual=(
+                        "The decision at {0} is a retrieval-only candidate that may contain a candidate-local "
+                        "process defect which transformed into the downstream defect {1}; presence remains "
+                        "unconfirmed until independent semantic judgment."
+                    ).format(candidate.ref, item.defect_state.label),
+                    mechanism=(
+                        "Judge an erroneous plan, priority drift, action/commitment mismatch, or responsible "
+                        "non-repair at this node separately from the pre-existing downstream functional defect. "
+                        "Offline retrieval is navigation evidence only and is not a causal verdict."
+                    ),
+                    scope="candidate_local_process_execution",
+                    transformation_reason=(
+                        "The progress aggregate is offline routing state, so the downstream failure is transformed "
+                        "into a candidate-local process-defect hypothesis for independent judgment."
+                    ),
+                )
             self._remember_defect(upstream_defect)
             downstream_chain = self.transformation_chains.get(
                 item.defect_state.fingerprint, (item.defect_state,)
@@ -13353,13 +13446,29 @@ class RecursiveAnalysisState:
                 confidence=0.0,
             )
             candidate_path = [candidate.ref, *item.downstream_path]
-            process_trajectory = candidate_process_trajectory_context(
-                graph=self.graph,
-                current_ref=candidate.ref,
-                path=candidate_path,
-            )
             confirmation_path = candidate_path
-            if process_trajectory and item.downstream_path:
+            if is_localized_deviation and item.downstream_path:
+                localized_target = item.downstream_path[-1]
+                self.graph.add_offline_navigation_edge(
+                    candidate.ref,
+                    localized_target,
+                    evidence_refs=evidence_refs,
+                    confidence=float(
+                        premise_assessment.get("confidence") or 0.0
+                    ),
+                )
+                confirmation_path = [candidate.ref, localized_target]
+            else:
+                process_trajectory = candidate_process_trajectory_context(
+                    graph=self.graph,
+                    current_ref=candidate.ref,
+                    path=candidate_path,
+                )
+            if (
+                not is_localized_deviation
+                and process_trajectory
+                and item.downstream_path
+            ):
                 lifecycle_target = item.downstream_path[-1]
                 lifecycle_evidence_refs = tuple(
                     dict.fromkeys(
@@ -13398,13 +13507,15 @@ class RecursiveAnalysisState:
                 seed_binding_identity=hypothesis.seed_binding_identity,
                 depth=item.depth + 1,
                 candidate_source=(
-                    "navigation_commitment_cue"
+                    "question_localized_first_deviation"
+                    if is_localized_deviation
+                    else "navigation_commitment_cue"
                     if commitment_cues
                     else "navigation_semantic_hypothesis"
                 ),
                 priority=(
                     1.0
-                    if commitment_cues
+                    if is_localized_deviation or commitment_cues
                     else min(max(candidate.score, 0.0), 0.99)
                 ),
                 checked_evidence_refs=list(evidence_refs),
@@ -17962,6 +18073,45 @@ class AgenticRecursiveAnalyzer:
                     for candidate in candidates
                     if candidate.ref in assessment_refs
                 )
+                localized_refs = _localized_question_candidate_refs(graph)
+                localized_anchor_refs = localized_refs[:1]
+                localized_assessment_refs = {
+                    ref
+                    for ref in localized_anchor_refs
+                    if ref in {candidate.ref for candidate in assessment_candidates}
+                }
+                if localized_assessment_refs:
+                    nonlocalized_capsules = tuple(
+                        capsule
+                        for capsule in capsules
+                        if capsule.candidate_ref not in localized_assessment_refs
+                    )
+                    merged_context_capsules = [
+                        *evidence_context_capsules,
+                        *nonlocalized_capsules,
+                    ]
+                    seen_context_refs: Set[str] = set()
+                    deduped_context_capsules = []
+                    for capsule in merged_context_capsules:
+                        if capsule.candidate_ref in seen_context_refs:
+                            continue
+                        seen_context_refs.add(capsule.candidate_ref)
+                        deduped_context_capsules.append(capsule)
+                    evidence_context_capsules = tuple(
+                        deduped_context_capsules
+                    )
+                    capsules = tuple(
+                        capsule
+                        for ref in localized_anchor_refs
+                        for capsule in capsules
+                        if capsule.candidate_ref == ref
+                    )
+                    assessment_candidates = tuple(
+                        candidate
+                        for ref in localized_anchor_refs
+                        for candidate in assessment_candidates
+                        if candidate.ref == ref
+                    )
             except Exception as exc:
                 candidate_compression = None
                 if candidate_funnel is not None:
