@@ -505,7 +505,8 @@ python -m trace_attribution \
 - `rejected_hypotheses`：被排除的候选及原因；
 - `confidence`：已确认根因的置信度；
 - `unresolved_gaps`：Trace 缺失或仍无法判定的语义信息。
-- `defect_evolution`：从行为契约、上下文传递、缺陷首次引入、动作物化、迟到补偿到用户观察的逐步语义演化；每一步都包含节点引用、输入语义、语义转换、输出语义、缺陷状态变化和原始证据。
+- `defect_evolution`：从行为契约、上下文传递、缺陷首次引入、动作物化、迟到补偿到用户观察的逐步语义演化。它同时保存机器可审计的节点、状态和证据，以及面向使用者的“谁做了什么、当时知道什么、为什么有问题、怎样影响下一步”。
+- `defect_subject`、`expected_sequence`、`actual_sequence`、`first_deviation`：明确命名本次追踪的具体偏差、比较的动作顺序和首次偏离位置，避免使用“比较期望顺序”“缺陷出现”等没有对象的抽象表述。
 
 对于已确认根因，模块会先根据 Causal IR、递归路径和数据流边确定性重建
 `defect_evolution`，再调用同一个离线 Judge 对这些不可变步骤生成中文解释。LLM 只能补充说明，
@@ -546,9 +547,15 @@ message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程
 cat /data/evo-bench/attribution/case-001.explanation.md
 ```
 
-Markdown 会按数据流顺序展示：用户或 Skill 形成的行为契约、契约如何进入模型上下文、哪个节点
-首次引入缺陷、缺陷如何传播并转化为动作、后续操作为何不能修复既有偏差、用户最终观察到了
-什么，以及直接根因、系统性诱因、已排除原因、反事实和改进建议。
+Markdown 默认采用工程复盘式表达：先明确本次追踪的偏差、期望动作顺序、实际动作顺序和首次
+偏离，再按数据流逐步说明每个参与者做了什么、当时掌握了什么信息、为何引入或没有引入偏差、
+结果怎样影响下一步。`tool.result`、节点 ID、`absent/present/propagated` 等内部字段只出现在文末
+“技术证据附录”，用于开发者审计，不要求普通使用者理解。
+
+本次升级不改变归因 CLI、Python API 或环境变量的使用方式。成功分析后仍然同时得到结构化
+JSON 和 Markdown 报告；变化仅包括 `defect_evolution/v2` 新增偏差对象、期望/实际动作序列、
+首次偏离和人类可读步骤字段，以及 Markdown 增加工程复盘正文和技术证据附录。对已经存在的
+`trace.json`，使用原命令重新执行归因即可生成新版报告，不需要重新运行 Agent 或重新采集 Trace。
 
 #### 查看分析结果
 

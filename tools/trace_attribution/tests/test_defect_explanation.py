@@ -189,7 +189,23 @@ class DefectExplanationTests(unittest.TestCase):
             behavioral_deviation_graph(),
         )
 
-        self.assertEqual(evolution["schema_version"], "defect-evolution/v1")
+        self.assertEqual(evolution["schema_version"], "defect-evolution/v2")
+        self.assertEqual(
+            evolution["defect_subject"],
+            "本应先调用 build_execute 再编辑，但实际先编辑、后调用 build_execute。",
+        )
+        self.assertEqual(
+            evolution["expected_sequence"],
+            ["调用 build_execute", "修改代码"],
+        )
+        self.assertEqual(
+            evolution["actual_sequence"],
+            ["修改代码", "调用 build_execute"],
+        )
+        self.assertEqual(
+            evolution["first_deviation"]["node_ref"],
+            "record:root",
+        )
         self.assertEqual(
             [step["stage"] for step in evolution["steps"]],
             [
@@ -244,6 +260,9 @@ class DefectExplanationTests(unittest.TestCase):
         evolution["steps"][1]["explanation"] = (
             "该节点首次用自生成假设覆盖了显式契约。"
         )
+        evolution["steps"][1]["problem_explanation"] = (
+            "该节点首次用自生成假设覆盖了显式契约。"
+        )
         evolution["contributing_conditions"] = [
             {
                 "title": "契约仅为声明性文本",
@@ -267,19 +286,157 @@ class DefectExplanationTests(unittest.TestCase):
         )
 
         self.assertIn("# 缺陷根因分析", markdown)
-        self.assertIn("## 缺陷产生过程", markdown)
-        self.assertIn("### 第 2 步：缺陷首次引入", markdown)
-        self.assertIn("`record:root`", markdown)
-        self.assertIn("输入语义", markdown)
-        self.assertIn("语义转换", markdown)
-        self.assertIn("输出语义", markdown)
-        self.assertIn("步骤说明：该节点首次用自生成假设覆盖了显式契约。", markdown)
-        self.assertIn("缺陷状态：`absent` → `present`", markdown)
+        self.assertIn("## 一句话结论", markdown)
+        self.assertIn("## 期望动作与实际动作", markdown)
+        self.assertIn("本次追踪的偏差", markdown)
+        self.assertIn("期望顺序：先调用 `build_execute`，再修改代码", markdown)
+        self.assertIn("实际顺序：先修改代码，再调用 `build_execute`", markdown)
+        self.assertIn("## 缺陷是怎样一步步产生的", markdown)
+        self.assertIn("### 第 2 步：Agent 首次改变了执行顺序", markdown)
+        self.assertIn("谁在做什么", markdown)
+        self.assertIn("当时掌握的信息", markdown)
+        self.assertIn("为什么这一步有问题", markdown)
+        self.assertIn("对下一步的影响", markdown)
+        self.assertIn("该节点首次用自生成假设覆盖了显式契约。", markdown)
+        narrative, appendix = markdown.split("## 技术证据附录", maxsplit=1)
+        self.assertIn("Agent 决策层决定先修改代码", narrative)
+        self.assertIn("如果 Agent 在首次决策时遵循期望顺序", narrative)
+        self.assertNotIn("The reasoning overrode", narrative)
+        self.assertNotIn("record:", narrative)
+        self.assertNotIn("tool.result", narrative)
+        self.assertNotIn("`absent`", narrative)
+        self.assertNotIn("`present`", narrative)
+        self.assertIn("`record:root`", appendix)
+        self.assertIn("`tool.result`", appendix)
+        self.assertIn("`absent` -> `present`", appendix)
         self.assertIn("## 反事实", markdown)
         self.assertIn("## 系统性诱因", markdown)
         self.assertIn("Harness 没有把 next_tool 转换为强制 obligation。", markdown)
         self.assertIn("工具保持可用并在后续成功执行。", markdown)
         self.assertIn("## 改进建议", markdown)
+
+    def test_each_step_explains_the_actor_action_deviation_and_next_effect(self):
+        evolution = service.build_defect_evolution(
+            behavioral_deviation_report(),
+            behavioral_deviation_graph(),
+        )
+
+        root_step = next(
+            step
+            for step in evolution["steps"]
+            if step["node_ref"] == "record:root"
+        )
+
+        self.assertEqual(root_step["actor"], "Agent 决策层")
+        self.assertIn("先修改代码", root_step["action_description"])
+        self.assertIn("build_execute", root_step["knowledge_at_time"])
+        self.assertIn("首次", root_step["problem_explanation"])
+        self.assertIn("编辑", root_step["effect_on_next"])
+        self.assertEqual(
+            root_step["human_defect_state"],
+            "执行要求原本正确，但在本步骤首次产生了顺序偏差。",
+        )
+
+    def test_order_comparison_excludes_actions_outside_the_contract_deviation(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "wide-action-window",
+                "records": [
+                    {
+                        "record_id": "plan-call",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                        "data": {"tool_name": "syntheticBuildChain_yocto_build_plan"},
+                    },
+                    {
+                        "record_id": "plan",
+                        "component": "tool",
+                        "event_type": "tool.result",
+                        "data": {
+                            "tool_name": "syntheticBuildChain_yocto_build_plan",
+                            "output": {"preview": '{"next_tool":"yocto_build_execute"}'},
+                        },
+                    },
+                    {
+                        "record_id": "read",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                        "data": {"tool_name": "read"},
+                    },
+                    {
+                        "record_id": "root",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "source_refs": ["record:plan"],
+                        "data": {"rationale": "Let me edit first."},
+                    },
+                    {
+                        "record_id": "edit",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "source_refs": ["record:root"],
+                        "data": {
+                            "decision_type": "llm_tool_call",
+                            "chosen_action": "edit",
+                        },
+                    },
+                    {
+                        "record_id": "execute",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                        "source_refs": ["record:edit"],
+                        "data": {
+                            "tool_name": "syntheticBuildChain_yocto_build_execute"
+                        },
+                    },
+                    {
+                        "record_id": "question",
+                        "component": "case",
+                        "event_type": "case.observed_defect",
+                        "source_refs": ["record:execute"],
+                        "data": {"actual": "Editing happened before Yocto execution."},
+                    },
+                ],
+            }
+        )
+        report = behavioral_deviation_report()
+        premise = report["analysis_question"]["premise_assessment"]
+        premise["contract_source_refs"] = ["record:plan"]
+        premise["first_deviation_ref"] = "record:edit"
+        premise["actual_sequence_refs"] = [
+            "record:plan-call",
+            "record:plan",
+            "record:read",
+            "record:root",
+            "record:edit",
+            "record:execute",
+            "record:question",
+        ]
+        report["confirmed_roots"][0]["recursive_path"] = [
+            "record:root",
+            "record:edit",
+            "record:question",
+        ]
+        report["causal_chain"] = [
+            ["record:root", "record:edit", "record:question"]
+        ]
+
+        evolution = service.build_defect_evolution(report, graph)
+
+        self.assertEqual(
+            evolution["expected_sequence"],
+            ["调用 yocto_build_execute", "修改代码"],
+        )
+        self.assertEqual(
+            evolution["actual_sequence"],
+            ["修改代码", "调用 yocto_build_execute"],
+        )
+        self.assertIn(
+            "先修改代码",
+            evolution["first_deviation"]["action"],
+        )
+        self.assertNotIn("read", evolution["defect_subject"])
+        self.assertNotIn("build_plan", evolution["defect_subject"])
 
     def test_derives_a_stable_explanation_path_from_the_json_report_path(self):
         path_builder = getattr(service, "explanation_output_path", None)
@@ -323,6 +480,12 @@ class DefectExplanationTests(unittest.TestCase):
                         "transformation": "Grounded transformation for {0}.".format(ref),
                         "output_semantics": "Grounded output for {0}.".format(ref),
                         "causal_reason": "Grounded causal role for {0}.".format(ref),
+                        "human_title": "Human title for {0}.".format(ref),
+                        "actor": "Human actor for {0}.".format(ref),
+                        "action_description": "Human action for {0}.".format(ref),
+                        "knowledge_at_time": "Human knowledge for {0}.".format(ref),
+                        "problem_explanation": "Human problem for {0}.".format(ref),
+                        "effect_on_next": "Human effect for {0}.".format(ref),
                     }
                     for ref in refs
                 ],
@@ -367,6 +530,14 @@ class DefectExplanationTests(unittest.TestCase):
         self.assertEqual(
             enriched["steps"][1]["explanation"],
             "Grounded explanation for record:root.",
+        )
+        self.assertEqual(
+            enriched["steps"][1]["actor"],
+            "Human actor for record:root.",
+        )
+        self.assertEqual(
+            enriched["steps"][1]["problem_explanation"],
+            "Human problem for record:root.",
         )
         self.assertEqual(enriched["generation"]["mode"], "llm_grounded_synthesis")
         self.assertIn("record:root", transport.last_prompt)
@@ -431,7 +602,7 @@ class DefectExplanationTests(unittest.TestCase):
                 Path(tempdir) / "case.attribution.explanation.md",
             )
             text = explanation_path.read_text(encoding="utf-8")
-            self.assertIn("## 缺陷产生过程", text)
+            self.assertIn("## 缺陷是怎样一步步产生的", text)
             self.assertIn("`record:root`", text)
 
     def test_enriches_the_published_json_with_the_stepwise_evolution(self):

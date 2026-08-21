@@ -12,8 +12,8 @@ from .graph import TraceGraph
 from .models import stable_json
 
 
-DEFECT_EVOLUTION_SCHEMA_VERSION = "defect-evolution/v1"
-DEFECT_EXPLANATION_PROMPT_SCHEMA_VERSION = "defect-explanation-prompt/v1"
+DEFECT_EVOLUTION_SCHEMA_VERSION = "defect-evolution/v2"
+DEFECT_EXPLANATION_PROMPT_SCHEMA_VERSION = "defect-explanation-prompt/v2"
 
 
 _STAGE_TITLES = {
@@ -51,6 +51,13 @@ def build_defect_evolution(
     ]
     actual_sequence = _grounded_refs(graph, premise.get("actual_sequence_refs"))
     next_actions = _contract_next_actions(graph, contract_refs)
+    expected_sequence, actual_action_sequence = _behavior_sequences(
+        graph,
+        report,
+        contract_refs=contract_refs,
+        actual_sequence=actual_sequence,
+        next_actions=next_actions,
+    )
     late_recovery_ref = _late_recovery_ref(
         graph,
         actual_sequence,
@@ -149,6 +156,10 @@ def build_defect_evolution(
             )
         )
 
+    first_deviation = next(
+        (step for step in steps if step.get("stage") == "defect_introduction"),
+        {},
+    )
     return {
         "schema_version": DEFECT_EVOLUTION_SCHEMA_VERSION,
         "analysis_outcome": str(report.get("analysis_outcome") or "inconclusive"),
@@ -157,6 +168,20 @@ def build_defect_evolution(
         ),
         "expected_behavior": str(premise.get("expected_behavior") or ""),
         "actual_behavior": str(premise.get("alleged_actual_behavior") or ""),
+        "defect_subject": _defect_subject(
+            expected_sequence,
+            actual_action_sequence,
+            expected_behavior=str(premise.get("expected_behavior") or ""),
+            actual_behavior=str(premise.get("alleged_actual_behavior") or ""),
+        ),
+        "expected_sequence": expected_sequence,
+        "actual_sequence": actual_action_sequence,
+        "first_deviation": {
+            "node_ref": str(first_deviation.get("node_ref") or ""),
+            "actor": str(first_deviation.get("actor") or ""),
+            "action": str(first_deviation.get("action_description") or ""),
+            "explanation": str(first_deviation.get("problem_explanation") or ""),
+        },
         "primary_cause": _primary_cause(root, root_ref),
         "steps": [
             {**step, "sequence": index}
@@ -182,21 +207,33 @@ def render_defect_explanation_markdown(
     lines = [
         "# 缺陷根因分析",
         "",
-        "## 分析结论",
+        "## 一句话结论",
         "",
-        str(
-            _mapping(evolution.get("primary_cause")).get("explanation")
-            or report.get("conclusion")
-            or "当前证据不足以确认根因。"
+        _human_conclusion(evolution, report),
+        "",
+        "- 本次追踪的偏差：{0}".format(
+            evolution.get("defect_subject") or "当前证据不足以明确命名偏差。"
         ),
         "",
-        "## 用户期望与实际行为",
+        "## 期望动作与实际动作",
         "",
-        "- 用户问题：{0}".format(evolution.get("question") or "未提供"),
-        "- 期望行为：{0}".format(evolution.get("expected_behavior") or "未记录"),
-        "- 实际行为：{0}".format(evolution.get("actual_behavior") or "未记录"),
+        "- 用户关心的问题：{0}".format(evolution.get("question") or "未提供"),
+        "- 期望顺序：{0}".format(
+            _render_action_sequence(evolution.get("expected_sequence") or ())
+            or evolution.get("expected_behavior")
+            or "未记录"
+        ),
+        "- 实际顺序：{0}".format(
+            _render_action_sequence(evolution.get("actual_sequence") or ())
+            or evolution.get("actual_behavior")
+            or "未记录"
+        ),
+        "- 首次偏离：{0}".format(
+            _mapping(evolution.get("first_deviation")).get("action")
+            or "当前证据不足以定位"
+        ),
         "",
-        "## 缺陷产生过程",
+        "## 缺陷是怎样一步步产生的",
         "",
     ]
     for step in evolution.get("steps") or ():
@@ -207,29 +244,25 @@ def render_defect_explanation_markdown(
             [
                 "### 第 {0} 步：{1}".format(
                     step.get("sequence") or "?",
-                    _STAGE_TITLES.get(stage, stage or "语义演化"),
+                    step.get("human_title")
+                    or _STAGE_TITLES.get(stage, stage or "语义演化"),
                 ),
                 "",
-                "- 节点：`{0}`".format(step.get("node_ref") or "unknown"),
-                "- 组件：`{0}` / `{1}`".format(
-                    step.get("component") or "unknown",
-                    step.get("event_type") or "unknown",
+                "- **谁在做什么**：{0}。{1}".format(
+                    step.get("actor") or "未识别的组件",
+                    step.get("action_description") or "未记录具体动作。",
                 ),
-                *(
-                    ["- 步骤说明：{0}".format(step.get("explanation"))]
-                    if step.get("explanation")
-                    else []
+                "- **当时掌握的信息**：{0}".format(
+                    step.get("knowledge_at_time") or "未记录"
                 ),
-                "- 输入语义：{0}".format(step.get("input_semantics") or "未记录"),
-                "- 语义转换：{0}".format(step.get("transformation") or "未记录"),
-                "- 输出语义：{0}".format(step.get("output_semantics") or "未记录"),
-                "- 缺陷状态：`{0}` → `{1}`".format(
-                    step.get("defect_before") or "unknown",
-                    step.get("defect_after") or "unknown",
+                "- **为什么这一步有问题**：{0}".format(
+                    step.get("problem_explanation") or "本步骤没有引入新的偏差。"
                 ),
-                "- 因果说明：{0}".format(step.get("causal_reason") or "未记录"),
-                "- 原始证据：{0}".format(
-                    _markdown_quote(str(step.get("evidence_excerpt") or "未记录"))
+                "- **对下一步的影响**：{0}".format(
+                    step.get("effect_on_next") or "未记录"
+                ),
+                "- **此时偏差发展到哪里**：{0}".format(
+                    step.get("human_defect_state") or "未确定"
                 ),
                 "",
             ]
@@ -240,14 +273,10 @@ def render_defect_explanation_markdown(
         for item in contributing:
             if not isinstance(item, Mapping):
                 continue
-            refs = ", ".join(
-                "`{0}`".format(ref) for ref in item.get("evidence_refs") or ()
-            )
             lines.append(
-                "- **{0}**：{1}{2}".format(
+                "- **{0}**：{1}".format(
                     item.get("title") or item.get("component") or "未分类诱因",
                     item.get("explanation") or item.get("reason") or "未记录",
-                    "（证据：{0}）".format(refs) if refs else "",
                 )
             )
     else:
@@ -257,7 +286,7 @@ def render_defect_explanation_markdown(
             "",
             "## 反事实",
             "",
-            str(evolution.get("counterfactual") or "缺少可验证的反事实结论。"),
+            _human_counterfactual(evolution),
             "",
             "## 已排除原因",
             "",
@@ -269,7 +298,7 @@ def render_defect_explanation_markdown(
             if not isinstance(item, Mapping):
                 continue
             lines.append(
-                "- `{0}`：{1}".format(
+                "- **{0}**：{1}".format(
                     item.get("component") or item.get("node_ref") or "unknown",
                     item.get("explanation")
                     or item.get("reason")
@@ -289,6 +318,40 @@ def render_defect_explanation_markdown(
             lines.append("- {0}".format(recommendation))
     else:
         lines.append("- 当前解释未生成有证据约束的改进建议。")
+    lines.extend(["", "## 技术证据附录", ""])
+    lines.append(
+        "以下内容用于审计归因结论；普通读者不需要理解节点 ID、事件类型或内部状态码。"
+    )
+    lines.append("")
+    for step in evolution.get("steps") or ():
+        if not isinstance(step, Mapping):
+            continue
+        lines.extend(
+            [
+                "### 证据 {0}：`{1}`".format(
+                    step.get("sequence") or "?", step.get("node_ref") or "unknown"
+                ),
+                "",
+                "- 运行时组件/事件：`{0}` / `{1}`".format(
+                    step.get("runtime_component") or "unknown",
+                    step.get("event_type") or "unknown",
+                ),
+                "- 内部缺陷状态：`{0}` -> `{1}`".format(
+                    step.get("defect_before") or "unknown",
+                    step.get("defect_after") or "unknown",
+                ),
+                "- 输入节点：{0}".format(
+                    ", ".join(
+                        "`{0}`".format(ref) for ref in step.get("input_refs") or ()
+                    )
+                    or "无"
+                ),
+                "- 原始证据：{0}".format(
+                    _markdown_quote(str(step.get("evidence_excerpt") or "未记录"))
+                ),
+                "",
+            ]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -342,6 +405,10 @@ def synthesize_defect_evolution(
             or [],
             "instructions": [
                 "Write a detailed Chinese root-cause explanation from the supplied facts only.",
+                "Write the human-facing fields as an engineering incident narrative, not as a translation of trace fields.",
+                "For every step, explicitly say who did what, what information was available then, why the step was or was not defective, and how it affected the next step.",
+                "Do not use unexplained event names such as tool.result, component identifiers, or state codes such as absent/present in human-facing fields.",
+                "Use concrete nouns: name the tool, Skill, action, requirement, decision, file, or result being discussed whenever the supplied facts contain it.",
                 "Explain what entered each node, how its semantics changed, what it produced, and how the defect state changed.",
                 "Preserve exactly the supplied process-step node refs and order; do not add, remove, merge, or reorder steps.",
                 "Distinguish direct root, propagation/materialization, late recovery, observation, contributing conditions, and ruled-out causes.",
@@ -359,6 +426,12 @@ def synthesize_defect_evolution(
                         "transformation": "how this node interpreted or changed them",
                         "output_semantics": "what semantics or action left the node",
                         "causal_reason": "why this step has its recorded causal role",
+                        "human_title": "short Chinese title describing the concrete event",
+                        "actor": "human-readable actor or subsystem name",
+                        "action_description": "what this actor concretely did",
+                        "knowledge_at_time": "what relevant requirement and evidence were available at that moment",
+                        "problem_explanation": "why this step introduced, propagated, repaired, observed, or did not cause the deviation",
+                        "effect_on_next": "how this output concretely changed the next decision or action",
                     }
                 ],
                 "contributing_conditions": [
@@ -478,6 +551,12 @@ def _validate_synthesis(
         "transformation",
         "output_semantics",
         "causal_reason",
+        "human_title",
+        "actor",
+        "action_description",
+        "knowledge_at_time",
+        "problem_explanation",
+        "effect_on_next",
     )
     normalized_steps: list[dict[str, str]] = []
     for step in steps:
@@ -557,6 +636,12 @@ def _merge_synthesis(
             "transformation",
             "output_semantics",
             "causal_reason",
+            "human_title",
+            "actor",
+            "action_description",
+            "knowledge_at_time",
+            "problem_explanation",
+            "effect_on_next",
         ):
             merged[field] = explanation[field]
         merged_steps.append(merged)
@@ -636,6 +721,14 @@ def _evolution_step(
     component = node.component if node is not None else "user"
     event_type = node.event_type if node is not None else "case.observed_defect"
     excerpt = _semantic_excerpt(data)
+    human = _human_step_fields(
+        graph,
+        report,
+        ref=ref,
+        stage=stage,
+        data=data,
+        excerpt=excerpt,
+    )
     return {
         "sequence": 0,
         "stage": stage,
@@ -653,7 +746,349 @@ def _evolution_step(
         "causal_reason": reason or _default_causal_reason(stage),
         "evidence_excerpt": excerpt,
         "evidence_refs": list(dict.fromkeys([ref, *input_refs])),
+        **human,
     }
+
+
+def _behavior_sequences(
+    graph: TraceGraph,
+    report: Mapping[str, Any],
+    *,
+    contract_refs: list[str],
+    actual_sequence: list[str],
+    next_actions: set[str],
+) -> tuple[list[str], list[str]]:
+    ordered_contract_actions: list[str] = []
+    for ref in contract_refs:
+        actions: set[str] = set()
+        _collect_next_actions(graph.nodes[ref].data, actions)
+        for action in sorted(actions):
+            label = "调用 {0}".format(action)
+            if label not in ordered_contract_actions:
+                ordered_contract_actions.append(label)
+    for action in sorted(next_actions):
+        label = "调用 {0}".format(action)
+        if label not in ordered_contract_actions:
+            ordered_contract_actions.append(label)
+
+    premise = _question_premise(report)
+    if str(premise.get("deviation_type") or "") == "action_order":
+        contract_positions = [
+            actual_sequence.index(ref)
+            for ref in contract_refs
+            if ref in actual_sequence
+        ]
+        window_start = max(contract_positions) + 1 if contract_positions else 0
+        first_deviation_ref = _grounded_ref(
+            graph, premise.get("first_deviation_ref")
+        )
+        first_deviation_position = (
+            actual_sequence.index(first_deviation_ref)
+            if first_deviation_ref in actual_sequence
+            else window_start
+        )
+        relevant_actual: list[str] = []
+        deviation_action_found = False
+        for index, ref in enumerate(actual_sequence[window_start:], start=window_start):
+            node = graph.nodes.get(ref)
+            if node is None:
+                continue
+            label = _node_action_label(node.data, node.event_type)
+            if not label:
+                continue
+            required_label = _matching_contract_action(
+                label, ordered_contract_actions
+            )
+            is_deviation_action = ref == first_deviation_ref
+            if (
+                not is_deviation_action
+                and not deviation_action_found
+                and index >= first_deviation_position
+                and not required_label
+            ):
+                is_deviation_action = True
+            if not is_deviation_action and not required_label:
+                continue
+            normalized = required_label or label
+            if not relevant_actual or relevant_actual[-1] != normalized:
+                relevant_actual.append(normalized)
+            deviation_action_found = deviation_action_found or is_deviation_action
+
+        expected = list(ordered_contract_actions)
+        expected.extend(
+            action
+            for action in relevant_actual
+            if action not in expected
+        )
+        return expected, relevant_actual
+
+    actual_actions: list[str] = []
+    for ref in actual_sequence:
+        node = graph.nodes.get(ref)
+        if node is None:
+            continue
+        label = _node_action_label(node.data, node.event_type)
+        if label and (not actual_actions or actual_actions[-1] != label):
+            actual_actions.append(label)
+    return ordered_contract_actions, actual_actions
+
+
+def _matching_contract_action(
+    actual_label: str, contract_actions: Iterable[str]
+) -> str:
+    if not actual_label.startswith("调用 "):
+        return ""
+    actual_name = _normalized_action_name(actual_label[len("调用 ") :])
+    for contract_label in contract_actions:
+        if not contract_label.startswith("调用 "):
+            continue
+        contract_name = _normalized_action_name(contract_label[len("调用 ") :])
+        if actual_name == contract_name or actual_name.endswith("_" + contract_name):
+            return contract_label
+    return ""
+
+
+def _normalized_action_name(value: str) -> str:
+    return value.replace(":", "_").replace(".", "_").strip().lower()
+
+
+def _node_action_label(data: Mapping[str, Any], event_type: str) -> str:
+    action = str(data.get("chosen_action") or data.get("tool_name") or "").strip()
+    if not action:
+        return ""
+    if action in {"edit", "write", "apply_patch"}:
+        return "修改代码"
+    if event_type in {"tool.call", "mcp.call", "skill.call"}:
+        return "调用 {0}".format(action)
+    if str(data.get("decision_type") or "") == "llm_tool_call":
+        return "修改代码" if action in {"edit", "write", "apply_patch"} else "调用 {0}".format(action)
+    return ""
+
+
+def _defect_subject(
+    expected_sequence: list[str],
+    actual_sequence: list[str],
+    *,
+    expected_behavior: str,
+    actual_behavior: str,
+) -> str:
+    if len(expected_sequence) >= 2 and len(actual_sequence) >= 2:
+        return "本应先{0} 再{1}，但实际先{2}、后{3}。".format(
+            _subject_action(expected_sequence[0]),
+            _subject_action(expected_sequence[1]),
+            _subject_action(actual_sequence[0]),
+            _subject_action(actual_sequence[1]),
+        )
+    if expected_sequence and actual_sequence:
+        return "期望执行“{0}”，但实际执行了“{1}”。".format(
+            " -> ".join(expected_sequence), " -> ".join(actual_sequence)
+        )
+    if expected_behavior or actual_behavior:
+        return "期望“{0}”，但实际“{1}”。".format(
+            expected_behavior or "未记录", actual_behavior or "未记录"
+        )
+    return "当前证据不足以明确命名偏差。"
+
+
+def _subject_action(action: str) -> str:
+    return "编辑" if action == "修改代码" else action
+
+
+def _render_action_sequence(actions: Iterable[Any]) -> str:
+    rendered = [_render_action(str(action)) for action in actions if str(action)]
+    if not rendered:
+        return ""
+    if len(rendered) == 1:
+        return rendered[0]
+    if len(rendered) == 2:
+        return "先{0}，再{1}".format(rendered[0], rendered[1])
+    return "先{0}，然后{1}，最后{2}".format(
+        rendered[0], "、".join(rendered[1:-1]), rendered[-1]
+    )
+
+
+def _render_action(action: str) -> str:
+    if action.startswith("调用 "):
+        return "调用 `{0}`".format(action[len("调用 ") :])
+    return action
+
+
+def _human_conclusion(
+    evolution: Mapping[str, Any], report: Mapping[str, Any]
+) -> str:
+    generation = _mapping(evolution.get("generation"))
+    summary = str(evolution.get("summary") or "").strip()
+    if generation.get("mode") == "llm_grounded_synthesis" and summary:
+        return summary
+    first = _mapping(evolution.get("first_deviation"))
+    actor = str(first.get("actor") or "相关组件").strip()
+    action = str(first.get("action") or "首次作出了偏离期望的决定").strip()
+    action = action.rstrip("。；; ")
+    if first:
+        expected = _render_action_sequence(
+            evolution.get("expected_sequence") or ()
+        ) or "既定要求"
+        return "{0}{1}。这一决定首次打破了“{2}”的执行要求，并在下一步被落实为实际动作。".format(
+            actor, action, expected
+        )
+    return str(
+        _mapping(evolution.get("primary_cause")).get("explanation")
+        or report.get("conclusion")
+        or "当前证据不足以确认根因。"
+    )
+
+
+def _human_counterfactual(evolution: Mapping[str, Any]) -> str:
+    expected = _render_action_sequence(evolution.get("expected_sequence") or ())
+    if expected:
+        return "如果 Agent 在首次决策时遵循期望顺序（{0}），后续就不会把该顺序偏差落实为实际动作。".format(
+            expected
+        )
+    return "如果首次偏离节点不覆盖已经收到的正确要求，后续就不会继续传递同一偏差。"
+
+
+def _human_step_fields(
+    graph: TraceGraph,
+    report: Mapping[str, Any],
+    *,
+    ref: str,
+    stage: str,
+    data: Mapping[str, Any],
+    excerpt: str,
+) -> dict[str, str]:
+    premise = _question_premise(report)
+    contract_refs = _grounded_refs(graph, premise.get("contract_source_refs"))
+    next_actions = _contract_next_actions(graph, contract_refs)
+    required = "、".join("`{0}`".format(item) for item in sorted(next_actions))
+    action = _node_action_label(data, str(graph.nodes[ref].event_type)) if ref in graph.nodes else ""
+
+    if stage == "contract_established":
+        tool_name = str(data.get("tool_name") or "规划工具")
+        return {
+            "human_title": "构建规划工具给出了正确的执行要求",
+            "actor": "`{0}` 工具".format(tool_name),
+            "action_description": "运行完成并明确给出下一步应调用 {0}。".format(required or "指定工具"),
+            "knowledge_at_time": "它依据用户要求和当前任务生成了后续执行计划。",
+            "problem_explanation": "本步骤没有问题，它建立了后续应当遵守的正确顺序。",
+            "effect_on_next": "后续 Agent 决策已经有了明确的下一步动作依据。",
+            "human_defect_state": "此时执行要求正确，尚未发生偏差。",
+        }
+    if stage == "context_delivery":
+        return {
+            "human_title": "执行要求被完整传入模型",
+            "actor": "上下文管理层",
+            "action_description": "把前序计划整理为模型能够读取的消息。",
+            "knowledge_at_time": "输入中包含了应当调用 {0} 的要求。".format(required or "指定工具"),
+            "problem_explanation": "本步骤没有删除或改变关键要求，因此不是偏差来源。",
+            "effect_on_next": "模型作决定时仍然能够看到正确的执行要求。",
+            "human_defect_state": "正确要求仍被保留，偏差尚未发生。",
+        }
+    if stage == "defect_introduction":
+        first_actual = _first_deviation_action(graph, report)
+        action_text = (
+            "决定先{0}，没有立即调用 {1}。".format(
+                first_actual, required
+            )
+            if first_actual and required
+            else "产生了与既定要求不一致的决定：{0}".format(excerpt)
+        )
+        return {
+            "human_title": "Agent 首次改变了执行顺序",
+            "actor": "Agent 决策层",
+            "action_description": action_text,
+            "knowledge_at_time": "已经收到明确要求：下一步应调用 {0}。".format(required or "指定工具"),
+            "problem_explanation": "这里是偏差首次产生的位置：Agent 看到了正确要求，却用自己的执行顺序覆盖了它。",
+            "effect_on_next": "这个决定直接使后续先执行编辑，而不是先运行要求的工具。",
+            "human_defect_state": "执行要求原本正确，但在本步骤首次产生了顺序偏差。",
+        }
+    if stage == "defect_materialization":
+        return {
+            "human_title": "错误决定变成了实际操作",
+            "actor": "Agent 动作生成层",
+            "action_description": "发起{0}，把上一阶段的决定落实为实际动作。".format(action or "对应操作"),
+            "knowledge_at_time": "沿用了上一决策中“先编辑”的安排。",
+            "problem_explanation": "它不是最早的根因，但让原本只存在于决策中的顺序偏差真正发生。",
+            "effect_on_next": "此后即使再调用要求的工具，也只能算迟到补做。",
+            "human_defect_state": "顺序偏差已经从错误决定变成可观察的执行行为。",
+        }
+    if stage == "defect_propagation":
+        return {
+            "human_title": "已有偏差继续影响后续处理",
+            "actor": _human_actor(data, ref, graph),
+            "action_description": "继续处理已经带有偏差的前序结果。",
+            "knowledge_at_time": "接收到的上游执行过程已经偏离期望。",
+            "problem_explanation": "本步骤没有首次制造偏差，但继续携带了它。",
+            "effect_on_next": "后续结果继续建立在已经偏离的执行过程上。",
+            "human_defect_state": "已有偏差继续向后传递。",
+        }
+    if stage == "late_recovery":
+        return {
+            "human_title": "要求的工具被迟到调用",
+            "actor": _human_actor(data, ref, graph),
+            "action_description": "随后才{0}。".format(action or "补做要求的动作"),
+            "knowledge_at_time": "此前要求的动作尚未按原顺序执行。",
+            "problem_explanation": "工具本身最终被调用，但调用时机已经晚于用户或 Skill 要求。",
+            "effect_on_next": "它可以补充验证，却不能撤销此前已经发生的顺序偏差。",
+            "human_defect_state": "发生了部分补救，但原有顺序偏差仍然成立。",
+        }
+    if stage == "user_observation":
+        return {
+            "human_title": "用户发现最终行为不符合预期",
+            "actor": "用户",
+            "action_description": "比较预期执行过程与实际执行记录，并提出质疑。",
+            "knowledge_at_time": "期望是“{0}”，实际是“{1}”。".format(
+                premise.get("expected_behavior") or "未记录",
+                premise.get("alleged_actual_behavior") or "未记录",
+            ),
+            "problem_explanation": "这里记录的是偏差被发现，而不是偏差被制造。",
+            "effect_on_next": "该观察成为离线归因分析的起点。",
+            "human_defect_state": "先前产生并传递的偏差最终被用户观察到。",
+        }
+    return {
+        "human_title": _STAGE_TITLES.get(stage, "语义处理"),
+        "actor": _human_actor(data, ref, graph),
+        "action_description": excerpt or "执行了本阶段处理。",
+        "knowledge_at_time": "接收到前序节点提供的信息。",
+        "problem_explanation": "当前证据不足以说明本步骤是否引入新偏差。",
+        "effect_on_next": "处理结果被传递给后续节点。",
+        "human_defect_state": "偏差状态尚不明确。",
+    }
+
+
+def _first_deviation_action(graph: TraceGraph, report: Mapping[str, Any]) -> str:
+    premise = _question_premise(report)
+    first_deviation_ref = _grounded_ref(graph, premise.get("first_deviation_ref"))
+    if first_deviation_ref:
+        node = graph.nodes[first_deviation_ref]
+        label = _node_action_label(node.data, node.event_type)
+        if label:
+            return label
+    actual_refs = _grounded_refs(graph, premise.get("actual_sequence_refs"))
+    start = (
+        actual_refs.index(first_deviation_ref)
+        if first_deviation_ref in actual_refs
+        else 0
+    )
+    for ref in actual_refs[start:]:
+        node = graph.nodes[ref]
+        label = _node_action_label(node.data, node.event_type)
+        if label:
+            return label
+    return ""
+
+
+def _human_actor(data: Mapping[str, Any], ref: str, graph: TraceGraph) -> str:
+    node = graph.nodes.get(ref)
+    if node is None:
+        return "未识别的组件"
+    tool_name = str(data.get("tool_name") or data.get("chosen_action") or "").strip()
+    if tool_name:
+        return "`{0}` 工具执行层".format(tool_name)
+    if node.component == "processor":
+        return "Agent 决策层"
+    if node.component == "context":
+        return "上下文管理层"
+    return "{0} 组件".format(node.component or "未识别")
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
