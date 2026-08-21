@@ -957,59 +957,73 @@ def _human_step_fields(
     excerpt: str,
 ) -> dict[str, str]:
     premise = _question_premise(report)
-    contract_refs = _grounded_refs(graph, premise.get("contract_source_refs"))
-    next_actions = _contract_next_actions(graph, contract_refs)
-    required = "、".join("`{0}`".format(item) for item in sorted(next_actions))
     action = _node_action_label(data, str(graph.nodes[ref].event_type)) if ref in graph.nodes else ""
+    expected = str(premise.get("expected_behavior") or "既定行为要求").strip()
+    actual = str(
+        premise.get("alleged_actual_behavior") or excerpt or "记录到的实际行为"
+    ).strip()
+    is_action_order = str(premise.get("deviation_type") or "") == "action_order"
 
     if stage == "contract_established":
-        tool_name = str(data.get("tool_name") or "规划工具")
         return {
-            "human_title": "构建规划工具给出了正确的执行要求",
-            "actor": "`{0}` 工具".format(tool_name),
-            "action_description": "运行完成并明确给出下一步应调用 {0}。".format(required or "指定工具"),
-            "knowledge_at_time": "它依据用户要求和当前任务生成了后续执行计划。",
-            "problem_explanation": "本步骤没有问题，它建立了后续应当遵守的正确顺序。",
-            "effect_on_next": "后续 Agent 决策已经有了明确的下一步动作依据。",
-            "human_defect_state": "此时执行要求正确，尚未发生偏差。",
+            "human_title": (
+                "执行顺序要求被明确记录"
+                if is_action_order
+                else "行为要求被明确记录"
+            ),
+            "actor": _human_actor(data, ref, graph),
+            "action_description": "记录了后续行为应满足的要求：{0}".format(expected),
+            "knowledge_at_time": "该节点掌握了形成行为约束所需的输入信息。",
+            "problem_explanation": "本步骤建立了判断偏差的基准，没有证据表明它引入了缺陷。",
+            "effect_on_next": "该要求成为后续决策和动作应当遵循的约束。",
+            "human_defect_state": "行为要求已经形成，尚未观察到偏差。",
         }
     if stage == "context_delivery":
         return {
-            "human_title": "执行要求被完整传入模型",
+            "human_title": "行为要求进入后续处理上下文",
             "actor": "上下文管理层",
-            "action_description": "把前序计划整理为模型能够读取的消息。",
-            "knowledge_at_time": "输入中包含了应当调用 {0} 的要求。".format(required or "指定工具"),
-            "problem_explanation": "本步骤没有删除或改变关键要求，因此不是偏差来源。",
-            "effect_on_next": "模型作决定时仍然能够看到正确的执行要求。",
-            "human_defect_state": "正确要求仍被保留，偏差尚未发生。",
+            "action_description": "向后续节点传递行为要求：{0}".format(expected),
+            "knowledge_at_time": "上下文中保留了用于判断后续行为是否符合预期的信息。",
+            "problem_explanation": "当前证据未显示本步骤删除或篡改了关键要求。",
+            "effect_on_next": "后续决策可以依据该要求选择行为。",
+            "human_defect_state": "要求仍然可用，偏差尚未在此处引入。",
         }
     if stage == "defect_introduction":
         first_actual = _first_deviation_action(graph, report)
-        action_text = (
-            "决定先{0}，没有立即调用 {1}。".format(
-                first_actual, required
+        action_description = action or excerpt or actual
+        if is_action_order and first_actual:
+            action_description = "决定先{0}；记录到的实际顺序是：{1}".format(
+                first_actual,
+                actual,
             )
-            if first_actual and required
-            else "产生了与既定要求不一致的决定：{0}".format(excerpt)
-        )
         return {
-            "human_title": "Agent 首次改变了执行顺序",
-            "actor": "Agent 决策层",
-            "action_description": action_text,
-            "knowledge_at_time": "已经收到明确要求：下一步应调用 {0}。".format(required or "指定工具"),
-            "problem_explanation": "这里是偏差首次产生的位置：Agent 看到了正确要求，却用自己的执行顺序覆盖了它。",
-            "effect_on_next": "这个决定直接使后续先执行编辑，而不是先运行要求的工具。",
-            "human_defect_state": "执行要求原本正确，但在本步骤首次产生了顺序偏差。",
+            "human_title": (
+                "Agent 首次改变了执行顺序"
+                if is_action_order
+                else "偏差在本节点首次出现"
+            ),
+            "actor": _human_actor(data, ref, graph),
+            "action_description": action_description,
+            "knowledge_at_time": "可用要求是：{0}".format(expected),
+            "problem_explanation": "本节点首次产生了与要求不一致的语义或决定：{0}".format(actual),
+            "effect_on_next": "这一输出把记录到的偏差带入后续步骤：{0}".format(
+                actual
+            ),
+            "human_defect_state": (
+                "执行要求原本正确，但在本步骤首次产生了顺序偏差。"
+                if is_action_order
+                else "输入中的要求仍然正确，但本节点首次产生了偏差。"
+            ),
         }
     if stage == "defect_materialization":
         return {
-            "human_title": "错误决定变成了实际操作",
-            "actor": "Agent 动作生成层",
-            "action_description": "发起{0}，把上一阶段的决定落实为实际动作。".format(action or "对应操作"),
-            "knowledge_at_time": "沿用了上一决策中“先编辑”的安排。",
-            "problem_explanation": "它不是最早的根因，但让原本只存在于决策中的顺序偏差真正发生。",
-            "effect_on_next": "此后即使再调用要求的工具，也只能算迟到补做。",
-            "human_defect_state": "顺序偏差已经从错误决定变成可观察的执行行为。",
+            "human_title": "偏差被落实为实际行为",
+            "actor": _human_actor(data, ref, graph),
+            "action_description": action or excerpt or actual,
+            "knowledge_at_time": "接收到的上游语义已经包含偏差。",
+            "problem_explanation": "本节点不是最早的根因，但把上游偏差转化成了可观察行为。",
+            "effect_on_next": "后续处理将建立在这一偏离预期的实际结果上：{0}".format(actual),
+            "human_defect_state": "偏差从内部决定转化为外部可观察结果。",
         }
     if stage == "defect_propagation":
         return {
@@ -1023,13 +1037,13 @@ def _human_step_fields(
         }
     if stage == "late_recovery":
         return {
-            "human_title": "要求的工具被迟到调用",
+            "human_title": "后续步骤尝试补偿已有偏差",
             "actor": _human_actor(data, ref, graph),
-            "action_description": "随后才{0}。".format(action or "补做要求的动作"),
-            "knowledge_at_time": "此前要求的动作尚未按原顺序执行。",
-            "problem_explanation": "工具本身最终被调用，但调用时机已经晚于用户或 Skill 要求。",
-            "effect_on_next": "它可以补充验证，却不能撤销此前已经发生的顺序偏差。",
-            "human_defect_state": "发生了部分补救，但原有顺序偏差仍然成立。",
+            "action_description": action or excerpt or "执行了补偿动作。",
+            "knowledge_at_time": "此前流程已经产生了与要求不一致的结果。",
+            "problem_explanation": "本步骤可能减轻影响，但不能证明最早的偏差从未发生。",
+            "effect_on_next": "补偿结果进入后续处理，同时保留原始偏差的因果记录。",
+            "human_defect_state": "影响可能得到部分修复，原始偏差仍可追溯。",
         }
     if stage == "user_observation":
         return {

@@ -4282,39 +4282,6 @@ def _canonicalize_root_confirmation_payload(
     ):
         return normalized
 
-    content = str(request.candidate_reference.get("content") or "")
-    try:
-        candidate_payload = json.loads(content)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        candidate_payload = {}
-    data = (
-        candidate_payload.get("data")
-        if isinstance(candidate_payload, Mapping)
-        else None
-    )
-    rationale = data.get("rationale") if isinstance(data, Mapping) else None
-    semantic_texts: List[str] = []
-    if isinstance(rationale, str):
-        semantic_texts.append(rationale)
-    elif isinstance(rationale, Mapping):
-        for key in ("recent_reasoning", "reasoning", "rationale", "preview"):
-            text = rationale.get(key)
-            if isinstance(text, str) and text.strip():
-                semantic_texts.append(text)
-    excerpt_candidates = [
-        line.strip()
-        for text in semantic_texts
-        for line in reversed(text.splitlines())
-        if 8 <= len(line.strip()) <= 280
-    ]
-    for candidate in excerpt_candidates:
-        candidate_normalized = re.sub(r"\s+", " ", candidate).strip().lower()
-        if any(
-            candidate_normalized in fragment
-            for fragment in fact_tree.candidate_semantic_fragments
-        ):
-            normalized["excerpt"] = candidate
-            break
     return normalized
 
 

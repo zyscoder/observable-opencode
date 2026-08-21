@@ -29,7 +29,7 @@ from .checkpoint import (
     build_checkpoint_config,
     publish_output_transaction,
 )
-from .claude import ClaudeJudgeClient, parse_json_object
+from .claude import ClaudeJudgeClient, TransportCallError, parse_json_object
 from .defect_explanation import (
     DEFECT_EXPLANATION_PROMPT_SCHEMA_VERSION,
     build_defect_evolution,
@@ -125,25 +125,16 @@ def analyze(request: AttributionRequest) -> AttributionResult:
         and not request.start_refs
         and options.engine == "recursive-agentic"
     ):
-        try:
-            premise_assessment = assess_question_premise(
-                transport,
-                graph,
-                request.question_binding,
+        premise_assessment, premise_physical_requests = (
+            _load_or_assess_question_premise(
+                transport=transport,
+                graph=graph,
+                binding=request.question_binding,
                 seed_ref=starts[0],
+                checkpoint_path=paths["checkpoint"],
+                maximum_requests=options.max_judge_requests,
             )
-        except Exception as exc:
-            premise_assessment = {
-                "status": "unknown",
-                "expected_behavior": "",
-                "alleged_actual_behavior": request.question_binding.original,
-                "reason": "Premise assessment failed: {0}: {1}".format(
-                    type(exc).__name__, exc
-                ),
-                "evidence_refs": [],
-                "missing_evidence": ["premise_assessment_unavailable"],
-                "confidence": 0.0,
-            }
+        )
         graph = bind_question_premise_assessment(graph, premise_assessment)
         starts = question_analysis_start_refs(
             graph,
@@ -165,7 +156,23 @@ def analyze(request: AttributionRequest) -> AttributionResult:
             report_payload = enrich_attribution_explanation(
                 report_payload,
                 graph,
-                transport=transport,
+                transport=(
+                    transport
+                    if _remaining_judge_requests(
+                        transport, options.max_judge_requests
+                    )
+                    > 0
+                    else None
+                ),
+            )
+            report_payload = _annotate_shared_judge_budget(
+                report_payload,
+                maximum=options.max_judge_requests,
+                premise_physical_requests=premise_physical_requests,
+                analyzer_physical_requests=0,
+                explanation_physical_requests=_explanation_physical_requests(
+                    report_payload
+                ),
             )
             atomic_write_json(out, report_payload)
             atomic_write_json(lineage_out, graph.message_lineage)
@@ -191,6 +198,11 @@ def analyze(request: AttributionRequest) -> AttributionResult:
             lineage_out=lineage_out,
             cache_path=cache_path,
             checkpoint_path=paths["checkpoint"],
+            premise_physical_requests=(
+                premise_physical_requests
+                if request.question_binding is not None and not request.start_refs
+                else 0
+            ),
         )
     else:
         report = BackwardTaintAnalyzer(
@@ -239,6 +251,7 @@ def _run_recursive_analysis(
     lineage_out: Path,
     cache_path: Path,
     checkpoint_path: Path,
+    premise_physical_requests: int,
 ) -> dict[str, Any]:
     options = request.options
     out = request.output_path
@@ -282,15 +295,48 @@ def _run_recursive_analysis(
             "fusion_mode": options.fusion_mode,
         },
     )
+    checkpoint = CheckpointBundle(checkpoint_path)
+    restored_replay = None
+    historical_analyzer_requests = 0
+    if _checkpoint_has_persisted_state(checkpoint):
+        restored_replay = checkpoint.restore_for_replay(
+            expected_config=checkpoint_config,
+            expected_lineage=graph.message_lineage,
+        )
+        historical_analyzer_requests = _checkpoint_analyzer_request_count(
+            restored_replay.state
+        )
+        if restored_replay.state.final_report is not None:
+            report_payload = dict(restored_replay.state.final_report)
+            checkpoint.completed_replay_output_commit(
+                attribution_path=out,
+                lineage_path=lineage_out,
+                report=report_payload,
+                message_lineage=graph.message_lineage,
+            )
+            evolution = report_payload.get("defect_evolution")
+            if isinstance(evolution, Mapping):
+                publish_defect_explanation(out, report_payload, evolution)
+            return report_payload
+
+    current_requests = _transport_physical_request_count(transport)
+    remaining_requests = max(
+        0,
+        options.max_judge_requests
+        - premise_physical_requests
+        - historical_analyzer_requests,
+    )
     causal_judge = ClaudeCausalJudge(
-        transport=transport,
+        transport=_SharedJudgeBudgetTransport(
+            transport,
+            maximum=current_requests + remaining_requests,
+        ),
         cache=(
             transport.cache
             if isinstance(transport.cache, JudgmentCache)
             else JudgmentCache(cache_path)
         ),
     )
-    checkpoint = CheckpointBundle(checkpoint_path)
     with GracefulSignalState() as shutdown:
         report = AgenticRecursiveAnalyzer(
             judge=causal_judge,
@@ -316,10 +362,27 @@ def _run_recursive_analysis(
             binding=request.question_binding,
             starts=starts,
         )
+        analyzer_physical_requests = _report_analyzer_request_count(report_payload)
         report_payload = enrich_attribution_explanation(
             report_payload,
             graph,
-            transport=transport,
+            transport=(
+                transport
+                if (
+                    premise_physical_requests + analyzer_physical_requests
+                    < options.max_judge_requests
+                )
+                else None
+            ),
+        )
+        report_payload = _annotate_shared_judge_budget(
+            report_payload,
+            maximum=options.max_judge_requests,
+            premise_physical_requests=premise_physical_requests,
+            analyzer_physical_requests=analyzer_physical_requests,
+            explanation_physical_requests=_explanation_physical_requests(
+                report_payload
+            ),
         )
         output_commit = checkpoint.completed_replay_output_commit(
             attribution_path=out,
@@ -358,6 +421,147 @@ def _run_recursive_analysis(
             report_payload["defect_evolution"],
         )
     return report_payload
+
+
+def _transport_physical_request_count(transport: Any) -> int:
+    value = getattr(transport, "request_count", 0)
+    return value if type(value) is int and value >= 0 else 0
+
+
+class _SharedJudgeBudgetTransport:
+    """Enforce the service-wide physical request cap without changing checkpoints."""
+
+    def __init__(self, transport: Any, *, maximum: int) -> None:
+        self._transport = transport
+        self._maximum = max(0, int(maximum))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._transport, name)
+
+    def create_message_text_with_usage(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+    ) -> Any:
+        if _remaining_judge_requests(self._transport, self._maximum) <= 0:
+            raise TransportCallError(
+                RuntimeError("shared Judge request budget exhausted"),
+                physical_requests=0,
+            )
+        return self._transport.create_message_text_with_usage(
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+        )
+
+    def create_message_text(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+    ) -> str:
+        try:
+            return self.create_message_text_with_usage(
+                system=system,
+                messages=messages,
+                max_tokens=max_tokens,
+            ).text
+        except TransportCallError as exc:
+            raise exc.error from exc
+
+
+def _remaining_judge_requests(transport: Any, maximum: int) -> int:
+    return max(0, int(maximum) - _transport_physical_request_count(transport))
+
+
+def _annotate_shared_judge_budget(
+    report: Mapping[str, Any],
+    *,
+    maximum: int,
+    premise_physical_requests: int,
+    analyzer_physical_requests: int,
+    explanation_physical_requests: int,
+) -> dict[str, Any]:
+    payload = _json_safe_copy(report)
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        payload["metadata"] = metadata
+    if isinstance(metadata.get("shared_judge_request_budget"), Mapping):
+        return payload
+    physical = (
+        max(0, int(premise_physical_requests))
+        + max(0, int(analyzer_physical_requests))
+        + max(0, int(explanation_physical_requests))
+    )
+    metadata["shared_judge_request_budget"] = {
+        "maximum_physical_requests": int(maximum),
+        "physical_requests": physical,
+        "remaining_physical_requests": max(0, int(maximum) - physical),
+        "premise_physical_requests": max(0, int(premise_physical_requests)),
+        "analyzer_physical_requests": max(0, int(analyzer_physical_requests)),
+        "explanation_physical_requests": max(
+            0, int(explanation_physical_requests)
+        ),
+        "enforced_across": [
+            "question_premise",
+            "recursive_attribution",
+            "defect_explanation",
+        ],
+    }
+    metadata["total_physical_judge_request_count"] = physical
+    return payload
+
+
+def _checkpoint_analyzer_request_count(state: Any) -> int:
+    final_report = getattr(state, "final_report", None)
+    if isinstance(final_report, Mapping):
+        count = _report_analyzer_request_count(final_report)
+        if count:
+            return count
+    actions = getattr(state, "actions", ())
+    for record in reversed(tuple(actions)):
+        if not isinstance(record, Mapping) or record.get("operation") != "state_snapshot":
+            continue
+        payload = record.get("payload")
+        value = payload.get("judge_requests") if isinstance(payload, Mapping) else None
+        if type(value) is int and value >= 0:
+            return value
+    return 0
+
+
+def _checkpoint_has_persisted_state(checkpoint: Any) -> bool:
+    paths = (
+        getattr(checkpoint, "manifest_path", None),
+        getattr(checkpoint, "current_path", None),
+    )
+    return any(isinstance(path, Path) and path.exists() for path in paths)
+
+
+def _report_analyzer_request_count(report: Mapping[str, Any]) -> int:
+    metadata = report.get("metadata")
+    value = (
+        metadata.get("physical_judge_request_count")
+        if isinstance(metadata, Mapping)
+        else 0
+    )
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _explanation_physical_requests(report: Mapping[str, Any]) -> int:
+    evolution = report.get("defect_evolution")
+    generation = (
+        evolution.get("generation") if isinstance(evolution, Mapping) else None
+    )
+    value = (
+        generation.get("physical_requests")
+        if isinstance(generation, Mapping)
+        else 0
+    )
+    return value if type(value) is int and value >= 0 else 0
 
 
 def enrich_attribution_explanation(
@@ -566,6 +770,168 @@ def assess_question_premise(
     )
 
 
+def _load_or_assess_question_premise(
+    *,
+    transport: Any,
+    graph: TraceGraph,
+    binding: AttributionQuestion,
+    seed_ref: str,
+    checkpoint_path: Path,
+    maximum_requests: int,
+) -> tuple[dict[str, Any], int]:
+    """Persist the premise gate so resume never re-judges checkpoint identity."""
+    checkpoint = CheckpointBundle(checkpoint_path)
+    store_path = Path(checkpoint_path) / "question-premise.json"
+    identity = hashlib.sha256(
+        stable_json(
+            {
+                "schema": "question-premise-checkpoint/v1",
+                "trace_binding": _source_trace_hash(graph),
+                "question_id": binding.question_id,
+                "seed_ref": seed_ref,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+    allowed_refs = frozenset(graph.upstream_refs(seed_ref))
+    migrated_store: Optional[dict[str, Any]] = None
+    if not store_path.exists() and _checkpoint_has_persisted_state(checkpoint):
+        restored = checkpoint.restore()
+        final_report = restored.final_report
+        analysis_question = (
+            final_report.get("analysis_question")
+            if isinstance(final_report, Mapping)
+            else None
+        )
+        premise = (
+            analysis_question.get("premise_assessment")
+            if isinstance(analysis_question, Mapping)
+            else None
+        )
+        if premise is None:
+            raise AttributionInputError(
+                "legacy incomplete checkpoint has no lossless question premise; "
+                "refusing to alter its causal input or re-query the Provider"
+            )
+        else:
+            migrated_assessment = _validate_question_premise_assessment(
+                premise,
+                allowed_refs=allowed_refs,
+            )
+            migration = "completed_checkpoint_report"
+        migrated_store = {
+            "schema": "question-premise-checkpoint/v1",
+            "identity": identity,
+            "physical_requests": _legacy_premise_request_count(final_report),
+            "assessment": migrated_assessment,
+            "migration": migration,
+        }
+
+    request_count_before_creation = _transport_physical_request_count(transport)
+
+    def create_store() -> Mapping[str, Any]:
+        if migrated_store is not None:
+            return migrated_store
+        before = _transport_physical_request_count(transport)
+        if before >= int(maximum_requests):
+            assessment = {
+                "status": "unknown",
+                "expected_behavior": "",
+                "alleged_actual_behavior": binding.original,
+                "reason": "Premise assessment skipped because the shared Judge request budget is exhausted.",
+                "evidence_refs": [],
+                "missing_evidence": ["judge_request_budget_exhausted"],
+                "confidence": 0.0,
+            }
+        else:
+            try:
+                assessment = assess_question_premise(
+                    transport,
+                    graph,
+                    binding,
+                    seed_ref=seed_ref,
+                )
+            except Exception as exc:
+                assessment = {
+                    "status": "unknown",
+                    "expected_behavior": "",
+                    "alleged_actual_behavior": binding.original,
+                    "reason": "Premise assessment failed: {0}: {1}".format(
+                        type(exc).__name__, exc
+                    ),
+                    "evidence_refs": [],
+                    "missing_evidence": ["premise_assessment_unavailable"],
+                    "confidence": 0.0,
+                }
+        return {
+            "schema": "question-premise-checkpoint/v1",
+            "identity": identity,
+            "physical_requests": max(
+                0,
+                _transport_physical_request_count(transport) - before,
+            ),
+            "assessment": assessment,
+        }
+
+    try:
+        stored, _created = checkpoint.load_or_create_question_premise(
+            identity=identity,
+            reserve_physical_request=(
+                migrated_store is None
+                and request_count_before_creation < int(maximum_requests)
+            ),
+            factory=create_store,
+        )
+    except Exception as exc:
+        if isinstance(exc, AttributionInputError):
+            raise
+        raise AttributionInputError(
+            "question premise checkpoint could not be loaded or created"
+        ) from exc
+    physical_requests = stored.get("physical_requests")
+    if type(physical_requests) is not int or physical_requests < 0:
+        raise AttributionInputError(
+            "question premise checkpoint has invalid request accounting"
+        )
+    if stored.get("state") == "inflight":
+        return {
+            "schema": "question-premise-assessment/v1",
+            "status": "unknown",
+            "expected_behavior": "",
+            "alleged_actual_behavior": binding.original,
+            "reason": "The prior premise Provider request completed or was interrupted before its response could be durably recorded.",
+            "evidence_refs": [],
+            "missing_evidence": ["premise_response_not_durably_recorded"],
+            "confidence": 0.0,
+            "deviation_type": "other",
+            "contract_source_refs": [],
+            "actual_sequence_refs": [],
+            "first_deviation_ref": "",
+            "upstream_influence_refs": [],
+            "localization_reason": "",
+            "analysis_mode": "offline_read_only",
+        }, physical_requests
+    assessment = _validate_question_premise_assessment(
+        stored.get("assessment"),
+        allowed_refs=allowed_refs,
+    )
+    return assessment, physical_requests
+
+
+def _legacy_premise_request_count(report: Any) -> int:
+    metadata = report.get("metadata") if isinstance(report, Mapping) else None
+    shared = (
+        metadata.get("shared_judge_request_budget")
+        if isinstance(metadata, Mapping)
+        else None
+    )
+    value = (
+        shared.get("premise_physical_requests")
+        if isinstance(shared, Mapping)
+        else None
+    )
+    return value if type(value) is int and value >= 0 else 1
+
+
 def _validate_question_premise_assessment(
     value: Any, *, allowed_refs: frozenset[str]
 ) -> dict[str, Any]:
@@ -610,20 +976,33 @@ def _validate_question_premise_assessment(
     }:
         deviation_type = "other"
     localization_reason = str(value.get("localization_reason") or "").strip()
+    expected_behavior = str(value.get("expected_behavior") or "").strip()
+    alleged_actual_behavior = str(
+        value.get("alleged_actual_behavior") or ""
+    ).strip()
+    missing_evidence = _dedupe_report_values(
+        str(item)
+        for item in value.get("missing_evidence") or ()
+        if str(item).strip()
+    )
+    if status == "contradicted":
+        if not refs or not expected_behavior or not alleged_actual_behavior:
+            raise ValueError(
+                "contradicted premise requires grounded evidence_refs, "
+                "expected_behavior, and alleged_actual_behavior"
+            )
+        if confidence < 0.5 or missing_evidence:
+            raise ValueError(
+                "contradicted premise requires decisive evidence without unresolved gaps"
+            )
     return {
         "schema": "question-premise-assessment/v1",
         "status": status,
-        "expected_behavior": str(value.get("expected_behavior") or "").strip(),
-        "alleged_actual_behavior": str(
-            value.get("alleged_actual_behavior") or ""
-        ).strip(),
+        "expected_behavior": expected_behavior,
+        "alleged_actual_behavior": alleged_actual_behavior,
         "reason": reason,
         "evidence_refs": refs,
-        "missing_evidence": _dedupe_report_values(
-            str(item)
-            for item in value.get("missing_evidence") or ()
-            if str(item).strip()
-        ),
+        "missing_evidence": missing_evidence,
         "confidence": confidence,
         "deviation_type": deviation_type,
         "contract_source_refs": grounded_refs("contract_source_refs"),
@@ -1288,6 +1667,7 @@ def validate_request_path_isolation(request: AttributionRequest) -> dict[str, Pa
     judge_cache = judge_cache_output_path(output, request.options.judge_cache_path).resolve()
     writable = {
         "output": output,
+        "explanation": explanation_output_path(output).resolve(),
         "lineage": lineage,
         "judge_cache": judge_cache,
     }
@@ -1522,16 +1902,7 @@ def load_graph(
         evaluation_paths=tuple(evaluation_paths),
         role="attribution",
     ).graph
-    if bundle_path is not None or trace_path is None:
-        return graph
-    segment_paths = _logical_segment_paths(Path(trace_path))
-    if len(segment_paths) <= 1:
-        return graph
-    return _merge_logical_case_segments(
-        graph,
-        primary_path=Path(trace_path).resolve(),
-        segment_paths=segment_paths,
-    )
+    return graph
 
 
 class _CompositeArtifactReader:

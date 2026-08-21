@@ -1163,7 +1163,62 @@ class CausalJudgeValidationTest(unittest.TestCase):
 
 
 class RootConfirmationValidationTest(unittest.TestCase):
-    def test_confirmation_canonicalizer_uses_an_exact_candidate_excerpt_and_drops_unoffered_process_fields(self):
+    def test_confirmation_canonicalizer_does_not_ground_an_unrelated_excerpt(self):
+        request = sample_confirmation_request(
+            candidate_reference={
+                **reference_envelope("record:decision"),
+                "fact_kind": "candidate_fact",
+                "decisive": True,
+                "content": json.dumps(
+                    {
+                        "component": "processor",
+                        "data": {
+                            "decision_type": "reasoning_block",
+                            "rationale": "Let me do the edit first.",
+                        },
+                    }
+                ),
+            }
+        )
+        payload = valid_confirmation_payload()
+        payload["excerpt"] = "A completely unrelated hallucination."
+
+        normalized = _canonicalize_root_confirmation_payload(
+            payload,
+            request=request,
+        )
+
+        self.assertEqual(
+            normalized["excerpt"],
+            "A completely unrelated hallucination.",
+        )
+        with self.assertRaisesRegex(ValueError, "excerpt"):
+            validate_recursive_confirmation(normalized, request=request)
+
+    def test_confirmation_canonicalizer_does_not_reverse_a_negated_excerpt(self):
+        request = sample_confirmation_request(
+            candidate_reference={
+                **reference_envelope("record:decision"),
+                "fact_kind": "candidate_fact",
+                "decisive": True,
+                "content": json.dumps(
+                    {
+                        "component": "processor",
+                        "data": {"rationale": "Let me do the edit first."},
+                    }
+                ),
+            }
+        )
+        payload = valid_confirmation_payload()
+        payload["excerpt"] = "Do not edit first."
+
+        normalized = _canonicalize_root_confirmation_payload(payload, request=request)
+
+        self.assertEqual(normalized["excerpt"], "Do not edit first.")
+        with self.assertRaisesRegex(ValueError, "excerpt"):
+            validate_recursive_confirmation(normalized, request=request)
+
+    def test_confirmation_canonicalizer_does_not_promote_a_paraphrase_to_exact_evidence(self):
         rationale = (
             "The required next action is execute.\n\n"
             "Let me do the edit first."
@@ -1194,11 +1249,13 @@ class RootConfirmationValidationTest(unittest.TestCase):
             payload,
             request=request,
         )
-        judgment = validate_recursive_confirmation(normalized, request=request)
-
-        self.assertEqual(judgment.status, "confirmed")
-        self.assertEqual(judgment.excerpt, "Let me do the edit first.")
-        self.assertEqual(judgment.process_confirmation_assessment, {})
+        self.assertEqual(
+            normalized["excerpt"],
+            "The agent chose to edit before executing.",
+        )
+        self.assertIsNone(normalized["process_confirmation_assessment"])
+        with self.assertRaisesRegex(ValueError, "excerpt"):
+            validate_recursive_confirmation(normalized, request=request)
 
     def test_zero_confidence_cannot_confirm_or_reject_a_root(self):
         payload = valid_confirmation_payload()

@@ -5,6 +5,8 @@ import hashlib
 import tempfile
 import unittest
 import signal
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -56,7 +58,274 @@ def output_config():
 
 
 class RecursiveCliTest(unittest.TestCase):
-    def test_load_graph_combines_sibling_session_segments_without_id_collisions(self):
+    def test_question_premise_is_reused_from_checkpoint_without_a_second_provider_call(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "premise-resume",
+                "records": [
+                    {
+                        "record_id": "execute",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                        "data": {"tool_name": "build"},
+                    }
+                ],
+            }
+        )
+        question = AttributionQuestion.create("Why was build omitted?")
+        bound = service.bind_question_hypothesis(graph, question)
+        seed_ref = bound.default_start_refs()[0]
+
+        class PremiseTransport:
+            def __init__(self):
+                self.request_count = 0
+
+            def create_message_text(self, **_kwargs):
+                self.request_count += 1
+                return json.dumps(
+                    {
+                        "status": "supported",
+                        "expected_behavior": "Call build.",
+                        "alleged_actual_behavior": "Build was omitted.",
+                        "reason": "The question reports an omission.",
+                        "evidence_refs": ["record:execute"],
+                        "missing_evidence": [],
+                        "confidence": 0.8,
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as root_value:
+            checkpoint_path = Path(root_value) / "checkpoint"
+            first_transport = PremiseTransport()
+            first, first_requests = service._load_or_assess_question_premise(
+                transport=first_transport,
+                graph=bound,
+                binding=question,
+                seed_ref=seed_ref,
+                checkpoint_path=checkpoint_path,
+                maximum_requests=8,
+            )
+            second_transport = PremiseTransport()
+            second, second_requests = service._load_or_assess_question_premise(
+                transport=second_transport,
+                graph=bound,
+                binding=question,
+                seed_ref=seed_ref,
+                checkpoint_path=checkpoint_path,
+                maximum_requests=8,
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first_requests, 1)
+        self.assertEqual(second_requests, 1)
+        self.assertEqual(first_transport.request_count, 1)
+        self.assertEqual(second_transport.request_count, 0)
+
+    def test_concurrent_premise_creation_issues_only_one_provider_request(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "premise-concurrent",
+                "records": [
+                    {
+                        "record_id": "execute",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                    }
+                ],
+            }
+        )
+        question = AttributionQuestion.create("Why was execution omitted?")
+        bound = service.bind_question_hypothesis(graph, question)
+        seed_ref = bound.default_start_refs()[0]
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingTransport:
+            def __init__(self):
+                self.request_count = 0
+                self.lock = threading.Lock()
+
+            def create_message_text(self, **_kwargs):
+                with self.lock:
+                    self.request_count += 1
+                entered.set()
+                release.wait(timeout=2)
+                return json.dumps(
+                    {
+                        "status": "supported",
+                        "expected_behavior": "Execute the required action.",
+                        "alleged_actual_behavior": "Execution was omitted.",
+                        "reason": "The question reports the omission.",
+                        "evidence_refs": ["record:execute"],
+                        "missing_evidence": [],
+                        "confidence": 0.8,
+                    }
+                )
+
+        with tempfile.TemporaryDirectory() as root_value:
+            checkpoint_path = Path(root_value) / "checkpoint"
+            transport = BlockingTransport()
+            results = []
+
+            def run():
+                results.append(
+                    service._load_or_assess_question_premise(
+                        transport=transport,
+                        graph=bound,
+                        binding=question,
+                        seed_ref=seed_ref,
+                        checkpoint_path=checkpoint_path,
+                        maximum_requests=8,
+                    )
+                )
+
+            first = threading.Thread(target=run)
+            second = threading.Thread(target=run)
+            first.start()
+            self.assertTrue(entered.wait(timeout=1))
+            second.start()
+            time.sleep(0.1)
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        self.assertEqual(transport.request_count, 1)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0], results[1])
+
+    def test_legacy_completed_checkpoint_migrates_premise_without_provider_call(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "legacy-premise",
+                "records": [
+                    {
+                        "record_id": "execute",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                    }
+                ],
+            }
+        )
+        question = AttributionQuestion.create("Why was execution omitted?")
+        bound = service.bind_question_hypothesis(graph, question)
+        seed_ref = bound.default_start_refs()[0]
+        assessment = {
+            "status": "supported",
+            "expected_behavior": "Execute the required action.",
+            "alleged_actual_behavior": "Execution was omitted.",
+            "reason": "The completed report preserved the premise.",
+            "evidence_refs": ["record:execute"],
+            "missing_evidence": [],
+            "confidence": 0.8,
+        }
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            checkpoint_path = root / "checkpoint"
+            checkpoint_path.mkdir()
+            manifest = checkpoint_path / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            checkpoint = mock.Mock(
+                manifest_path=manifest,
+                current_path=checkpoint_path / "current",
+            )
+            checkpoint.restore.return_value = mock.Mock(
+                final_report={
+                    "analysis_question": {"premise_assessment": assessment},
+                    "metadata": {},
+                }
+            )
+
+            def create_sidecar(*, identity, factory, **_kwargs):
+                return dict(factory()), True
+
+            checkpoint.load_or_create_question_premise.side_effect = create_sidecar
+            transport = mock.Mock(request_count=0)
+            with mock.patch.object(
+                service, "CheckpointBundle", return_value=checkpoint
+            ):
+                migrated, physical = service._load_or_assess_question_premise(
+                    transport=transport,
+                    graph=bound,
+                    binding=question,
+                    seed_ref=seed_ref,
+                    checkpoint_path=checkpoint_path,
+                    maximum_requests=8,
+                )
+
+        self.assertEqual(migrated["reason"], assessment["reason"])
+        self.assertEqual(physical, 1)
+        transport.create_message_text.assert_not_called()
+
+    def test_legacy_incomplete_checkpoint_fails_closed_without_provider_call(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "legacy-incomplete",
+                "records": [
+                    {
+                        "record_id": "execute",
+                        "component": "tool",
+                        "event_type": "tool.call",
+                    }
+                ],
+            }
+        )
+        question = AttributionQuestion.create("Why was execution omitted?")
+        bound = service.bind_question_hypothesis(graph, question)
+        seed_ref = bound.default_start_refs()[0]
+        with tempfile.TemporaryDirectory() as root_value:
+            root = Path(root_value)
+            checkpoint_path = root / "checkpoint"
+            checkpoint_path.mkdir()
+            manifest = checkpoint_path / "manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            checkpoint = mock.Mock(
+                manifest_path=manifest,
+                current_path=checkpoint_path / "current",
+            )
+            checkpoint.restore.return_value = mock.Mock(
+                final_report=None,
+                actions=(
+                    {
+                        "operation": "state_snapshot",
+                        "payload": {
+                            "seed_ledger": [
+                                {
+                                    "start_ref": seed_ref,
+                                    "defect_state": {
+                                        "expected": "Execute the required action.",
+                                        "actual": "Execution was omitted.",
+                                        "mechanism": "The required action was not selected.",
+                                        "confidence": 0.8,
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                ),
+            )
+            checkpoint.load_or_create_question_premise.side_effect = (
+                lambda *, identity, factory, **_kwargs: (dict(factory()), True)
+            )
+            transport = mock.Mock(request_count=0)
+            with mock.patch.object(
+                service, "CheckpointBundle", return_value=checkpoint
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "no lossless question premise",
+                ):
+                    service._load_or_assess_question_premise(
+                        transport=transport,
+                        graph=bound,
+                        binding=question,
+                        seed_ref=seed_ref,
+                        checkpoint_path=checkpoint_path,
+                        maximum_requests=8,
+                    )
+
+        transport.create_message_text.assert_not_called()
+
+    def test_load_graph_does_not_merge_prefix_matched_sibling_sessions(self):
         with tempfile.TemporaryDirectory() as root_value:
             root = Path(root_value)
             main = root / "context-case"
@@ -112,15 +381,13 @@ class RecursiveCliTest(unittest.TestCase):
             graph = service.load_graph(main / "trace.json")
 
             self.assertEqual(graph.case_id, "context-case")
-            self.assertEqual(len(graph.nodes), 2)
-            self.assertEqual(
-                graph.raw_trace["manifest"]["logical_segment_count"], 2
-            )
+            self.assertEqual(len(graph.nodes), 1)
+            self.assertNotIn("logical_segment_count", graph.raw_trace["manifest"])
             self.assertEqual(
                 {node.data.get("call_id") for node in graph.nodes.values()},
-                {"seg_0__call_1", "seg_1__call_1"},
+                {"call_1"},
             )
-            self.assertTrue(
+            self.assertFalse(
                 any("yocto_build_execute" in str(node.data) for node in graph.nodes.values())
             )
 
@@ -320,6 +587,42 @@ class RecursiveCliTest(unittest.TestCase):
             ["record:tool_call"],
         )
         self.assertEqual(report["premise_assessment"]["status"], "contradicted")
+
+    def test_contradicted_premise_requires_grounded_comparison_evidence(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "contradicted premise requires",
+        ):
+            service._validate_question_premise_assessment(
+                {
+                    "status": "contradicted",
+                    "expected_behavior": "",
+                    "alleged_actual_behavior": "",
+                    "reason": "The allegation is false.",
+                    "evidence_refs": ["record:not_offered"],
+                    "missing_evidence": [],
+                    "confidence": 0.98,
+                },
+                allowed_refs=frozenset({"record:tool_call"}),
+            )
+
+    def test_contradicted_premise_rejects_uncertain_or_missing_evidence(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "contradicted premise requires decisive evidence",
+        ):
+            service._validate_question_premise_assessment(
+                {
+                    "status": "contradicted",
+                    "expected_behavior": "Call the build skill.",
+                    "alleged_actual_behavior": "The skill was omitted.",
+                    "reason": "The available evidence is incomplete.",
+                    "evidence_refs": ["record:tool_call"],
+                    "missing_evidence": ["tool result unavailable"],
+                    "confidence": 0.0,
+                },
+                allowed_refs=frozenset({"record:tool_call"}),
+            )
 
     def test_question_creates_an_offline_expectation_gap_seed_over_relevant_trace_facts(self):
         duplicated_context = [

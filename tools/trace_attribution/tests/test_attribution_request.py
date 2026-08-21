@@ -15,9 +15,11 @@ import unittest
 from unittest import mock
 
 from trace_attribution.graph import TraceGraph
+from trace_attribution.defect_explanation import explanation_output_path
 from trace_attribution.models import NodeJudgment
 from trace_attribution.models import stable_json
 from trace_attribution.causal_state import RecursiveAttributionReport
+from trace_attribution.checkpoint import CheckpointBundle
 from trace_attribution.request import (
     DEFAULT_ATTRIBUTION_OBJECTIVE,
     MAX_QUESTION_CHARS,
@@ -30,6 +32,219 @@ from trace_attribution.request import (
 
 
 class AttributionRequestTest(unittest.TestCase):
+    def test_premise_request_reservation_survives_factory_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "checkpoint")
+            with self.assertRaisesRegex(RuntimeError, "crash after request"):
+                bundle.load_or_create_question_premise(
+                    identity="premise-1",
+                    reserve_physical_request=True,
+                    factory=lambda: (_ for _ in ()).throw(
+                        RuntimeError("crash after request")
+                    ),
+                )
+            second_factory = mock.Mock()
+            stored, created = bundle.load_or_create_question_premise(
+                identity="premise-1",
+                reserve_physical_request=True,
+                factory=second_factory,
+            )
+
+        self.assertFalse(created)
+        self.assertEqual(stored["state"], "inflight")
+        self.assertEqual(stored["physical_requests"], 1)
+        second_factory.assert_not_called()
+
+    def test_zero_request_premise_migration_can_retry_after_factory_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            bundle = CheckpointBundle(Path(tempdir) / "checkpoint")
+            with self.assertRaisesRegex(RuntimeError, "migration crash"):
+                bundle.load_or_create_question_premise(
+                    identity="premise-migration",
+                    reserve_physical_request=False,
+                    factory=lambda: (_ for _ in ()).throw(
+                        RuntimeError("migration crash")
+                    ),
+                )
+            stored, created = bundle.load_or_create_question_premise(
+                identity="premise-migration",
+                reserve_physical_request=False,
+                factory=lambda: {
+                    "schema": "question-premise-checkpoint/v1",
+                    "identity": "premise-migration",
+                    "physical_requests": 0,
+                    "assessment": {"status": "supported"},
+                },
+            )
+
+        self.assertTrue(created)
+        self.assertEqual(stored["state"], "complete")
+        self.assertEqual(stored["physical_requests"], 0)
+
+    def test_shared_transport_budget_blocks_calls_after_premise_consumes_the_cap(self) -> None:
+        service = importlib.import_module("trace_attribution.service")
+        transport = mock.Mock(request_count=1)
+        bounded = service._SharedJudgeBudgetTransport(transport, maximum=1)
+
+        with self.assertRaisesRegex(RuntimeError, "budget exhausted"):
+            bounded.create_message_text(
+                system="judge",
+                messages=[{"role": "user", "content": "analyze"}],
+                max_tokens=128,
+            )
+
+        transport.create_message_text_with_usage.assert_not_called()
+
+    def test_shared_budget_annotation_preserves_checkpointed_request_accounting(self) -> None:
+        service = importlib.import_module("trace_attribution.service")
+        checkpointed = {
+            "metadata": {
+                "shared_judge_request_budget": {
+                    "maximum_physical_requests": 128,
+                    "physical_requests": 37,
+                    "remaining_physical_requests": 91,
+                },
+                "total_physical_judge_request_count": 37,
+            }
+        }
+
+        replayed = service._annotate_shared_judge_budget(
+            checkpointed,
+            maximum=128,
+            premise_physical_requests=1,
+            analyzer_physical_requests=0,
+            explanation_physical_requests=0,
+        )
+
+        self.assertEqual(replayed, checkpointed)
+
+    def test_completed_checkpoint_replay_returns_persisted_report_without_provider_calls(self) -> None:
+        service = importlib.import_module("trace_attribution.service")
+        graph = TraceGraph.from_trace({"case_id": "completed", "records": []})
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            request = AttributionRequest(
+                trace_path=root / "trace.json",
+                output_path=root / "result.json",
+                options=AttributionOptions(engine="recursive-agentic"),
+            )
+            transport = mock.Mock(
+                model="offline-model",
+                base_url="offline://judge",
+                thinking_config={"type": "disabled"},
+                max_tokens=4096,
+                context_budget=mock.Mock(),
+                provider_error_threshold=3,
+                cache=mock.Mock(),
+                request_count=0,
+            )
+            transport.context_budget.to_dict.return_value = {}
+            final_report = {
+                "case_id": "completed",
+                "metadata": {
+                    "physical_judge_request_count": 7,
+                    "shared_judge_request_budget": {
+                        "maximum_physical_requests": 128,
+                        "physical_requests": 8,
+                        "remaining_physical_requests": 120,
+                    },
+                },
+                "defect_evolution": {"steps": [], "generation": {}},
+            }
+            checkpoint = mock.Mock()
+            checkpoint.manifest_path = root / "checkpoint" / "manifest.json"
+            checkpoint.manifest_path.parent.mkdir(parents=True)
+            checkpoint.manifest_path.write_text("{}", encoding="utf-8")
+            checkpoint.current_path = root / "checkpoint" / "current"
+            state = mock.Mock(
+                final_report=final_report,
+                frontier_payload={"judge_requests": 7},
+            )
+            checkpoint.restore_for_replay.return_value = mock.Mock(state=state)
+
+            with mock.patch.object(
+                service, "CheckpointBundle", return_value=checkpoint
+            ), mock.patch.object(
+                service, "build_checkpoint_config", return_value={"config": "stable"}
+            ), mock.patch.object(
+                service, "AgenticRecursiveAnalyzer"
+            ) as analyzer, mock.patch.object(
+                service, "publish_defect_explanation"
+            ):
+                result = service._run_recursive_analysis(
+                    request=request,
+                    graph=graph,
+                    starts=(),
+                    objective=request.effective_objective,
+                    transport=transport,
+                    lineage_out=root / "lineage.json",
+                    cache_path=root / "cache.jsonl",
+                    checkpoint_path=root / "checkpoint",
+                    premise_physical_requests=1,
+                )
+
+        self.assertEqual(result, final_report)
+        analyzer.assert_not_called()
+        transport.create_message_text.assert_not_called()
+        transport.create_message_text_with_usage.assert_not_called()
+
+    def test_historical_request_count_comes_from_the_action_state_snapshot(self) -> None:
+        service = importlib.import_module("trace_attribution.service")
+        state = mock.Mock(
+            final_report=None,
+            frontier_payload={"frontier": []},
+            actions=(
+                {
+                    "operation": "state_snapshot",
+                    "payload": {"judge_requests": 7},
+                },
+            ),
+        )
+
+        self.assertEqual(service._checkpoint_analyzer_request_count(state), 7)
+
+    def test_zero_shared_judge_budget_skips_premise_assessment(self) -> None:
+        service = importlib.import_module("trace_attribution.service")
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "zero-budget",
+                "records": [
+                    {
+                        "record_id": "result",
+                        "component": "evaluation",
+                        "event_type": "case.observed_defect",
+                    }
+                ],
+            }
+        )
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            request = AttributionRequest(
+                trace_path=root / "trace.json",
+                output_path=root / "result.json",
+                question="Why was the expected behavior omitted?",
+                options=AttributionOptions(
+                    engine="recursive-agentic",
+                    max_judge_requests=0,
+                ),
+            )
+            transport = mock.Mock(request_count=0)
+            with mock.patch.object(
+                service, "load_graph", return_value=graph
+            ), mock.patch.object(
+                service, "ClaudeJudgeClient", return_value=transport
+            ), mock.patch.object(
+                service, "assess_question_premise"
+            ) as assess, mock.patch.object(
+                service,
+                "_run_recursive_analysis",
+                return_value={"case_id": "zero-budget"},
+            ) as run_recursive:
+                service.analyze(request)
+
+            assess.assert_not_called()
+            run_recursive.assert_called_once()
+
     def test_question_normalization_and_identity_are_stable(self) -> None:
         left = AttributionQuestion.create("  为什么编译失败？\r\n")
         right = AttributionQuestion.create("为什么编译失败？\n")
@@ -175,6 +390,19 @@ class AttributionRequestTest(unittest.TestCase):
                         ),
                     ),
                     (root / "lineage-output.json",),
+                ),
+                (
+                    "lineage aliases explanation output",
+                    AttributionRequest(
+                        trace_path=trace_path,
+                        output_path=root / "result.json",
+                        options=AttributionOptions(
+                            lineage_output_path=explanation_output_path(
+                                root / "result.json"
+                            )
+                        ),
+                    ),
+                    (root / "result.json",),
                 ),
                 (
                     "cache aliases trace",
@@ -852,12 +1080,16 @@ class AttributionRequestTest(unittest.TestCase):
                 max_tokens=4096,
                 provider_error_threshold=3,
                 cache=mock.Mock(),
+                request_count=1,
             )
             report = mock.Mock(metadata={})
             analyzer = mock.Mock()
             analyzer.analyze.return_value = report
             checkpoint = mock.Mock()
             checkpoint.completed_replay_output_commit.return_value = None
+            checkpoint.load_or_create_question_premise.side_effect = (
+                lambda *, identity, factory, **_kwargs: (dict(factory()), True)
+            )
             shutdown = mock.MagicMock()
             shutdown.stop_requested = mock.Mock(return_value=False)
             signal_context = mock.MagicMock()

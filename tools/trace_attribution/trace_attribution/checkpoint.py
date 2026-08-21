@@ -1393,6 +1393,45 @@ class CheckpointBundle:
         with self._checkpoint_lock(exclusive=True, create_root=True):
             self._initialize_locked(validated)
 
+    def load_or_create_question_premise(
+        self,
+        *,
+        identity: str,
+        reserve_physical_request: bool,
+        factory: Callable[[], Mapping[str, Any]],
+    ) -> tuple[JsonDict, bool]:
+        """Serialize creation of the premise sidecar with checkpoint mutations."""
+        if not identity:
+            raise ValueError("question premise identity is required")
+        with self._checkpoint_lock(exclusive=True, create_root=True):
+            self._bind_carrier_root(self.root)
+            self._capture_carrier_root_identity()
+            path = self.root / "question-premise.json"
+            if self._entry_exists(path):
+                stored = self._read_regular_json(path, "question premise checkpoint")
+                if stored.get("identity") != identity:
+                    raise CheckpointCompatibilityError(
+                        "question premise checkpoint identity mismatch"
+                    )
+                return stored, False
+            if reserve_physical_request:
+                reservation = {
+                    "schema": "question-premise-checkpoint/v1",
+                    "identity": identity,
+                    "state": "inflight",
+                    "physical_requests": 1,
+                }
+                self._atomic_write_json(path, reservation)
+            created = factory()
+            if not isinstance(created, Mapping):
+                raise ValueError("question premise factory must return an object")
+            payload = dict(created)
+            if payload.get("identity") != identity:
+                raise ValueError("question premise factory returned the wrong identity")
+            payload["state"] = "complete"
+            self._atomic_write_json(path, payload)
+            return payload, True
+
     def _initialize_locked(self, validated: Mapping[str, Any]) -> None:
         self._require_lock(exclusive=True)
         self._resolve_visible_generation()

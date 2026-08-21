@@ -10,6 +10,7 @@ from unittest import mock
 
 from trace_attribution import service
 from trace_attribution import cli
+from trace_attribution import defect_explanation
 from trace_attribution.graph import TraceGraph
 from trace_attribution.request import AttributionResult
 
@@ -177,6 +178,92 @@ def behavioral_deviation_report() -> dict:
 
 
 class DefectExplanationTests(unittest.TestCase):
+    def test_deterministic_human_fields_do_not_invent_an_edit_order_scenario(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "wrong-algorithm",
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {
+                            "rationale": "Use exhaustive search for every request."
+                        },
+                    }
+                ],
+            }
+        )
+        report = {
+            "analysis_question": {
+                "premise_assessment": {
+                    "deviation_type": "semantic_change",
+                    "expected_behavior": "Preserve the bounded lookup algorithm.",
+                    "alleged_actual_behavior": "The decision selected exhaustive search.",
+                    "first_deviation_ref": "record:decision",
+                    "actual_sequence_refs": ["record:decision"],
+                }
+            }
+        }
+
+        fields = defect_explanation._human_step_fields(
+            graph,
+            report,
+            ref="record:decision",
+            stage="defect_introduction",
+            data=graph.nodes["record:decision"].data,
+            excerpt="Use exhaustive search for every request.",
+        )
+        rendered = json.dumps(fields, ensure_ascii=False)
+
+        self.assertIn("bounded lookup algorithm", rendered)
+        self.assertIn("exhaustive search", rendered)
+        self.assertNotIn("编辑", rendered)
+        self.assertNotIn("构建规划", rendered)
+        self.assertNotIn("迟到", rendered)
+
+    def test_action_order_human_fields_use_the_recorded_actions_not_edit_template(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "deploy-before-test",
+                "records": [
+                    {
+                        "record_id": "decision",
+                        "component": "processor",
+                        "event_type": "decision",
+                        "data": {"rationale": "Deploy now and test afterward."},
+                    }
+                ],
+            }
+        )
+        report = {
+            "analysis_question": {
+                "premise_assessment": {
+                    "deviation_type": "action_order",
+                    "expected_behavior": "Run integration tests before deployment.",
+                    "alleged_actual_behavior": "Deployment happened before integration tests.",
+                    "first_deviation_ref": "record:decision",
+                    "actual_sequence_refs": ["record:decision"],
+                }
+            }
+        }
+
+        fields = defect_explanation._human_step_fields(
+            graph,
+            report,
+            ref="record:decision",
+            stage="defect_introduction",
+            data=graph.nodes["record:decision"].data,
+            excerpt="Deploy now and test afterward.",
+        )
+        rendered = json.dumps(fields, ensure_ascii=False)
+
+        self.assertIn("integration tests", rendered)
+        self.assertIn("Deployment", rendered)
+        self.assertNotIn("编辑", rendered)
+        self.assertNotIn("构建规划", rendered)
+        self.assertNotIn("指定工具", rendered)
+
     def test_builds_a_stepwise_defect_evolution_from_grounded_nodes(self):
         builder = getattr(service, "build_defect_evolution", None)
         self.assertIsNotNone(
@@ -331,7 +418,7 @@ class DefectExplanationTests(unittest.TestCase):
         self.assertIn("先修改代码", root_step["action_description"])
         self.assertIn("build_execute", root_step["knowledge_at_time"])
         self.assertIn("首次", root_step["problem_explanation"])
-        self.assertIn("编辑", root_step["effect_on_next"])
+        self.assertIn("edit", root_step["effect_on_next"])
         self.assertEqual(
             root_step["human_defect_state"],
             "执行要求原本正确，但在本步骤首次产生了顺序偏差。",
