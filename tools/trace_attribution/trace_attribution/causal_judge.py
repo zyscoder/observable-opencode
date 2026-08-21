@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import math
 import re
@@ -1336,6 +1337,8 @@ def build_causal_step_prompt(request: CausalStepRequest) -> str:
                 "Use defect_transformation only when a different upstream defect transforms into the active defect through an explicit mechanism.",
                 "When request.defect_state.label=candidate_local_process_defect, judge the current node's candidate-local process defect, not whether it created the pre-existing downstream functional defect. A baseline code gap may predate the node while the node still introduces an erroneous plan, priority drift, action/commitment mismatch, or responsible non-repair that materially prevents repair.",
                 "For a candidate-local process defect, current_defect_status=present means the grounded node semantics themselves contain that process defect. Explain the transformation into the downstream failure; do not mark the node absent merely because the final functional defect existed before the Agent run.",
+                "When request.defect_state.label starts with localized_ and ends with _deviation, the offline premise gate has localized a supported behavioral divergence but has not assigned root cause. Judge whether the current node is the first semantic commitment to that divergence. If its recorded reasoning explicitly chooses behavior contrary to the supplied contract and no offered predecessor already contains that wrong commitment, set current_defect_status=present, candidate_introduction=true, assess every offered predecessor, and request independent root confirmation.",
+                "For a localized behavioral deviation, distinguish the earlier reasoning or planning commitment that introduces the wrong action/order from the later tool call that only materializes it.",
                 "When candidate_process_trajectory is supplied, jointly assess the candidate semantics and its bounded post-candidate execution facts. Repeated no-delivery episodes, zero mutations or verification, and an unfulfilled implementation commitment may ground a process defect; they do not make every earlier plan defective by temporal association alone.",
                 "For candidate_local_process_defect, complete process_assessment before choosing current_defect_status. Classify the candidate role, any explicit commitment, and whether the bounded post-candidate trajectory materialized or diverged from that commitment.",
                 "candidate_commitment_cues contains exact recorded first-person forward-action language and is explicitly not a verdict. For every supplied cue, process_assessment must classify it as commitment, non_commitment, or ambiguous and explain that classification. Never silently ignore it as not_applicable.",
@@ -2053,6 +2056,128 @@ def _validate_process_assessment(
         "reason": reason,
         "evidence_refs": list(evidence_refs),
     }
+
+
+def _canonicalize_causal_step_payload(
+    value: Dict[str, Any], *, request: CausalStepRequest
+) -> Dict[str, Any]:
+    """Resolve mechanically contradictory control fields without adding a verdict."""
+    if not isinstance(value, dict):
+        return value
+    normalized = copy.deepcopy(value)
+    predecessors = normalized.get("predecessors")
+    if isinstance(predecessors, list):
+        normalized["predecessors"] = [
+            predecessor
+            for predecessor in predecessors
+            if not (
+                isinstance(predecessor, Mapping)
+                and str(predecessor.get("ref") or "").strip()
+                == request.current_node.ref
+            )
+        ]
+    else:
+        return normalized
+    status = str(normalized.get("current_defect_status") or "").strip().lower()
+    current_data = request.current_node.data
+    current_rationale = current_data.get("rationale")
+    recent_reasoning = (
+        str(current_rationale.get("recent_reasoning") or "").strip()
+        if isinstance(current_rationale, Mapping)
+        else ""
+    )
+    current_metadata = current_data.get("metadata")
+    current_message_id = (
+        str(
+            current_metadata.get("messageID")
+            or current_metadata.get("message_id")
+            or ""
+        )
+        if isinstance(current_metadata, Mapping)
+        else ""
+    )
+    same_generation_reasoning_refs: Set[str] = set()
+    if (
+        status == "present"
+        and str(current_data.get("decision_type") or "") == "llm_tool_call"
+        and recent_reasoning
+        and current_message_id
+    ):
+        normalized_reasoning = " ".join(recent_reasoning.split())
+        for candidate in request.candidates:
+            candidate_data = candidate.node.data
+            candidate_metadata = candidate_data.get("metadata")
+            candidate_message_id = (
+                str(
+                    candidate_metadata.get("messageID")
+                    or candidate_metadata.get("message_id")
+                    or ""
+                )
+                if isinstance(candidate_metadata, Mapping)
+                else ""
+            )
+            candidate_rationale = candidate_data.get("rationale")
+            if (
+                str(candidate_data.get("decision_type") or "")
+                == "reasoning_block"
+                and candidate_message_id == current_message_id
+                and isinstance(candidate_rationale, str)
+                and " ".join(candidate_rationale.split()) == normalized_reasoning
+            ):
+                same_generation_reasoning_refs.add(candidate.ref)
+    for predecessor in normalized["predecessors"]:
+        if not isinstance(predecessor, dict):
+            continue
+        predecessor_ref = str(predecessor.get("ref") or "").strip()
+        if predecessor_ref in same_generation_reasoning_refs:
+            predecessor["relation"] = "same_defect_propagation"
+            predecessor["recurse"] = True
+            predecessor["upstream_defect"] = None
+            predecessor["reason"] = (
+                "The current tool-action decision repeats this earlier same-message "
+                "reasoning verbatim, so the defect-bearing semantic commitment "
+                "predates its action projection."
+            )
+            evidence_refs = predecessor.get("evidence_refs")
+            if isinstance(evidence_refs, list) and predecessor_ref not in evidence_refs:
+                evidence_refs.append(predecessor_ref)
+        relation = str(predecessor.get("relation") or "").strip().lower()
+        if relation in {"same_defect_propagation", "defect_transformation"}:
+            if status == "present":
+                predecessor["recurse"] = True
+            else:
+                predecessor["relation"] = "unknown"
+                predecessor["recurse"] = False
+                predecessor["upstream_defect"] = None
+        elif (
+            relation == "contributing_condition"
+            and predecessor.get("recurse") is True
+            and status != "present"
+        ):
+            predecessor["recurse"] = False
+            predecessor["upstream_defect"] = None
+    recursive_relations = {
+        "same_defect_propagation",
+        "defect_transformation",
+        "contributing_condition",
+    }
+    has_recursive_predecessor = any(
+        isinstance(predecessor, Mapping)
+        and predecessor.get("recurse") is True
+        and str(predecessor.get("relation") or "").strip().lower()
+        in recursive_relations
+        for predecessor in normalized["predecessors"]
+    )
+    if normalized.get("candidate_introduction") is True and has_recursive_predecessor:
+        normalized["candidate_introduction"] = False
+    investigation = normalized.get("suggested_investigation")
+    if (
+        normalized.get("candidate_introduction") is not True
+        and isinstance(investigation, Mapping)
+        and investigation.get("action") == "request_root_confirmation"
+    ):
+        normalized["suggested_investigation"] = None
+    return normalized
 
 
 def validate_causal_step_payload(
@@ -4133,6 +4258,66 @@ def root_confirmation_from_payload(
     return validate_recursive_confirmation(value, request=request)
 
 
+def _canonicalize_root_confirmation_payload(
+    value: Dict[str, Any], *, request: RootConfirmationRequest
+) -> Dict[str, Any]:
+    """Normalize fact-equivalent confirmation fields without changing its verdict."""
+    if not isinstance(value, dict):
+        return value
+    normalized = copy.deepcopy(value)
+    if not request.process_factual_context:
+        normalized["process_confirmation_assessment"] = None
+    if str(normalized.get("status") or "").strip().lower() != "confirmed":
+        return normalized
+
+    try:
+        fact_tree = _ConfirmationFactTreeValidator(request).validate()
+    except (TypeError, ValueError):
+        return normalized
+    excerpt = str(normalized.get("excerpt") or "").strip()
+    normalized_excerpt = re.sub(r"\s+", " ", excerpt).strip().lower()
+    if normalized_excerpt and any(
+        normalized_excerpt in fragment
+        for fragment in fact_tree.candidate_semantic_fragments
+    ):
+        return normalized
+
+    content = str(request.candidate_reference.get("content") or "")
+    try:
+        candidate_payload = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        candidate_payload = {}
+    data = (
+        candidate_payload.get("data")
+        if isinstance(candidate_payload, Mapping)
+        else None
+    )
+    rationale = data.get("rationale") if isinstance(data, Mapping) else None
+    semantic_texts: List[str] = []
+    if isinstance(rationale, str):
+        semantic_texts.append(rationale)
+    elif isinstance(rationale, Mapping):
+        for key in ("recent_reasoning", "reasoning", "rationale", "preview"):
+            text = rationale.get(key)
+            if isinstance(text, str) and text.strip():
+                semantic_texts.append(text)
+    excerpt_candidates = [
+        line.strip()
+        for text in semantic_texts
+        for line in reversed(text.splitlines())
+        if 8 <= len(line.strip()) <= 280
+    ]
+    for candidate in excerpt_candidates:
+        candidate_normalized = re.sub(r"\s+", " ", candidate).strip().lower()
+        if any(
+            candidate_normalized in fragment
+            for fragment in fact_tree.candidate_semantic_fragments
+        ):
+            normalized["excerpt"] = candidate
+            break
+    return normalized
+
+
 @dataclass(frozen=True)
 class _RequestOutcome:
     payload: Optional[JsonDict]
@@ -4964,13 +5149,21 @@ class ClaudeCausalJudge(
             prompt=prompt,
             node_ref=request.current_node.ref,
             request_context=request.to_dict(),
-            validator=lambda value: validate_causal_step_payload(value, request=request),
+            validator=lambda value: validate_causal_step_payload(
+                _canonicalize_causal_step_payload(value, request=request),
+                request=request,
+            ),
             max_tokens=int(getattr(self.transport, "max_tokens", 4096)),
             max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
             try:
-                value = causal_step_from_payload(outcome.payload, request=request)
+                value = causal_step_from_payload(
+                    _canonicalize_causal_step_payload(
+                        outcome.payload, request=request
+                    ),
+                    request=request,
+                )
             except Exception as exc:
                 raise BoundedJudgeCallError(
                     "post-validation adapter failed: {0}: {1}".format(
@@ -5019,13 +5212,21 @@ class ClaudeCausalJudge(
             node_ref=request.candidate_ref,
             request_context=request.factual_dict(),
             validator=lambda value: validate_recursive_confirmation(value, request=request),
+            normalizer=lambda value: _canonicalize_root_confirmation_payload(
+                value,
+                request=request,
+            ),
             max_tokens=min(int(getattr(self.transport, "max_tokens", 4096)), 2048),
             max_physical_requests=max_physical_requests,
         )
         if outcome.payload is not None:
             try:
                 value = root_confirmation_from_payload(
-                    outcome.payload, request=request
+                    _canonicalize_root_confirmation_payload(
+                        outcome.payload,
+                        request=request,
+                    ),
+                    request=request,
                 )
             except Exception as exc:
                 raise BoundedJudgeCallError(

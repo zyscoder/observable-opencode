@@ -6,6 +6,10 @@ from pathlib import Path
 from typing import Optional
 
 from .claude import default_judge_timeout_seconds
+from .judge_budget import (
+    DEFAULT_JUDGE_CONTEXT_SAFETY_MARGIN_TOKENS,
+    DEFAULT_JUDGE_CONTEXT_WINDOW_TOKENS,
+)
 from .request import AttributionOptions, AttributionRequest
 from .errors import AttributionInputError
 from .service import (
@@ -14,11 +18,19 @@ from .service import (
     analyze,
     attribution_output_payload,
     atomic_write_json,
+    explanation_output_path,
     judge_cache_output_path,
     lineage_output_path,
     load_graph,
     recursive_checkpoint_path,
 )
+
+
+def _optional_namespace_int(
+    args: argparse.Namespace, name: str, default: int
+) -> int:
+    value = getattr(args, name, default)
+    return value if type(value) is int else default
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -87,7 +99,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--judge-max-tokens",
         type=int,
-        default=4096,
+        default=8192,
         help="Max output tokens for each judge call; reasoning models may need extra room for JSON text.",
     )
     parser.add_argument(
@@ -173,9 +185,17 @@ def main() -> int:
                 base_url_env=args.base_url_env,
                 judge_timeout_sec=args.judge_timeout_sec,
                 judge_max_tokens=args.judge_max_tokens,
-                judge_context_window_tokens=args.judge_context_window_tokens,
+                judge_context_window_tokens=_optional_namespace_int(
+                    args,
+                    "judge_context_window_tokens",
+                    DEFAULT_JUDGE_CONTEXT_WINDOW_TOKENS,
+                ),
                 judge_context_safety_margin_tokens=(
-                    args.judge_context_safety_margin_tokens
+                    _optional_namespace_int(
+                        args,
+                        "judge_context_safety_margin_tokens",
+                        DEFAULT_JUDGE_CONTEXT_SAFETY_MARGIN_TOKENS,
+                    )
                 ),
                 thinking_mode=args.thinking_mode,
                 provider_error_threshold=args.provider_error_threshold,
@@ -188,6 +208,7 @@ def main() -> int:
     except AttributionInputError as exc:
         raise SystemExit("error: {0}".format(exc)) from exc
     print(args.out)
+    print(explanation_output_path(Path(args.out)))
     return 0
 
 

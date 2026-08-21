@@ -37,6 +37,7 @@ GLOBAL_FUSION_MAX_OPEN_ROOT_CANDIDATES = 3
 JUDGE_PROMPT_STRING_CHARS = 1600
 JUDGE_PROMPT_COLLECTION_ITEMS = 12
 JUDGE_PROMPT_MAXIMUM_DEPTH = 10
+DEFAULT_JUDGE_CAPSULE_MAX_BYTES = 24_576
 VALIDATION_SOURCE_KEYS = frozenset(
     {
         "candidate_ref",
@@ -208,6 +209,141 @@ def _episode_facts(
         "episode_role": episode_role,
         "grounded_hops": supplied_hops,
     }
+
+
+_JUDGE_PRIORITY_KEYS = (
+    "ref",
+    "candidate_ref",
+    "resolved_ref",
+    "canonical_ref",
+    "from_ref",
+    "to_ref",
+    "relation",
+    "evidence_type",
+    "edge_origin",
+    "source_container",
+    "inference_method",
+    "eligible_for_attribution",
+    "component",
+    "event_type",
+    "title",
+    "status",
+    "tool_name",
+    "decision_type",
+    "rationale",
+    "text",
+    "summary",
+    "reason",
+    "path",
+    "files",
+    "command",
+    "exit_code",
+    "root_candidate_eligible",
+    "node",
+    "data",
+)
+
+
+def _compact_judge_value(
+    value: Any,
+    *,
+    text_limit: int,
+    collection_limit: int,
+    mapping_limit: int,
+    depth: int,
+) -> Any:
+    if isinstance(value, str):
+        if len(value) <= text_limit:
+            return value
+        return value[: max(0, text_limit - 3)] + "..."
+    if isinstance(value, Mapping):
+        keys = [key for key in _JUDGE_PRIORITY_KEYS if key in value]
+        keys.extend(
+            key
+            for key in sorted(value, key=str)
+            if key not in keys
+        )
+        selected = keys[:mapping_limit]
+        result = {
+            str(key): _compact_judge_value(
+                value[key],
+                text_limit=max(64, text_limit // (2 if depth else 1)),
+                collection_limit=collection_limit,
+                mapping_limit=mapping_limit,
+                depth=depth + 1,
+            )
+            for key in selected
+        }
+        if len(keys) > len(selected):
+            result["_omitted_key_count"] = len(keys) - len(selected)
+        return result
+    if isinstance(value, (list, tuple)):
+        selected = value[:collection_limit]
+        result = [
+            _compact_judge_value(
+                item,
+                text_limit=max(64, text_limit // (2 if depth else 1)),
+                collection_limit=collection_limit,
+                mapping_limit=mapping_limit,
+                depth=depth + 1,
+            )
+            for item in selected
+        ]
+        if len(value) > len(selected):
+            result.append({"_omitted_item_count": len(value) - len(selected)})
+        return result
+    return copy.deepcopy(value)
+
+
+def _compact_edge(value: Mapping[str, Any]) -> JsonDict:
+    return {
+        key: copy.deepcopy(value[key])
+        for key in (
+            "from_ref",
+            "to_ref",
+            "relation",
+            "evidence_type",
+            "edge_origin",
+            "source_container",
+            "inference_method",
+            "eligible_for_attribution",
+            "confidence",
+        )
+        if key in value
+    }
+
+
+def _compact_judge_capsule(
+    source: Mapping[str, Any],
+    *,
+    text_limit: int,
+    collection_limit: int,
+    mapping_limit: int,
+    source_hash: str,
+) -> JsonDict:
+    projection = {
+        key: _compact_judge_value(
+            value,
+            text_limit=text_limit,
+            collection_limit=collection_limit,
+            mapping_limit=mapping_limit,
+            depth=0,
+        )
+        for key, value in source.items()
+    }
+    downstream_path = source.get("downstream_path")
+    if isinstance(downstream_path, (list, tuple)):
+        projection["downstream_path"] = [str(ref) for ref in downstream_path]
+    causal_path_edges = source.get("causal_path_edges")
+    if isinstance(causal_path_edges, (list, tuple)):
+        projection["causal_path_edges"] = [
+            _compact_edge(edge)
+            for edge in causal_path_edges
+            if isinstance(edge, Mapping)
+        ]
+    projection["projection_truncated"] = stable_json(projection) != stable_json(source)
+    projection["source_payload_sha256"] = source_hash
+    return projection
 
 
 @dataclass(frozen=True)
@@ -634,6 +770,54 @@ class CandidateEvidenceCapsule:
                 owner_ref=self.candidate_ref,
             ),
         }
+
+    def compact_judge_dict(
+        self, *, max_bytes: int = DEFAULT_JUDGE_CAPSULE_MAX_BYTES
+    ) -> JsonDict:
+        """Return a byte-bounded Judge projection without changing audit facts."""
+        if type(max_bytes) is not int or max_bytes < 4096:
+            raise ValueError("max_bytes must be an integer of at least 4096")
+        source = self.judge_dict()
+        source_hash = hashlib.sha256(stable_json(source).encode("utf-8")).hexdigest()
+        for text_limit, collection_limit, mapping_limit in (
+            (1200, 12, 32),
+            (700, 10, 24),
+            (420, 8, 20),
+            (240, 6, 16),
+            (120, 4, 12),
+        ):
+            projection = _compact_judge_capsule(
+                source,
+                text_limit=text_limit,
+                collection_limit=collection_limit,
+                mapping_limit=mapping_limit,
+                source_hash=source_hash,
+            )
+            if len(stable_json(projection).encode("utf-8")) <= max_bytes:
+                return projection
+        projection = {
+            "schema_version": source.get("schema_version"),
+            "candidate_ref": self.candidate_ref,
+            "defect_state": self.defect_state.to_dict(),
+            "candidate": _compact_judge_value(
+                source.get("candidate"),
+                text_limit=80,
+                collection_limit=2,
+                mapping_limit=10,
+                depth=0,
+            ),
+            "downstream_path": list(self.downstream_path),
+            "causal_path_edges": [
+                _compact_edge(item) for item in self.causal_path_edges
+            ],
+            "start_refs": list(self.start_refs),
+            "episode_facts": _thaw(self.episode_facts),
+            "projection_truncated": True,
+            "source_payload_sha256": source_hash,
+        }
+        if len(stable_json(projection).encode("utf-8")) > max_bytes:
+            raise ValueError("essential candidate Judge projection exceeds max_bytes")
+        return projection
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CandidateEvidenceCapsule":

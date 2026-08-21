@@ -149,6 +149,41 @@ def sample_graph(
 
 
 class CandidateEvidenceCapsuleTest(unittest.TestCase):
+    def test_compact_projection_never_truncates_causal_path_membership(self):
+        edges = [
+            {
+                "from_ref": "record:{0}".format(index),
+                "to_ref": "record:{0}".format(index + 1),
+                "relation": "recorded_hop",
+                "evidence_type": "recorded_dataflow",
+                "edge_origin": "trace.dataflow_edges",
+                "source_container": "trace.dataflow_edges",
+                "inference_method": "trace_dataflow_edge",
+                "eligible_for_attribution": True,
+            }
+            for index in range(20)
+        ]
+        source = {
+            "candidate_ref": "record:0",
+            "downstream_path": ["record:{0}".format(index) for index in range(21)],
+            "causal_path_edges": edges,
+            "action_group": {"large": "x" * 50_000},
+        }
+
+        payload = evidence_capsule._compact_judge_capsule(
+            source,
+            text_limit=120,
+            collection_limit=4,
+            mapping_limit=12,
+            source_hash="a" * 64,
+        )
+
+        self.assertEqual(payload["downstream_path"], source["downstream_path"])
+        self.assertEqual(len(payload["causal_path_edges"]), 20)
+        self.assertTrue(
+            all(edge["source_container"] == "trace.dataflow_edges" for edge in payload["causal_path_edges"])
+        )
+
     def _synthetic_prompt_capsule(self, graph: TraceGraph | None = None):
         graph = graph or sample_graph()
         candidate = CausalCandidate(
@@ -224,6 +259,32 @@ class CandidateEvidenceCapsuleTest(unittest.TestCase):
             },
             start_refs=("record:observed_defect",),
         )[0]
+
+    def test_compact_judge_projection_is_byte_bounded_without_losing_identity_or_path(self):
+        trace = copy.deepcopy(sample_graph().raw_trace)
+        trace["records"][0]["data"]["text"] = "prompt-evidence " * 20_000
+        trace["records"][1]["data"]["rationale"] = "decision-evidence " * 20_000
+        graph = TraceGraph.from_trace(trace)
+        capsule = self._decision_capsule(graph)
+
+        payload = capsule.compact_judge_dict(max_bytes=4096)
+        encoded = stable_json(payload).encode("utf-8")
+
+        self.assertLessEqual(len(encoded), 4096)
+        self.assertEqual(payload["candidate_ref"], capsule.candidate_ref)
+        self.assertEqual(payload["downstream_path"], list(capsule.downstream_path))
+        self.assertEqual(payload["defect_state"], capsule.defect_state.to_dict())
+        self.assertTrue(payload["projection_truncated"])
+        original_edges = {
+            (edge["from_ref"], edge["to_ref"], edge["relation"]): edge
+            for edge in capsule.causal_path_edges
+        }
+        for edge in payload["causal_path_edges"]:
+            original = original_edges[
+                (edge["from_ref"], edge["to_ref"], edge["relation"])
+            ]
+            for key in ("edge_origin", "source_container", "evidence_type"):
+                self.assertEqual(edge.get(key, ""), original.get(key, ""))
 
     def test_capsule_persists_graph_aware_materialized_change_eligibility(self):
         graph = sample_graph(decision_event_type="change")

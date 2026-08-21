@@ -137,7 +137,11 @@ function evaluateAcceptanceAssertion(assertion, trace, index) {
     const changed = records.filter((record) => record.event_type === "change").filter((record) =>
       (Array.isArray(record.data?.files) ? record.data.files : []).some((file) => {
         const normalized = normalizePath(String(file))
-        return normalized === target || normalized.startsWith(`${target}/`)
+        return (
+          normalized === target ||
+          normalized.startsWith(`${target}/`) ||
+          normalized.endsWith(`/${target}`)
+        )
       }),
     )
     const shouldChange = assertion.should_change !== false
@@ -321,6 +325,43 @@ function detectEvidence(name, trace) {
           record.event_type === "response.claim" &&
           (Array.isArray(record.data?.direct_evidence_refs) ? record.data.direct_evidence_refs.length > 0 : false),
       ),
+    artifact_cleanup: (records) =>
+      records.filter(
+        (record) =>
+          record.event_type === "change" &&
+          hasAny(
+            record,
+            [
+              "stale",
+              "cleanup",
+              "清理",
+              "delete",
+              "removed",
+              "rm ",
+              "unlink",
+              "notes/stale_run.md",
+              "delete_file",
+            ],
+          ),
+      ),
+    nested_tool_chain: (records) => {
+      const candidateCalls = records
+        .map((record, index) => ({ index, record, text: JSON.stringify(record).toLowerCase() }))
+        .filter((item) =>
+          item.text.includes("yocto_build_plan") || item.text.includes("yocto_build_execute") || item.text.includes("build-plan") || item.text.includes("mcp.call"),
+        )
+      const hasPlan = candidateCalls.some((entry) => entry.text.includes("yocto_build_plan") || entry.text.includes("build-plan"))
+      const hasExecute = candidateCalls.some((entry) => entry.text.includes("yocto_build_execute"))
+      if (!hasPlan || !hasExecute) return []
+      const planIndex = candidateCalls.find((entry) => entry.text.includes("yocto_build_plan") || entry.text.includes("build-plan"))?.index
+      const executeIndex = [...candidateCalls]
+        .reverse()
+        .find((entry) => entry.text.includes("yocto_build_execute") && (planIndex === undefined || entry.index > planIndex))?.index
+      if (planIndex === undefined || executeIndex === undefined) return []
+      return candidateCalls
+        .filter((entry) => entry.text.includes("yocto_build_plan") || entry.text.includes("yocto_build_execute"))
+        .map((entry) => entry.record)
+    },
     mcp_call_output: (records) =>
       records.filter(
         (record) =>
@@ -396,6 +437,25 @@ function detectEvidence(name, trace) {
           hasAny(record, ["obligation_type", "status"]) &&
           (record.data?.obligation_type || record.data?.status),
       ),
+    task_relevance_shift: (records) =>
+      records.filter(
+        (record) =>
+          (isAnswerSemanticRecord(record) || record.event_type === "decision") &&
+          hasAny(record, [
+            "stale",
+            "旧",
+            "修正",
+            "pollute",
+            "artifact",
+            "污染",
+            "重新会话",
+            "重启",
+            "step2",
+            "15%",
+            "20%",
+            "not applicable",
+          ]),
+      ),
     unsupported_claims: (records, fullTrace) => {
       const health = fullTrace?.metrics?.trace_health ?? {}
       if ((health.unsupported_response_claims ?? 0) > 0 || (health.context_only_response_claims ?? 0) > 0) {
@@ -453,6 +513,22 @@ function detectEvidence(name, trace) {
         (record) =>
           isAnswerSemanticRecord(record) &&
           hasAny(record, ["alternative", "option", "tradeoff", "方案", "取舍", "比较", "选择"]),
+      ),
+    logic_preservation_claim: (records) =>
+      records.filter(
+        (record) =>
+          isAnswerSemanticRecord(record) &&
+          hasAny(record, [
+            "control flow",
+            "control-flow",
+            "branch",
+            "分支",
+            "逻辑",
+            "控制流",
+            "未修改",
+            "preserve",
+            "保持.*?逻辑",
+          ]),
       ),
     risk_assessment: (records) =>
       records.filter(

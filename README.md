@@ -537,6 +537,13 @@ python -m trace_attribution \
 - `rejected_hypotheses`：被排除的候选及原因；
 - `confidence`：已确认根因的置信度；
 - `unresolved_gaps`：Trace 缺失或仍无法判定的语义信息。
+- `defect_evolution`：从行为契约、上下文传递、缺陷首次引入、动作物化、迟到补偿到用户观察的逐步语义演化。它同时保存机器可审计的节点、状态和证据，以及面向使用者的“谁做了什么、当时知道什么、为什么有问题、怎样影响下一步”。
+- `defect_subject`、`expected_sequence`、`actual_sequence`、`first_deviation`：明确命名本次追踪的具体偏差、比较的动作顺序和首次偏离位置，避免使用“比较期望顺序”“缺陷出现”等没有对象的抽象表述。
+
+对于已确认根因，模块会先根据 Causal IR、递归路径和数据流边确定性重建
+`defect_evolution`，再调用同一个离线 Judge 对这些不可变步骤生成中文解释。LLM 只能补充说明，
+不能增加、删除、合并或重排节点，也不能修改缺陷状态和证据引用；若输出违反约束，会自动回退
+到确定性解释。该过程只读取 Trace，不改变 Agent、OpenCode session 或 Trace 采集行为。
 
 如果没有足够证据，模块会返回
 `no_confirmed_root_cause / evidence_insufficient`，不会为了给出答案而虚构根因。
@@ -549,14 +556,15 @@ Trace 引用收窄起点；若不知道节点，保持自动候选检索即可�
 
 若 `--out` 为 `/data/evo-bench/attribution/case-001.json`，归因过程中会同时维护结果、
 message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程重启后，可使用相同
-参数继续分析，避免重复消耗已经完成的 Judge 请求。分析正常结束后，CLI 会在终端最后一行
-打印 `--out` 指定的路径；该 JSON 是最终归因报告，也是查看分析结果的首要入口。
+参数继续分析，避免重复消耗已经完成的 Judge 请求。分析正常结束后，CLI 会依次打印
+`--out` 指定的 JSON 路径和面向人工阅读的 Markdown 解释路径。
 
 以上述 `--out` 为例，默认会得到：
 
 ```text
 /data/evo-bench/attribution/
-├── case-001.json                       # 最终归因报告，主要查看它
+├── case-001.json                       # 最终结构化归因报告
+├── case-001.explanation.md             # 完整缺陷描述和逐节点产生过程
 ├── case-001.message-lineage.json       # 离线重建的消息、上下文和数据流
 ├── case-001.judge-cache.jsonl          # 已完成的 LLM Judge 判断缓存
 └── case-001.checkpoint/                # 递归分析断点，用于中断续跑
@@ -564,6 +572,22 @@ message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程
 
 `trace.html` 只用于人工查看 Agent 的原始执行流程，不承载归因结论。归因结果中的 Trace 引用
 可以回到同一 case 的 `trace.html` 或 `trace.json` 核验，但不要把 HTML 当作归因输入。
+
+直接阅读完整的缺陷产生过程：
+
+```bash
+cat /data/evo-bench/attribution/case-001.explanation.md
+```
+
+Markdown 默认采用工程复盘式表达：先明确本次追踪的偏差、期望动作顺序、实际动作顺序和首次
+偏离，再按数据流逐步说明每个参与者做了什么、当时掌握了什么信息、为何引入或没有引入偏差、
+结果怎样影响下一步。`tool.result`、节点 ID、`absent/present/propagated` 等内部字段只出现在文末
+“技术证据附录”，用于开发者审计，不要求普通使用者理解。
+
+本次升级不改变归因 CLI、Python API 或环境变量的使用方式。成功分析后仍然同时得到结构化
+JSON 和 Markdown 报告；变化仅包括 `defect_evolution/v2` 新增偏差对象、期望/实际动作序列、
+首次偏离和人类可读步骤字段，以及 Markdown 增加工程复盘正文和技术证据附录。对已经存在的
+`trace.json`，使用原命令重新执行归因即可生成新版报告，不需要重新运行 Agent 或重新采集 Trace。
 
 #### 查看分析结果
 
@@ -581,6 +605,7 @@ jq '{
   analysis_outcome,
   conclusion,
   confidence,
+  defect_evolution,
   causal_chain,
   supporting_evidence_refs,
   rejected_hypotheses,

@@ -61,6 +61,8 @@ from trace_attribution.recursive_analyzer import (
     RecursiveAnalysisState,
     _assert_report_grounded_evidence,
     _grounded_downstream_path,
+    _localized_question_candidate_refs,
+    _select_navigation_candidates,
     _validate_global_pass_derivations,
     classify_legacy_projection_shape,
 )
@@ -944,6 +946,84 @@ def valid_single_node_payload() -> dict:
 
 
 class RecursiveTraversalTest(unittest.TestCase):
+    def test_localized_question_candidates_prioritize_first_deviation_and_sequence(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "localized-question-candidates",
+                "offline_question_projection": {
+                    "premise_assessment": {
+                        "status": "supported",
+                        "confidence": 0.95,
+                        "missing_evidence": [],
+                        "first_deviation_ref": "record:reasoning",
+                        "actual_sequence_refs": ["record:edit", "record:execute"],
+                        "contract_source_refs": ["record:plan"],
+                    }
+                },
+                "records": [
+                    {"record_id": "plan", "component": "mcp", "event_type": "tool.result", "data": {}},
+                    {"record_id": "reasoning", "component": "processor", "event_type": "decision", "data": {}},
+                    {"record_id": "edit", "component": "tool", "event_type": "decision", "data": {}},
+                    {"record_id": "execute", "component": "mcp", "event_type": "decision", "data": {}},
+                ],
+            }
+        )
+
+        self.assertEqual(
+            _localized_question_candidate_refs(graph),
+            (
+                "record:reasoning",
+                "record:edit",
+                "record:execute",
+                "record:plan",
+            ),
+        )
+
+    def test_supported_question_navigation_enters_only_through_first_deviation(self):
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "localized-question-anchor",
+                "offline_question_projection": {
+                    "premise_assessment": {
+                        "status": "supported",
+                        "confidence": 0.95,
+                        "missing_evidence": [],
+                        "first_deviation_ref": "record:decision",
+                        "actual_sequence_refs": ["record:edit", "record:execute"],
+                        "contract_source_refs": ["record:plan"],
+                    }
+                },
+                "records": [
+                    {"record_id": "plan", "component": "mcp", "event_type": "tool.result", "data": {}},
+                    {"record_id": "decision", "component": "processor", "event_type": "decision", "data": {}},
+                    {"record_id": "edit", "component": "tool", "event_type": "decision", "data": {}},
+                    {"record_id": "execute", "component": "mcp", "event_type": "decision", "data": {}},
+                ],
+            }
+        )
+        candidates = [
+            CausalCandidate(
+                ref=ref,
+                node=graph.nodes[ref],
+                source="localized_evidence",
+                score=1.0,
+                edge={},
+                evidence_refs=(ref,),
+            )
+            for ref in (
+                "record:execute",
+                "record:decision",
+                "record:edit",
+            )
+        ]
+
+        selected = _select_navigation_candidates(graph, candidates)
+
+        self.assertEqual(
+            [candidate.ref for candidate in selected],
+            ["record:decision"],
+        )
+
     def test_process_confirmation_rebuilds_fact_only_context(self):
         defect = DefectState.create(
             label="candidate_local_process_defect",

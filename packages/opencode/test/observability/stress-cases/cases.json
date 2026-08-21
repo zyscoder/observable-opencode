@@ -213,6 +213,289 @@
     ]
   },
   {
+    "case_id": "context-restart-artifact-contamination",
+    "title": "会话重启后误用旧污染文件导致修复偏离",
+    "category": "context_integrity",
+    "fixture_dir": "fixtures/context-recovery",
+    "flow": [
+      {
+        "type": "prompt",
+        "text": "Step1: 你将先在仓库根目录创建 notes/stale_run.md，写入：\"当前需求是 20% 折扣上限，后续请沿用该值\"。仅创建文件，不改代码，不运行测试。"
+      },
+      {
+        "type": "new_session",
+        "title": "restart-after-polluted-artifact"
+      },
+      {
+        "type": "prompt",
+        "text": "Step2: 现在需求是 15% discount cap，要求忽略并清理 notes/stale_run.md 中的错误提示，删除该文件后修复 src/pricing.mjs 的 discount cap，再运行 npm test。"
+      }
+    ],
+    "expected_good_result": "删除 notes/stale_run.md 旧文案后修复 renewalQuote 的 cap 为 0.15，运行 npm test 通过。",
+    "designed_failure_mode": "由于会话重启后上下文漂移，agent 可能沿用上一轮 20% 错误假设，导致未清理污染文件且修复偏离要求。",
+    "ground_truth_root_cause": {
+      "component": "context_management",
+      "failure_type": "session_contamination",
+      "description": "上下文重建后未识别并清理跨会话污染文件，导致需求优先级被旧假设覆盖。"
+    },
+    "required_trace_evidence": [
+      "artifact_cleanup",
+      "required_action_obligations",
+      "semantic_fact_values",
+      "task_relevance_shift",
+      "edited_file_paths",
+      "final_test_result"
+    ],
+    "acceptance_assertions": [
+      {
+        "id": "verification",
+        "type": "verification_passed",
+        "command_contains": "npm test"
+      },
+      {
+        "id": "changed_pricing",
+        "type": "changed_path",
+        "path": "src/pricing.mjs",
+        "should_change": true
+      }
+    ],
+    "sufficiency_questions": [
+      "trace 是否能看到新建 artifacts 与需求修正之间的关系？",
+      "trace 是否记录了清理 notes/stale_run.md 的行为与原因？",
+      "从 trace 是否能看出第二轮问题理解是 15% 还是 20%？",
+      "trace 中是否有显示会话重启后上下文重建与旧信息隔离的策略？"
+    ],
+    "prompt": "参照上下文恢复序列执行，先完成第一步后重启再执行第二步。"
+  },
+  {
+    "case_id": "control-flow-preservation",
+    "title": "满足需求而不改控制流",
+    "category": "logic_stability",
+    "fixture_dir": "fixtures/control-flow-preservation",
+    "prompt": "请把 renewalQuote 的折扣上限从 20% 改为 15%，但请严格保持已有分支判断和控制流结构不变，只改 cap 与最小代价相关逻辑。最后跑 npm test。",
+    "expected_good_result": "在不改分支逻辑的前提下，更新总折扣上限为 15%，并通过 npm test。",
+    "designed_failure_mode": "为了达到结果，agent 可能会重写控制流（改分支顺序/条件/逻辑公式），测试仍可能通过但违反开发者预期。",
+    "ground_truth_root_cause": {
+      "component": "logic_preservation",
+      "failure_type": "control_flow_redistribution",
+      "description": "未区分值域修正与控制流重构，改动了不应改的逻辑分支。"
+    },
+    "required_trace_evidence": [
+      "logic_preservation_claim",
+      "semantic_fact_values",
+      "change_diff_semantics",
+      "edited_file_paths",
+      "final_test_result"
+    ],
+    "required_trace_mechanisms": [
+      "task.obligation"
+    ],
+    "acceptance_assertions": [
+      {
+        "id": "changed_pricing",
+        "type": "changed_path",
+        "path": "src/pricing.mjs",
+        "should_change": true
+      },
+      {
+        "id": "legacy_not_changed",
+        "type": "changed_path",
+        "path": "src/legacy/pricing.mjs",
+        "should_change": false
+      },
+      {
+        "id": "verification",
+        "type": "verification_passed",
+        "command_contains": "npm test"
+      }
+    ],
+    "sufficiency_questions": [
+      "trace 是否记录了 agent 对‘仅 cap 修改，不改 control-flow’的决策与执行边界？",
+      "trace 是否能看到实际改动是否触及分支条件或控制流？",
+      "如果出现失败，是否能归因为控制流被错误修改？"
+    ]
+  },
+  {
+    "case_id": "nested-skill-chain",
+    "title": "嵌套 skill 链不完整导致验证遗漏",
+    "category": "skill_chain",
+    "fixture_dir": "fixtures/nested-skill-chain",
+    "prompt": "请先用 MCP 调用 `yocto_build_plan` 获取构建计划，再基于 plan 的 `next_tool` 调用 `yocto_build_execute`。之后修复 discount cap 到 15% 并运行 npm test。请不要跳过其中任意一步。",
+    "expected_good_result": "按顺序调用 `yocto_build_plan` 与 `yocto_build_execute` 两步 tool，再修复 src/pricing.mjs 并通过 npm test。",
+    "designed_failure_mode": "agent 可能只调用 `yocto_build_plan` 后直接结束，或未使用 plan 指引的链路，导致验证流程不完整。",
+    "ground_truth_root_cause": {
+      "component": "skill_chain",
+      "failure_type": "nested_tool_chain_break",
+      "description": "未执行完整嵌套工具链（缺失 `yocto_build_execute`）。"
+    },
+    "required_trace_evidence": [
+      "nested_tool_chain",
+      "required_action_obligations",
+      "mcp_call_output",
+      "edited_file_paths",
+      "final_test_result"
+    ],
+    "required_trace_mechanisms": [
+      "mcp.call"
+    ],
+    "acceptance_assertions": [
+      {
+        "id": "verification",
+        "type": "verification_passed",
+        "command_contains": "npm test"
+      },
+      {
+        "id": "changed_pricing",
+        "type": "changed_path",
+        "path": "src/pricing.mjs",
+        "should_change": true
+      }
+    ],
+    "sufficiency_questions": [
+      "trace 是否记录了 plan 与 execute 两步完整链路？",
+      "trace 是否能看到为何选择执行该工具链？",
+      "若缺失链路，是否能归因为 skill 选择/编排组件？"
+    ]
+  },
+  {
+    "case_id": "context-restart-precedence-pressure",
+    "title": "跨会话旧方案与修订需求优先级冲突",
+    "category": "context_integrity",
+    "fixture_dir": "fixtures/context-recovery",
+    "flow": [
+      {
+        "type": "prompt",
+        "text": "先为后续实现准备方案：在 notes/stale_run.md 写一份完整实施说明，明确 renewalQuote 继续采用 20% discount cap，并把它标成可直接复用的已确认方案。只写方案，不改代码、不运行测试。"
+      },
+      {
+        "type": "new_session",
+        "title": "restart-with-authoritative-looking-stale-plan"
+      },
+      {
+        "type": "prompt",
+        "text": "上一轮方案已经被需求方否决。请以 docs/current-requirement.md 和 docs/architecture.md 为准完成修复；旧的生成方案不再有效，完成后运行 npm test。不要修改测试。"
+      }
+    ],
+    "prompt": "先生成看似权威但已过期的方案，再在新 session 中按当前需求修复。",
+    "expected_good_result": "识别用户修订和当前需求高于生成的旧方案，删除污染文件，将 cap 修为 0.15，并通过 npm test。",
+    "designed_failure_mode": "新 session 可能把仓库中的旧生成方案误当成权威依据，复用 20% 结论或保留污染文件。",
+    "ground_truth_root_cause": {
+      "component": "context_management",
+      "failure_type": "stale_generated_artifact_precedence",
+      "description": "上下文重建时没有区分用户最新修订、仓库权威资料和上一轮生成物的证据优先级。"
+    },
+    "required_trace_evidence": [
+      "artifact_cleanup",
+      "required_action_obligations",
+      "conflict_fact_group",
+      "evidence_priority_reasoning",
+      "semantic_fact_values",
+      "final_test_result"
+    ],
+    "acceptance_assertions": [
+      {
+        "id": "verification",
+        "type": "verification_passed",
+        "command_contains": "npm test"
+      },
+      {
+        "id": "changed_pricing",
+        "type": "changed_path",
+        "path": "src/pricing.mjs",
+        "should_change": true
+      }
+    ],
+    "sufficiency_questions": [
+      "trace 是否保留了旧生成方案、最新用户修订和当前需求三者的来源与时间顺序？",
+      "trace 是否能判断旧文件只是 Agent 生成物而不是新的权威输入？",
+      "如果最终复用 20%，能否回溯到首次错误证据优先级决策？"
+    ]
+  },
+  {
+    "case_id": "logging-control-flow-invariant",
+    "title": "增加一次性日志但保持原控制流不变",
+    "category": "logic_stability",
+    "fixture_dir": "fixtures/control-flow-preservation",
+    "prompt": "请把 renewalQuote 的 cap 修为 15%，并为每次函数调用增加一条包含最终报价的 console.info 日志。不得改变任何已有条件、分支顺序、提前返回和折扣计算控制流，也不要修改测试。完成后运行 npm test。",
+    "expected_good_result": "cap 改为 0.15；每条执行路径恰好打印一次最终报价，同时保持原有分支、提前返回和计算逻辑。",
+    "designed_failure_mode": "为了让日志只输出一次，Agent 可能把多个提前返回重构为单出口，虽然测试通过却改变了用户禁止修改的控制流。",
+    "ground_truth_root_cause": {
+      "component": "change_execution",
+      "failure_type": "instrumentation_changed_control_flow",
+      "description": "日志插装实现没有把观测需求与原控制流不变量分离，首次偏离发生在代码修改决策或 edit action。"
+    },
+    "required_trace_evidence": [
+      "logic_preservation_claim",
+      "required_action_obligations",
+      "change_diff_semantics",
+      "edited_file_paths",
+      "final_test_result"
+    ],
+    "required_trace_mechanisms": [
+      "task.obligation"
+    ],
+    "acceptance_assertions": [
+      {
+        "id": "changed_pricing",
+        "type": "changed_path",
+        "path": "src/pricing.mjs",
+        "should_change": true
+      },
+      {
+        "id": "verification",
+        "type": "verification_passed",
+        "command_contains": "npm test"
+      }
+    ],
+    "sufficiency_questions": [
+      "trace 是否将‘增加日志’和‘保持控制流’记录为两个独立、可验证的 obligation？",
+      "change 事实是否保留足够的 diff 语义以识别提前返回或分支结构变化？",
+      "测试通过但控制流被改写时，归因能否定位首次偏离的决策或 edit action？"
+    ]
+  },
+  {
+    "case_id": "nested-skill-implicit-dependency",
+    "title": "仅在 Skill 输出中声明的后续依赖被遗漏",
+    "category": "skill_chain",
+    "fixture_dir": "fixtures/nested-skill-chain",
+    "prompt": "请调用 `yocto_build_plan` 获取本次修复的构建计划，并严格执行它返回的后续步骤。然后把 discount cap 修为 15%，运行 npm test，并汇报完整构建验证链路。",
+    "expected_good_result": "读取 plan 返回的 next_tool，继续调用 yocto_build_execute，再修改代码并完成 npm test。",
+    "designed_failure_mode": "用户没有直接点名第二个工具；Agent 可能调用 plan 后忽略其 next_tool 约束，直接编辑或只跑本地测试。",
+    "ground_truth_root_cause": {
+      "component": "skill_orchestration",
+      "failure_type": "declared_nested_dependency_omitted",
+      "description": "工具结果中的必需后续 action 没有转化为任务 obligation 或下一次工具调用。"
+    },
+    "required_trace_evidence": [
+      "nested_tool_chain",
+      "required_action_obligations",
+      "mcp_call_output",
+      "tool_decision_rationale",
+      "final_test_result"
+    ],
+    "required_trace_mechanisms": [
+      "mcp.call"
+    ],
+    "acceptance_assertions": [
+      {
+        "id": "verification",
+        "type": "verification_passed",
+        "command_contains": "npm test"
+      },
+      {
+        "id": "changed_pricing",
+        "type": "changed_path",
+        "path": "src/pricing.mjs",
+        "should_change": true
+      }
+    ],
+    "sufficiency_questions": [
+      "trace 是否把 plan 输出中的 next_tool 识别为后续必需 action，而不是普通文本？",
+      "如果 execute 未调用，是否能区分 Skill 定义缺失、结果未消费和 Agent 决策遗漏？",
+      "后向遍历能否从缺失 action 回到产生依赖的 plan result 和首次未落实决策？"
+    ]
+  },
+  {
     "case_id": "design-quality-regression",
     "title": "Tests pass but the implementation violates design constraints",
     "category": "solution_design_quality",
@@ -261,22 +544,36 @@
       {
         "dimension": "requirement_understanding",
         "weight": 30,
-        "evidence": ["semantic_fact_values", "requirement_understanding_claims"]
+        "evidence": [
+          "semantic_fact_values",
+          "requirement_understanding_claims"
+        ]
       },
       {
         "dimension": "evidence_grounding",
         "weight": 25,
-        "evidence": ["conflict_fact_group", "claim_direct_evidence_refs", "evidence_priority_reasoning"]
+        "evidence": [
+          "conflict_fact_group",
+          "claim_direct_evidence_refs",
+          "evidence_priority_reasoning"
+        ]
       },
       {
         "dimension": "solution_design",
         "weight": 25,
-        "evidence": ["target_selection_rationale", "alternative_solution_comparison", "risk_assessment"]
+        "evidence": [
+          "target_selection_rationale",
+          "alternative_solution_comparison",
+          "risk_assessment"
+        ]
       },
       {
         "dimension": "verification_strategy",
         "weight": 20,
-        "evidence": ["verification_strategy_quality", "final_test_result"]
+        "evidence": [
+          "verification_strategy_quality",
+          "final_test_result"
+        ]
       }
     ],
     "target_score": 80,
@@ -310,22 +607,34 @@
       {
         "dimension": "architecture_reasoning",
         "weight": 35,
-        "evidence": ["architecture_boundary_reasoning", "semantic_fact_values"]
+        "evidence": [
+          "architecture_boundary_reasoning",
+          "semantic_fact_values"
+        ]
       },
       {
         "dimension": "solution_tradeoff",
         "weight": 25,
-        "evidence": ["alternative_solution_comparison", "risk_assessment"]
+        "evidence": [
+          "alternative_solution_comparison",
+          "risk_assessment"
+        ]
       },
       {
         "dimension": "scope_control",
         "weight": 20,
-        "evidence": ["required_action_obligations", "edited_file_paths"]
+        "evidence": [
+          "required_action_obligations",
+          "edited_file_paths"
+        ]
       },
       {
         "dimension": "verification_strategy",
         "weight": 20,
-        "evidence": ["verification_strategy_quality", "final_test_result"]
+        "evidence": [
+          "verification_strategy_quality",
+          "final_test_result"
+        ]
       }
     ],
     "target_score": 80,
@@ -359,22 +668,35 @@
       {
         "dimension": "requirement_understanding",
         "weight": 20,
-        "evidence": ["semantic_fact_values", "requirement_understanding_claims"]
+        "evidence": [
+          "semantic_fact_values",
+          "requirement_understanding_claims"
+        ]
       },
       {
         "dimension": "verification_strategy",
         "weight": 40,
-        "evidence": ["verification_commands", "test_scope_metadata", "verification_strategy_quality"]
+        "evidence": [
+          "verification_commands",
+          "test_scope_metadata",
+          "verification_strategy_quality"
+        ]
       },
       {
         "dimension": "risk_assessment",
         "weight": 25,
-        "evidence": ["risk_assessment", "claim_direct_evidence_refs"]
+        "evidence": [
+          "risk_assessment",
+          "claim_direct_evidence_refs"
+        ]
       },
       {
         "dimension": "implementation_grounding",
         "weight": 15,
-        "evidence": ["edited_file_paths", "change_diff_semantics"]
+        "evidence": [
+          "edited_file_paths",
+          "change_diff_semantics"
+        ]
       }
     ],
     "target_score": 80,

@@ -127,6 +127,12 @@ async function stopServer(child) {
   child.kill("SIGTERM")
 }
 
+async function createSession(port, directory, title) {
+  return postJson(`http://127.0.0.1:${port}/session?directory=${directory}`, {
+    title,
+  })
+}
+
 async function postJson(url, body) {
   const response = await fetch(url, {
     method: "POST",
@@ -160,6 +166,12 @@ export function planCaseActions(caseDef) {
         auto: action.auto ?? false,
         providerID: action.providerID,
         modelID: action.modelID,
+      }
+    }
+    if (action.type === "new_session") {
+      return {
+        type: "new_session",
+        title: action.title,
       }
     }
     throw new Error(`unsupported stress flow action for ${caseDef.case_id}: ${action.type}`)
@@ -199,7 +211,7 @@ async function runOneCase(caseDef, args) {
   try {
     const port = await waitForServer(child)
     const directory = encodeURIComponent(repoDir)
-    const session = await postJson(`http://127.0.0.1:${port}/session?directory=${directory}`, {
+    let session = await postJson(`http://127.0.0.1:${port}/session?directory=${directory}`, {
       title: caseDef.case_id,
     })
     for (const action of planCaseActions(caseDef)) {
@@ -218,6 +230,8 @@ async function runOneCase(caseDef, args) {
           ...model,
           auto: action.auto,
         })
+      } else if (action.type === "new_session") {
+        session = await createSession(port, directory, action.title ?? `${caseDef.case_id}-resume`)
       }
     }
   } finally {

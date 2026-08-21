@@ -18,7 +18,7 @@ const rootDir = path.dirname(fileURLToPath(import.meta.url))
 test("stress cases define grounded root-cause and semantic quality scenarios with fixtures", () => {
   const cases = loadCases(rootDir)
 
-  assert.equal(cases.length, 11)
+  assert.equal(cases.length, 17)
   assert.deepEqual(
     cases.map((item) => item.case_id),
     [
@@ -29,6 +29,12 @@ test("stress cases define grounded root-cause and semantic quality scenarios wit
       "subagent-misleading-summary",
       "insufficient-verification",
       "tool-failure-hallucination",
+      "context-restart-artifact-contamination",
+      "control-flow-preservation",
+      "nested-skill-chain",
+      "context-restart-precedence-pressure",
+      "logging-control-flow-invariant",
+      "nested-skill-implicit-dependency",
       "design-quality-regression",
       "semantic-requirement-priority",
       "semantic-architecture-boundary",
@@ -82,6 +88,40 @@ test("trace sufficiency review marks missing evidence as insufficient", () => {
   assert.equal(review.can_offline_module_identify_root_cause, false)
   assert.ok(review.missing_semantics.includes(caseDefinition.required_trace_evidence[0]))
   assert.ok(review.evidence_found.every((item) => item.status === "missing"))
+})
+
+test("changed_path accepts an absolute traced path for a relative assertion", () => {
+  const caseDefinition = {
+    case_id: "absolute-changed-path",
+    required_trace_evidence: [],
+    sufficiency_questions: [],
+    acceptance_assertions: [
+      {
+        id: "pricing_changed",
+        type: "changed_path",
+        path: "src/pricing.mjs",
+        should_change: true,
+      },
+    ],
+  }
+  const trace = {
+    manifest: { case_id: caseDefinition.case_id },
+    records: [
+      {
+        record_id: "change_1",
+        event_type: "change",
+        component: "tool",
+        data: {
+          files: ["/tmp/fixture/src/pricing.mjs"],
+        },
+      },
+    ],
+  }
+
+  const review = reviewTraceSufficiency({ caseDefinition, trace })
+
+  assert.equal(review.actual_case_outcome.status, "pass")
+  assert.deepEqual(review.actual_case_outcome.assertions[0].record_refs, ["record:change_1"])
 })
 
 test("trace summary handles missing trace reviews and subset analysis", () => {
@@ -231,6 +271,12 @@ test("stress runner supports explicit multi-step HTTP flows for compaction scena
   assert.equal(flowActions[1].auto, false)
   assert.match(flowActions[2].text, /上一轮|前一轮/)
   assert.doesNotMatch(flowActions[2].text, /src\/payment/)
+
+  const contextRecoveryCase = loadCases(rootDir).find((item) => item.case_id === "context-restart-artifact-contamination")
+  const contextFlowActions = runner.planCaseActions(contextRecoveryCase)
+  assert.deepEqual(contextFlowActions.map((item) => item.type), ["prompt", "new_session", "prompt"])
+  assert.match(contextFlowActions[0].text, /stale_run\.md/)
+  assert.match(contextFlowActions[2].text, /15%/)
 })
 
 test("stress runner validates semantics from an actual production case", async () => {

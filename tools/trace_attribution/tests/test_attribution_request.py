@@ -670,7 +670,7 @@ class AttributionRequestTest(unittest.TestCase):
         self.assertEqual(options.base_url, "")
         self.assertEqual(options.base_url_env, "ANTHROPIC_BASE_URL")
         self.assertEqual(options.judge_timeout_sec, 3600.0)
-        self.assertEqual(options.judge_max_tokens, 4096)
+        self.assertEqual(options.judge_max_tokens, 8192)
         self.assertEqual(options.judge_context_window_tokens, 200_000)
         self.assertEqual(options.judge_context_safety_margin_tokens, 8_192)
         self.assertEqual(options.thinking_mode, "auto")
@@ -755,7 +755,7 @@ class AttributionRequestTest(unittest.TestCase):
                 model="offline-model",
                 base_url="offline://judge",
                 thinking_config={"type": "disabled"},
-                max_tokens=4096,
+                max_tokens=8192,
                 provider_error_threshold=3,
             )
             analyzer = mock.Mock()
@@ -787,7 +787,7 @@ class AttributionRequestTest(unittest.TestCase):
                 api_key_env="ANTHROPIC_API_KEY",
                 base_url="",
                 base_url_env="ANTHROPIC_BASE_URL",
-                max_tokens=4096,
+                max_tokens=8192,
                 context_window_tokens=200_000,
                 context_safety_margin_tokens=8_192,
                 timeout_seconds=3600.0,
@@ -897,7 +897,10 @@ class AttributionRequestTest(unittest.TestCase):
 
             config_call = build_config.call_args.kwargs
             self.assertEqual(config_call["objective"], "Why did validation fail?")
-            self.assertEqual(config_call["start_refs"], ("record:failure",))
+            question_seed = "record:offline_question_{0}".format(
+                request.question_binding.question_id[:20]
+            )
+            self.assertEqual(config_call["start_refs"], (question_seed,))
             self.assertEqual(
                 config_call["budgets"],
                 {
@@ -927,7 +930,7 @@ class AttributionRequestTest(unittest.TestCase):
             self.assertEqual(result.to_dict()["payload"], published_report)
             self.assertEqual(
                 published_report["analysis_question"]["selected_start_refs"],
-                ["record:failure"],
+                [question_seed],
             )
             self.assertEqual(result.output_path, request.output_path)
             self.assertEqual(result.question, request.question_binding)
@@ -1054,7 +1057,13 @@ class AttributionRequestTest(unittest.TestCase):
             ):
                 api_result = service.analyze(api_request)
 
-            self.assertEqual(stdout.getvalue(), str(cli_output) + "\n")
+            self.assertEqual(
+                stdout.getvalue(),
+                str(cli_output)
+                + "\n"
+                + str(cli_output.with_name(cli_output.stem + ".explanation.md"))
+                + "\n",
+            )
             self.assertTrue(cli_output.is_file())
             self.assertTrue(api_result.output_path.is_file())
             self.assertTrue(
@@ -1083,7 +1092,11 @@ class AttributionRequestTest(unittest.TestCase):
             )
             self.assertEqual(
                 cli_payload["analysis_question"]["selected_start_refs"],
-                ["record:observed"],
+                [
+                    "record:offline_question_{0}".format(
+                        api_request.question_binding.question_id[:20]
+                    )
+                ],
             )
             self.assertEqual(fixture.read_bytes(), original_trace_bytes)
 
@@ -1523,7 +1536,13 @@ class AttributionRequestTest(unittest.TestCase):
                 self.assertEqual(cli.main(), 0)
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
-            self.assertEqual(stdout.getvalue(), str(output_path) + "\n")
+            self.assertEqual(
+                stdout.getvalue(),
+                str(output_path)
+                + "\n"
+                + str(output_path.with_name(output_path.stem + ".explanation.md"))
+                + "\n",
+            )
             self.assertEqual(stderr.getvalue(), "")
             self.assertEqual(
                 payload["conclusion"],
@@ -1653,17 +1672,17 @@ class AttributionRequestTest(unittest.TestCase):
 
         self.assertEqual(
             payload["conclusion"],
-            "no_defect: no confirmed root cause; evidence is insufficient.",
+            (
+                "The user-reported deviation is not supported by the recorded "
+                "trace facts; no defect or root cause was confirmed."
+            ),
         )
+        self.assertEqual(payload["question_premise_status"], "contradicted")
         self.assertEqual(payload["confidence"], 0.0)
         self.assertEqual(
             payload["unresolved_gaps"],
             [
                 {"kind": "unresolved_ref", "ref": "record:unknown"},
-                {
-                    "kind": "no_confirmed_root_cause",
-                    "reason": "evidence_insufficient",
-                },
             ],
         )
 

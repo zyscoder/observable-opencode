@@ -42,6 +42,9 @@ from .models import JsonDict, stable_json
 from .restoration_obligation import RestorationObligation
 
 
+GLOBAL_JUDGE_CANDIDATE_CAPSULE_MAX_BYTES = 8192
+GLOBAL_JUDGE_CONTEXT_CAPSULE_MAX_BYTES = 4096
+GLOBAL_JUDGE_FACTUAL_CAPSULE_MAX_BYTES = 8192
 GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION
 GLOBAL_JUDGE_DIAGNOSTICS_SCHEMA = "global-judge-diagnostics/v1"
 GLOBAL_JUDGE_PROMPT_PROJECTION_SCHEMA = "global-judge-prompt-projection/v2"
@@ -319,7 +322,9 @@ def _global_active_failure_factual_context(
     entries = []
     competitors = []
     for capsule in request.capsules:
-        payload = capsule.judge_dict()
+        payload = capsule.compact_judge_dict(
+            max_bytes=GLOBAL_JUDGE_FACTUAL_CAPSULE_MAX_BYTES
+        )
         candidate = payload.get("candidate")
         node = (
             candidate.get("node")
@@ -601,6 +606,13 @@ class GlobalCandidateJudgeRequest:
         return tuple(output)
 
     def to_dict(self) -> JsonDict:
+        return self._projection(compact_for_judge=False)
+
+    def judge_dict(self) -> JsonDict:
+        """Return the bounded prompt projection; to_dict remains lossless."""
+        return self._projection(compact_for_judge=True)
+
+    def _projection(self, *, compact_for_judge: bool) -> JsonDict:
         self.validate()
         return {
             "case_id": self.case_id,
@@ -632,10 +644,23 @@ class GlobalCandidateJudgeRequest:
             "retrieval_is_not_causal_verdict": True,
             "grounded_refs": list(self.grounded_refs),
             "candidate_evidence_capsules": [
-                item.judge_dict() for item in self.capsules
+                (
+                    item.compact_judge_dict(
+                        max_bytes=GLOBAL_JUDGE_CANDIDATE_CAPSULE_MAX_BYTES
+                    )
+                    if compact_for_judge
+                    else item.judge_dict()
+                )
+                for item in self.capsules
             ],
             "evidence_context_capsules": [
-                item.judge_dict()
+                (
+                    item.compact_judge_dict(
+                        max_bytes=GLOBAL_JUDGE_CONTEXT_CAPSULE_MAX_BYTES
+                    )
+                    if compact_for_judge
+                    else item.judge_dict()
+                )
                 for item in self.evidence_context_capsules
             ],
         }
@@ -1395,7 +1420,7 @@ def global_candidate_comparison_contract(
 ) -> JsonDict:
     request.validate()
     return global_candidate_comparison_contract_from_context(
-        request.to_dict()
+        request.judge_dict()
     )
 
 
