@@ -193,26 +193,45 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertNotIn("$rootcause-analysis", text, name)
 
-    def test_scored_forward_wrapper_uses_isolated_bundle_and_external_binary(self):
+    def test_scored_forward_wrapper_requires_container_and_external_linux_binary(self):
         self.assertTrue(FORWARD_RUNNER_PATH.is_file())
         wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
         for phrase in (
             "prepare_isolated_bundle.py",
             '"OPENCODE_BIN"',
             '"prompt-opencode.md"',
-            'cwd=context["workspace"]',
+            '"--mode"',
+            '"smoke"',
+            '"scored"',
+            '"docker"',
+            '"podman"',
+            '"/workspace"',
+            '"/opt/opencode"',
+            "build_scored_container_command",
+            "validate_linux_release_binary",
         ):
             self.assertIn(phrase, wrapper)
         self.assertNotIn('"packages/opencode/src/index.ts"', wrapper)
         self.assertNotIn('cwd=REPO', wrapper)
-        self.assertIn('"PWD": str(workspace)', wrapper)
-        for variable in ("OLDPWD", "INIT_CWD", "GIT_DIR", "GIT_WORK_TREE"):
-            self.assertIn(f'env.pop("{variable}", None)', wrapper)
+        self.assertIn("unscored_smoke", wrapper)
+        self.assertIn("scored_pending_evaluator", wrapper)
+        self.assertIn("SANITIZED_PROVIDER_ENV", wrapper)
         self.assertIn(
             "tools/rootcause_skill_tests/pressure/run_isolated_opencode.py",
             self.raw_forward_report_text,
         )
         self.assertIn("unscored", self.raw_forward_report_text)
+
+    def test_docs_do_not_equate_cwd_isolation_with_scored_isolation(self):
+        for name, text in (
+            ("README", self.readme_text),
+            ("plan", self.plan_text),
+            ("results", (REPO_ROOT / "docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md").read_text(encoding="utf-8")),
+        ):
+            self.assertIn("Docker", text, name)
+            self.assertIn("Podman", text, name)
+            self.assertIn("Linux release", text, name)
+            self.assertRegex(text, r"(?i)cwd.{0,120}(smoke|不构成评分隔离)", name)
 
     def test_readme_artifact_example_uses_discoverable_fixture_id(self):
         self.assertIn("artifact_refs", self.readme_text)

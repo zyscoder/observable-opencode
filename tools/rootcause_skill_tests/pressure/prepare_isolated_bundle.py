@@ -4,7 +4,9 @@
 import argparse
 import hashlib
 import json
+import re
 import shutil
+import uuid
 from pathlib import Path
 
 
@@ -13,6 +15,7 @@ FIXTURES = ROOT / "tools" / "rootcause_skill_tests" / "fixtures"
 CASES_PATH = Path(__file__).with_name("cases.json")
 SKILL_ROOT = ROOT / ".claude" / "skills" / "rootcause-analysis"
 TERMINAL_STATUSES = {"success", "error", "cancelled"}
+OPAQUE_CASE_PATTERN = re.compile(r"case-[0-9a-f]{32}\Z")
 
 
 def canonical_hash(value):
@@ -164,12 +167,37 @@ def prompts(trace_path, question):
     }
 
 
-def prepare(case, destination):
+def sanitize_trace_identity(trace, opaque_case_id):
+    derived = json.loads(json.dumps(trace, ensure_ascii=False))
+    derived["manifest"]["run_id"] = opaque_case_id
+    derived["manifest"]["case_id"] = opaque_case_id
+    for node in derived["nodes"]:
+        scope = node.get("scope")
+        if not isinstance(scope, dict):
+            raise ValueError(f"Canonical node scope is missing: {node.get('node_id')}")
+        scope["run_id"] = opaque_case_id
+        scope["case_id"] = opaque_case_id
+        node["integrity"]["payload_hash"] = canonical_hash(node.get("payload"))
+        if "source_hash" in node["integrity"]:
+            node["integrity"]["source_hash"] = source_hash(node)
+    return derived
+
+
+def trace_bytes(trace):
+    return (json.dumps(trace, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def prepare(case, destination, opaque_case_id=None, agent_trace_path="/workspace/trace.json"):
     questions = case_questions()
     if case not in questions:
         raise ValueError(f"No pressure question is defined for case: {case}")
 
+    opaque_case_id = opaque_case_id or f"case-{uuid.uuid4().hex}"
+    if not OPAQUE_CASE_PATTERN.fullmatch(opaque_case_id):
+        raise ValueError("Opaque case ID must match case-<32 lowercase hex characters>")
     destination = destination.resolve(strict=False)
+    if destination.name != opaque_case_id:
+        raise ValueError("Agent-visible destination basename must equal the opaque case ID")
     source = FIXTURES / case
     trace_source = fixture_file(source, Path("trace.json"))
     trace = json.loads(trace_source.read_text(encoding="utf-8"))
@@ -185,10 +213,13 @@ def prepare(case, destination):
         artifacts.append((relative, artifact_source))
 
     canonical_skill = skill_files()
-    rendered_prompts = prompts(destination / "trace.json", questions[case])
+    derived_trace = sanitize_trace_identity(trace, opaque_case_id)
+    validate_trace(derived_trace, opaque_case_id)
+    derived_bytes = trace_bytes(derived_trace)
+    rendered_prompts = prompts(agent_trace_path, questions[case])
 
     destination.mkdir(parents=True, exist_ok=False)
-    shutil.copyfile(trace_source, destination / "trace.json")
+    (destination / "trace.json").write_bytes(derived_bytes)
     for relative, artifact_source in artifacts:
         artifact_destination = destination / relative
         artifact_destination.parent.mkdir(parents=True, exist_ok=True)
@@ -199,6 +230,17 @@ def prepare(case, destination):
         shutil.copyfile(skill_source, skill_destination)
     for name, content in rendered_prompts.items():
         (destination / name).write_text(content, encoding="utf-8")
+    return {
+        "source_fixture": case,
+        "opaque_case_id": opaque_case_id,
+        "source_trace_sha256": hashlib.sha256(trace_source.read_bytes()).hexdigest(),
+        "derived_trace_sha256": hashlib.sha256(derived_bytes).hexdigest(),
+        "derivation": {
+            "kind": "sanitized_identity_projection",
+            "identity_fields": ["manifest.run_id", "manifest.case_id", "nodes[*].scope"],
+            "node_integrity_recomputed": True,
+        },
+    }
 
 
 def main(argv=None):
@@ -206,11 +248,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=sorted(questions), required=True)
     parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--opaque-case-id")
+    parser.add_argument("--agent-trace-path", default="/workspace/trace.json")
     args = parser.parse_args(argv)
     try:
-        prepare(args.case, args.destination)
+        provenance = prepare(
+            args.case,
+            args.destination,
+            args.opaque_case_id,
+            args.agent_trace_path,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
+    print(json.dumps(provenance, ensure_ascii=False, sort_keys=True))
     return 0
 
 

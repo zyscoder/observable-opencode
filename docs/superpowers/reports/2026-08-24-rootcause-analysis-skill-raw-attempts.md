@@ -24,26 +24,27 @@ Observed result:
 {"raw_returncode":1,"stdout":"Not logged in · Please run /login\n","stderr":"","timed_out":false,"termination_signal":null,"termination_action":"none; process exited itself"}
 ```
 
-## Current Isolated OpenCode Wrapper
+## Current Smoke/Scored OpenCode Wrapper
 
-The scored-run wrapper is maintained as executable source at
-`tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`. It first calls
-`prepare_isolated_bundle.py` for the selected case, then launches a standalone
-OpenCode executable with that case's `workspace` as cwd. The Agent-visible
-workspace contains only the selected finalized Trace and verified Artifacts,
-the canonical `rootcause-analysis` Skill, and the OpenCode/Claude prompts. It
-contains no evaluator `cases.json`, hidden expected outcomes, rubric, sibling
-fixtures, reports, Git history, or symlink to the repository.
+The wrapper is maintained at
+`tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`. `--mode smoke`
+runs locally and is never scored. `--mode scored` requires a Docker or Podman
+filesystem sandbox and an external Linux release ELF. It mounts only the
+current opaque workspace at `/workspace` and the binary at `/opt/opencode`.
+The Agent-visible workspace contains only the identity-sanitized finalized
+Trace, verified Artifacts, canonical `rootcause-analysis` Skill, and runtime
+prompts. Evaluator mappings and derived provenance remain in host audit data.
 
-Use `--opencode-bin` or `OPENCODE_BIN` to supply the standalone executable.
-The wrapper isolates HOME/XDG state, preserves the no-overwrite batch-root and
-safe-signal audit contracts, records per-case errors, and continues remaining
-cases. Captured outputs remain `unscored_pending_evaluator` until the evaluator,
-outside the Agent workspace, compares them with hidden cases and the rubric.
+Use `--opencode-bin` or `OPENCODE_BIN` to supply the executable. Scored mode
+also requires `--container-runtime docker|podman`; successful output remains
+`scored_pending_evaluator` until the host-side evaluator compares it with the
+hidden cases and rubric. Provider secrets are forwarded by whitelisted variable
+name and are not serialized into command audit.
 
 ```bash
-export OPENCODE_BIN=/absolute/path/to/opencode
+export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
 python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
+  --mode scored --container-runtime docker \
   --batch-root /tmp/rootcause-forward-<unique>
 ```
 
@@ -486,3 +487,14 @@ process was reaped and was not running at the end.
 ## Interpretation
 
 The historical seven-case source-build run observed `error=no providers found cause=Error: no providers found` before model inference. It did not establish an OpenCode self-exit code, a signal-caused termination, or a scored isolated result. The current tracked wrapper preserves the signal distinction, builds evaluator-clean workspaces, uses an external `OPENCODE_BIN`, and continues after individual case failures. Hidden outcomes and the rubric remain evaluator-only inputs after Agent execution.
+
+## Fix B Round 1 Classification
+
+All attempts recorded above are local/source or cwd-isolated **smoke** attempts.
+None is a scored isolation result. Scored execution now requires a working
+Docker or Podman filesystem sandbox, an external Linux release `OPENCODE_BIN`,
+one opaque workspace mounted at `/workspace`, and no repository, batch, audit,
+evaluator, sibling, or parent workspace mount. On 2026-08-24 the Docker CLI was
+present but daemon access failed with `permission denied ... docker.sock`, and
+Podman was not installed, so the scored integration remained explicitly
+blocked. No model result or rubric score is claimed.

@@ -29,7 +29,12 @@ wrapper. A final RED required sanitizing inherited repository navigation state
 from the OpenCode child environment. Each RED was followed by focused GREEN
 before the next behavior was added.
 
-## Isolation Contract
+## Historical Isolation Contract
+
+This report predates Fix B round 1. Its external-binary cwd path is now
+classified as smoke only; cwd separation does not provide scored filesystem
+isolation. Scored runs now require Docker or Podman plus an external Linux
+release `OPENCODE_BIN`, as documented in the round-1 report.
 
 `prepare_isolated_bundle.py` now accepts all seven case IDs. Before creating a
 destination it validates terminal Causal IR identity, canonical node payload
@@ -49,13 +54,12 @@ report, Git history, or symlink to the repository. Both prompts contain the
 exact selected question and isolated Trace path, but no expected-answer keys or
 repository path.
 
-`run_isolated_opencode.py` requires `--opencode-bin` or `OPENCODE_BIN`, creates
+The historical runner required `--opencode-bin` or `OPENCODE_BIN`, created
 each bundle through the builder, and launches that executable with the bundle
 as cwd. HOME, PWD, and XDG roots point outside the workspace into case-local
 runtime state; inherited `OLDPWD`, `INIT_CWD`, `GIT_DIR`, and `GIT_WORK_TREE`
 are removed. Safe-signal auditing, no-overwrite roots, per-case error records,
-and continuation remain intact. Results remain
-`unscored_pending_evaluator` until external scoring.
+and continuation remain useful smoke evidence. These results are unscored.
 
 ## Evaluator Boundary
 
@@ -110,7 +114,6 @@ not an Agent inference result and not a rubric score.
 
 ## Remaining External Prerequisite
 
-A real scored result still requires authenticated Claude Code or a standalone
-OpenCode binary with a configured provider. Once available, run the isolated
-prompts and let the evaluator score the captured JSON/Markdown. The historical
-blocked attempts do not satisfy that requirement.
+A real scored result requires a working Docker or Podman daemon, an external
+Linux release OpenCode binary, and a configured provider. The historical cwd
+and blocked attempts do not satisfy that requirement.

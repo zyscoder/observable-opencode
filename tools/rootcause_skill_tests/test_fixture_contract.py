@@ -1,11 +1,14 @@
 import hashlib
 import importlib.util
 import json
+import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 
@@ -147,7 +150,8 @@ class FixtureContractTests(unittest.TestCase):
             for case_spec in case_specs:
                 case = case_spec["fixture"]
                 with self.subTest(case=case):
-                    destination = Path(directory) / case
+                    opaque_id = f"case-{uuid.uuid4().hex}"
+                    destination = Path(directory) / opaque_id
                     result = subprocess.run(
                         [
                             sys.executable,
@@ -156,6 +160,10 @@ class FixtureContractTests(unittest.TestCase):
                             case,
                             "--destination",
                             str(destination),
+                            "--opaque-case-id",
+                            opaque_id,
+                            "--agent-trace-path",
+                            "/workspace/trace.json",
                         ],
                         text=True,
                         capture_output=True,
@@ -163,7 +171,13 @@ class FixtureContractTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
 
-                    trace = json.loads((FIXTURES / case / "trace.json").read_text(encoding="utf-8"))
+                    provenance = json.loads(result.stdout)
+                    self.assertEqual(provenance["source_fixture"], case)
+                    self.assertEqual(provenance["opaque_case_id"], opaque_id)
+                    self.assertEqual(provenance["derivation"]["kind"], "sanitized_identity_projection")
+
+                    source_trace = json.loads((FIXTURES / case / "trace.json").read_text(encoding="utf-8"))
+                    trace = json.loads((destination / "trace.json").read_text(encoding="utf-8"))
                     artifact_files = {Path(item["path"]) for item in trace["artifacts"]}
                     expected_files = {
                         Path("trace.json"),
@@ -181,10 +195,21 @@ class FixtureContractTests(unittest.TestCase):
                         self.assertFalse(path.is_symlink(), path)
                         path.resolve(strict=True).relative_to(destination.resolve(strict=True))
 
+                    self.assertEqual(trace["manifest"]["case_id"], opaque_id)
+                    self.assertEqual(trace["manifest"]["run_id"], opaque_id)
+                    for node in trace["nodes"]:
+                        self.assertEqual(node["scope"]["case_id"], opaque_id)
+                        self.assertEqual(node["scope"]["run_id"], opaque_id)
+                        assert_node_integrity(self, node)
                     self.assertEqual(
-                        (destination / "trace.json").read_bytes(),
-                        (FIXTURES / case / "trace.json").read_bytes(),
+                        hashlib.sha256((FIXTURES / case / "trace.json").read_bytes()).hexdigest(),
+                        provenance["source_trace_sha256"],
                     )
+                    self.assertEqual(
+                        hashlib.sha256((destination / "trace.json").read_bytes()).hexdigest(),
+                        provenance["derived_trace_sha256"],
+                    )
+                    self.assertNotEqual(trace["manifest"], source_trace["manifest"])
                     for relative in canonical_skill_files:
                         source = ROOT / relative
                         self.assertEqual((destination / relative).read_bytes(), source.read_bytes())
@@ -192,7 +217,8 @@ class FixtureContractTests(unittest.TestCase):
                     for prompt_name in ("prompt-claude.md", "prompt-opencode.md"):
                         prompt = (destination / prompt_name).read_text(encoding="utf-8")
                         self.assertIn(case_spec["question"], prompt)
-                        self.assertIn(str(destination / "trace.json"), prompt)
+                        self.assertIn("/workspace/trace.json", prompt)
+                        self.assertNotIn(str(destination), prompt)
                         self.assertNotIn(str(ROOT), prompt)
                         for hidden_key in case_spec["expected"]:
                             self.assertNotIn(hidden_key, prompt)
@@ -204,9 +230,40 @@ class FixtureContractTests(unittest.TestCase):
                     self.assertNotIn(".git", names)
                     self.assertNotIn("reports", names)
 
+                    visible_paths = [str(path.relative_to(destination)) for path in destination.rglob("*")]
+                    visible_bytes = "\n".join(
+                        path.read_text(encoding="utf-8", errors="replace")
+                        for path in destination.rglob("*")
+                        if path.is_file()
+                    )
+                    questionless = visible_bytes.replace(case_spec["question"], "")
+                    for semantic_slug in {item["fixture"] for item in case_specs}:
+                        self.assertNotIn(semantic_slug, "\n".join(visible_paths))
+                        self.assertNotIn(f"rootcause-{semantic_slug}", questionless)
+                        if semantic_slug != "ambiguous":
+                            self.assertNotIn(semantic_slug, questionless)
+                    identity_values = []
+                    def collect_strings(value):
+                        if isinstance(value, dict):
+                            for child in value.values():
+                                collect_strings(child)
+                        elif isinstance(value, list):
+                            for child in value:
+                                collect_strings(child)
+                        elif isinstance(value, str):
+                            identity_values.append(value)
+                    collect_strings(trace)
+                    for semantic_slug in {item["fixture"] for item in case_specs}:
+                        self.assertNotIn(semantic_slug, identity_values)
+                        self.assertNotIn(f"rootcause-{semantic_slug}", identity_values)
+                    self.assertNotIn('"expected"', questionless)
+                    self.assertNotIn(json.dumps(case_spec["expected"], ensure_ascii=False), questionless)
+                    self.assertNotIn("source_fixture", visible_bytes)
+                    self.assertNotIn("derived_trace_sha256", visible_bytes)
+
     def test_isolated_bundle_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
-            destination = Path(directory) / "known-root"
+            destination = Path(directory) / "case-0123456789abcdef0123456789abcdef"
             command = [
                 sys.executable,
                 str(RUNNER),
@@ -214,6 +271,8 @@ class FixtureContractTests(unittest.TestCase):
                 "known-root",
                 "--destination",
                 str(destination),
+                "--opaque-case-id",
+                "case-0123456789abcdef0123456789abcdef",
             ]
             first = subprocess.run(command, text=True, capture_output=True, check=False)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -247,9 +306,14 @@ class FixtureContractTests(unittest.TestCase):
             module.FIXTURES = fixture_root
 
             with self.assertRaisesRegex(ValueError, "digest"):
-                module.prepare("known-root", root / "bundle")
+                module.prepare(
+                    "known-root",
+                    root / "case-0123456789abcdef0123456789abcdef",
+                    "case-0123456789abcdef0123456789abcdef",
+                    "/workspace/trace.json",
+                )
 
-    def test_forward_runner_uses_bundle_as_agent_cwd(self):
+    def test_forward_runner_smoke_is_explicitly_unscored(self):
         executable = shutil.which("echo")
         self.assertIsNotNone(executable)
         with tempfile.TemporaryDirectory() as directory:
@@ -258,6 +322,8 @@ class FixtureContractTests(unittest.TestCase):
                 [
                     sys.executable,
                     str(FORWARD_RUNNER),
+                    "--mode",
+                    "smoke",
                     "--batch-root",
                     str(batch_root),
                     "--case",
@@ -265,7 +331,7 @@ class FixtureContractTests(unittest.TestCase):
                     "--opencode-bin",
                     executable,
                     "--timeout-seconds",
-                    "2",
+                    "10",
                 ],
                 text=True,
                 capture_output=True,
@@ -273,7 +339,11 @@ class FixtureContractTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             record = json.loads(result.stdout)
-            workspace = batch_root.resolve() / "known-root" / "workspace"
+            self.assertEqual(record["run_kind"], "smoke_local")
+            self.assertEqual(record["evaluation_status"], "unscored_smoke")
+            self.assertNotIn("scored", record["run_kind"])
+            workspace = Path(record["workspace"])
+            self.assertRegex(workspace.name, r"^case-[0-9a-f]{32}$")
             self.assertEqual(record["cwd"], str(workspace))
             self.assertEqual(record["trace_path"], str(workspace / "trace.json"))
             self.assertEqual(record["command_argv"][0], executable)
@@ -281,6 +351,175 @@ class FixtureContractTests(unittest.TestCase):
             self.assertFalse(record["timed_out"])
             self.assertIsNone(record["wrapper_error"])
             self.assertNotIn(str(ROOT), record["prompt"])
+
+    def test_forward_runner_redacts_provider_secrets_from_host_audit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "echo-provider-secret"
+            executable.write_text(
+                "#!/bin/sh\nprintf '%s\\n' \"$APIKEY\" \"$OPENCODE_CONFIG_CONTENT\"\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            secret = "audit-must-not-contain-this-api-key"
+            config = '{"apiKey":"audit-must-not-contain-config-secret"}'
+            environment = dict(os.environ, APIKEY=secret, OPENCODE_CONFIG_CONTENT=config)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(FORWARD_RUNNER),
+                    "--mode",
+                    "smoke",
+                    "--batch-root",
+                    str(root / "batch"),
+                    "--case",
+                    "known-root",
+                    "--opencode-bin",
+                    str(executable),
+                    "--timeout-seconds",
+                    "2",
+                ],
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            audit_bytes = (root / "batch" / "results.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn(secret, audit_bytes)
+            self.assertNotIn(config, audit_bytes)
+            self.assertIn("<redacted:APIKEY>", audit_bytes)
+            self.assertIn("<redacted:OPENCODE_CONFIG_CONTENT>", audit_bytes)
+
+    def test_scored_container_command_mounts_only_one_workspace_and_linux_binary(self):
+        spec = importlib.util.spec_from_file_location("scored_forward_runner", FORWARD_RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "case-0123456789abcdef0123456789abcdef"
+            workspace.mkdir()
+            binary = root / "opencode-linux-x64"
+            binary.write_bytes(b"\x7fELF" + b"\0" * 32)
+            binary.chmod(0o755)
+            command = module.build_scored_container_command(
+                "docker",
+                "debian:bookworm-slim",
+                workspace,
+                binary,
+                "Trace: /workspace/trace.json; prompt without a secret",
+                {"MODEL": "m", "URL": "https://provider.invalid/v1", "APIKEY": "top-secret"},
+            )
+            mounts = module.container_mounts(command)
+            self.assertEqual(
+                mounts,
+                {
+                    str(workspace.resolve()): "/workspace",
+                    str(binary.resolve()): "/opt/opencode",
+                },
+            )
+            rendered = json.dumps(command, ensure_ascii=False)
+            self.assertNotIn("top-secret", rendered)
+            self.assertNotIn(str(root / "evaluator"), rendered)
+            self.assertNotIn(str(root / "audit.jsonl"), rendered)
+            self.assertIn("/workspace/trace.json", rendered)
+            self.assertIn("APIKEY", command)
+
+    def test_scored_mode_refuses_without_container_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "opencode-linux-x64"
+            binary.write_bytes(b"\x7fELF" + b"\0" * 32)
+            binary.chmod(0o755)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(FORWARD_RUNNER),
+                    "--mode",
+                    "scored",
+                    "--container-runtime",
+                    "podman",
+                    "--opencode-bin",
+                    str(binary),
+                    "--batch-root",
+                    str(Path(directory) / "batch"),
+                    "--case",
+                    "known-root",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("filesystem sandbox", result.stderr)
+            self.assertFalse((Path(directory) / "batch").exists())
+
+    def test_scored_adversarial_probe_has_the_same_two_mount_boundary(self):
+        spec = importlib.util.spec_from_file_location("scored_probe_runner", FORWARD_RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "case-0123456789abcdef0123456789abcdef"
+            workspace.mkdir()
+            (workspace / "trace.json").write_text("{}", encoding="utf-8")
+            binary = root / "opencode-linux-x64"
+            binary.write_bytes(b"\x7fELF" + b"\0" * 32)
+            canary = root / "evaluator-canary"
+            canary.write_text("hidden", encoding="utf-8")
+            command = module.build_scored_probe_command(
+                "docker", "debian:bookworm-slim", workspace, binary, canary
+            )
+            self.assertEqual(
+                module.container_mounts(command),
+                {
+                    str(workspace.resolve()): "/workspace",
+                    str(binary.resolve()): "/opt/opencode",
+                },
+            )
+            rendered = shlex.join(command)
+            for unavailable in (
+                "/workspace/../evaluator",
+                "/workspace/../audit",
+                "/workspace/../batch",
+                str(canary),
+            ):
+                self.assertIn(unavailable, rendered)
+            self.assertNotIn(str(root / "cases.json"), rendered)
+            self.assertNotIn(str(root / "rubric.json"), rendered)
+
+    def test_scored_adversarial_probe_integration_or_explicit_block(self):
+        docker = shutil.which("docker")
+        if docker is None:
+            self.skipTest("BLOCKED: Docker absent; Podman integration is not available")
+        info = subprocess.run(
+            [docker, "info"], text=True, capture_output=True, check=False, timeout=15
+        )
+        if info.returncode != 0:
+            blocker = info.stderr.strip() or info.stdout.strip()
+            self.skipTest(f"BLOCKED: Docker daemon unavailable: {blocker}")
+        spec = importlib.util.spec_from_file_location("scored_probe_integration", FORWARD_RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "case-0123456789abcdef0123456789abcdef"
+            workspace.mkdir()
+            (workspace / "trace.json").write_text("{}", encoding="utf-8")
+            binary = root / "opencode-linux-x64"
+            binary.write_bytes(b"\x7fELF" + b"\0" * 32)
+            canary = root / "evaluator-canary"
+            canary.write_text("hidden", encoding="utf-8")
+            command = module.build_scored_probe_command(
+                docker, "debian:bookworm-slim", workspace, binary, canary
+            )
+            probe = subprocess.run(
+                command, text=True, capture_output=True, check=False, timeout=120
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
 
     def test_isolated_bundle_rejects_a_fixture_local_artifact_symlink_escape(self):
         spec = importlib.util.spec_from_file_location("prepare_isolated_bundle", RUNNER)
@@ -302,7 +541,12 @@ class FixtureContractTests(unittest.TestCase):
             module.FIXTURES = fixture_root
 
             with self.assertRaises(ValueError):
-                module.prepare("known-root", root / "bundle")
+                module.prepare(
+                    "known-root",
+                    root / "case-0123456789abcdef0123456789abcdef",
+                    "case-0123456789abcdef0123456789abcdef",
+                    "/workspace/trace.json",
+                )
 
 
 if __name__ == "__main__":

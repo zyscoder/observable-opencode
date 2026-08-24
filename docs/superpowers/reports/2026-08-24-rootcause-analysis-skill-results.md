@@ -21,15 +21,16 @@ no forward result or rubric score was fabricated.
 
 | Check | Result |
 | --- | --- |
-| Root-cause Skill fixture, query, and contract suite | PASS, 100/100 |
+| Root-cause Skill fixture, query, and contract suite | PASS, 106/106 with 1 explicitly blocked integration skip |
 | `trace_query.py` bytecode compilation | PASS |
 | Official `quick_validate.py` Skill validation | PASS, `Skill is valid!` |
 | Skill canonical-location discovery in current OpenCode source build | PASS |
 | Repository whitespace validation | PASS |
 | Fixture immutability check | PASS |
 | Documented `build-requirement` Artifact query | PASS, integrity verified |
-| Seven isolated Agent workspace builds and file-tree audits | PASS |
-| External-binary OpenCode wrapper synthetic cwd check | PASS |
+| Seven opaque Agent workspace builds and file-tree audits | PASS |
+| External-binary OpenCode wrapper synthetic cwd smoke check | PASS, unscored |
+| Docker/Podman scored integration | BLOCKED, Docker daemon unavailable and Podman absent |
 
 Commands:
 
@@ -93,20 +94,30 @@ restriction.
 
 ## Forward-Test Protocol
 
-The current scored protocol first uses
+The bundle protocol first uses
 `tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py` to build one
 no-overwrite workspace per case. Each workspace contains exactly the selected
 finalized Trace and verified Artifacts, the canonical Skill, and two
 runtime-specific prompts. It contains no evaluator cases, expected outcomes,
 rubric, sibling fixture, report, Git history, repository path in either prompt,
-or symlink/path escape. Claude runs with the workspace as cwd. OpenCode runs
-through `run_isolated_opencode.py` with an external `OPENCODE_BIN`, the workspace
-as cwd, and isolated HOME/XDG state. Captured output stays outside the Agent
-workspace.
+or symlink/path escape. It also replaces semantic fixture identity with a
+per-run opaque ID and emits original/derived integrity provenance only to the
+host-side evaluator.
+
+An isolated cwd is only smoke isolation. The scored OpenCode protocol requires
+a working Docker or Podman filesystem sandbox and an external Linux release
+`OPENCODE_BIN`. The container receives exactly two read-only bind mounts: one
+opaque workspace at `/workspace` and the binary at `/opt/opencode`. It cannot
+see the workspace parent, siblings, repository, batch root, audit JSONL,
+evaluator mapping, or hidden rubric. Provider values are passed through an
+environment-name whitelist and secrets are never serialized into command audit.
+Any provider value echoed by child stdout/stderr is redacted only in the
+host-side audit projection; the child process receives the unchanged value.
 
 Only the evaluator reads `pressure/cases.json` and `pressure/rubric.json` after
 execution. The builder extracts the exact `question` but never copies the
-`expected` object. Outputs remain `unscored_pending_evaluator` until this
+`expected` object. Successful sandboxed outputs remain
+`scored_pending_evaluator` until this
 outside-workspace scoring step completes.
 
 The attempts below are preserved historical smoke evidence. They did not use
@@ -177,15 +188,17 @@ the signal was delivered. Those records therefore establish neither signal
 delivery nor termination cause and must not be reported as an OpenCode self-exit
 code.
 
-The current isolated wrapper accepts `--batch-root` or
+The current runner accepts `--batch-root` or
 `ROOTCAUSE_FORWARD_BATCH_ROOT`, otherwise creates a unique timestamp/PID/UUID
 root, and refuses to overwrite existing directories. It requires
-`--opencode-bin` or `OPENCODE_BIN`, builds each isolated workspace before
+`--opencode-bin` or `OPENCODE_BIN`, builds each opaque workspace before
 launch, records signal attempts separately from successful operating-system
 signal calls, records post-signal state and bounded final cleanup, and
 continues after per-case `wrapper_error`. The earlier one-second `known-root`
-spot check exercised only the historical source-build wrapper and is not a
-scored Agent result.
+spot check and all prior local cwd runs are smoke only and are not scored Agent
+results. The current machine has a Docker CLI but cannot access its daemon
+socket; Podman is absent. Therefore the scored adversarial probe and Agent run
+are explicitly blocked rather than reported as passed.
 
 ## Case Matrix
 
@@ -207,7 +220,7 @@ restraint, remain **not evaluated** rather than passed or failed.
 ## Observed Guarantees
 
 - The seven canonical fixtures remained unchanged.
-- All seven isolated workspace file trees were audited against exact allowlists; no hidden evaluator data or repository symlink was present.
+- All seven opaque workspace file trees were audited against exact allowlists; no hidden evaluator data, semantic fixture identity, or repository symlink was present.
 - No forward-test output was written into a fixture, Trace bundle, or analyzed
   project.
 - No Trace capture, OpenCode runtime, existing Python attribution module, or
@@ -217,8 +230,9 @@ restraint, remain **not evaluated** rather than passed or failed.
 
 ## Remaining Validation
 
-After authenticating Claude or configuring a standalone OpenCode binary and
-provider, build all seven isolated workspaces, run from those workspaces, and
+After configuring a provider, a Linux release OpenCode binary, and an available
+Docker or Podman daemon, build all seven opaque workspaces, run them through
+the scored container mode, and
 let only the external evaluator score the captured JSON and Markdown against
 `tools/rootcause_skill_tests/pressure/rubric.json`. The key acceptance checks
 remain:

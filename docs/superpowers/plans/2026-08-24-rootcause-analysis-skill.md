@@ -20,7 +20,8 @@
 - Retrieval limits bound one query response, not semantic analysis depth or root-candidate count.
 - Every report conclusion and recommendation cites resolvable Trace evidence.
 - Recommendations are proposals only; the Skill never applies or validates a repair.
-- Scored forward runs execute from a no-overwrite isolated workspace. Only the evaluator may read `pressure/cases.json`, hidden expected outcomes, or `pressure/rubric.json`; none may enter the Agent workspace or prompt.
+- Scored forward runs require Docker or Podman filesystem isolation and an external Linux release OpenCode binary. A local process with an isolated cwd is smoke only and is never scored.
+- Agent-visible paths, prompts, and derived Trace identities use opaque per-run IDs. Only the evaluator retains fixture mappings, derivation provenance, `pressure/cases.json`, hidden outcomes, and `pressure/rubric.json`; none enter a container mount.
 
 ## File Map
 
@@ -53,7 +54,7 @@
 - `tools/rootcause_skill_tests/pressure/cases.json`: questions and hidden expected outcomes for all forward-test fixtures.
 - `tools/rootcause_skill_tests/pressure/rubric.json`: machine-readable forward-test rubric.
 - `tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py`: evaluator-side builder for one selected Trace, its verified Artifacts, the canonical Skill, and runtime-specific prompts.
-- `tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`: external-binary OpenCode runner whose Agent cwd is the selected isolated workspace.
+- `tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`: explicit smoke/scored runner; scored mode mounts one opaque workspace and one external Linux release binary into Docker or Podman.
 - `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-baseline.md`: observed pre-Skill behavior.
 - `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md`: post-Skill comparison and remaining limitations.
 - `README.md`: invocation, inputs, outputs, and analysis-only boundary.
@@ -692,7 +693,7 @@ git diff --check
 
 - [ ] **Step 3: Build isolated workspaces and run GREEN forward tests**
 
-The evaluator builds each workspace before launching an Agent. The workspace
+The evaluator builds each opaque workspace before launching an Agent. The workspace
 contains only the selected finalized Trace and verified Artifacts, the
 canonical Skill, and runtime-specific prompts. It contains no `cases.json`,
 rubric, hidden expected outcome, sibling fixture, report, Git history, or
@@ -700,9 +701,12 @@ symlink back to the repository.
 
 ```bash
 FORWARD_ROOT=$(mktemp -d /tmp/rootcause-forward.XXXXXX)
-BUNDLE="$FORWARD_ROOT/known-root"
+OPAQUE_CASE_ID=$(python3 -c 'import uuid; print("case-" + uuid.uuid4().hex)')
+BUNDLE="$FORWARD_ROOT/$OPAQUE_CASE_ID"
 python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
-  --case known-root --destination "$BUNDLE"
+  --case known-root --opaque-case-id "$OPAQUE_CASE_ID" \
+  --agent-trace-path /workspace/trace.json --destination "$BUNDLE" \
+  > "$FORWARD_ROOT/evaluator-provenance.json"
 
 (cd "$BUNDLE" && claude --bare -p \
   --permission-mode plan \
@@ -711,13 +715,18 @@ python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
   2> "$FORWARD_ROOT/known-root.claude.stderr"
 ```
 
-For OpenCode, use a standalone executable and the isolated runner. Provider
-configuration may be supplied through inherited runtime environment variables,
-but the executable runs with the bundle as cwd and isolated HOME/XDG roots:
+The Claude cwd command above and local/source OpenCode execution are smoke only.
+They can validate Skill discovery and provider setup but cannot be scored.
+
+For scored OpenCode, use an external Linux release ELF and a working Docker or
+Podman filesystem sandbox. The runner mounts only the selected workspace at
+`/workspace` and the binary at `/opt/opencode`; repo, batch, audit, evaluator,
+workspace parent, sibling fixtures, and hidden mappings stay host-side:
 
 ```bash
-export OPENCODE_BIN=/absolute/path/to/opencode
+export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
 python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
+  --mode scored --container-runtime docker \
   --batch-root "$FORWARD_ROOT/opencode-run"
 ```
 
@@ -725,9 +734,10 @@ Repeat all seven cases. `prepare_isolated_bundle.py` is the evaluator-side
 boundary: it reads only each case's `fixture` and exact `question` from
 `pressure/cases.json` and never copies `expected` data. After Agent execution,
 the evaluator alone reads `cases.json` and `rubric.json` to score captured
-outputs outside the Agent workspace. Running the Bun source entry point from
-the repository is permitted only as a Skill-discovery/provider smoke test; it
-is not an isolated scored forward run.
+outputs outside all mounts. Agent-visible identity is opaque; fixture mapping,
+derived provenance, and rubric stay evaluator-only. Running the Bun source
+entry point, a host-native binary, or any process merely given an isolated cwd
+is permitted only as a Skill-discovery/provider smoke test and is not scored.
 
 - [ ] **Step 4: Evaluate results against the rubric**
 

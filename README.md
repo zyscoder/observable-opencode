@@ -796,47 +796,71 @@ python3 "$TRACE_QUERY" artifact --trace "$TRACE" --id build-requirement --max-ch
 Trace，不修改 Agent、Harness、Skill、MCP、Tool、Prompt、模型配置、代码、构建环境、Trace 或
 原 Session，也不会把结论反馈给原 Agent。报告中的优化项仅是建议，必须由独立任务评审和实施。
 
-### 隔离 Forward Test
+### Root-Cause Skill Forward Test
 
 对 Skill 做效果评分时，不能直接从本仓库启动 Agent 并把仓库内 fixture 路径交给它，否则 Agent
 可能读取 `cases.json`、隐藏期望、rubric、其他 fixture 或 Git 历史，评分不具备隔离性。先由评估器
-构造单 case workspace：
+构造单 case workspace。Agent 可见目录、prompt 和派生 Trace 只使用每轮新生成的 opaque ID；
+fixture 到 opaque ID 的映射、原始/派生摘要和隐藏 rubric 只保存在评估器侧：
 
 ```bash
 export FORWARD_ROOT=$(mktemp -d /tmp/rootcause-forward.XXXXXX)
+export OPAQUE_CASE_ID=$(python3 -c 'import uuid; print("case-" + uuid.uuid4().hex)')
 python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
   --case known-root \
-  --destination "$FORWARD_ROOT/known-root"
+  --opaque-case-id "$OPAQUE_CASE_ID" \
+  --agent-trace-path /workspace/trace.json \
+  --destination "$FORWARD_ROOT/$OPAQUE_CASE_ID" \
+  > "$FORWARD_ROOT/evaluator-provenance.json"
 ```
 
-每个 workspace 只包含该 case 的 finalize `trace.json`、Trace 声明且摘要校验通过的 Artifacts、
+每个 workspace 只包含该 case 的 finalize 派生 `trace.json`、Trace 声明且摘要校验通过的 Artifacts、
 规范 `.claude/skills/rootcause-analysis`，以及 `prompt-claude.md`、`prompt-opencode.md`。builder
 拒绝覆盖已有目录、symlink 越界、节点完整性错误和 Artifact 摘要不一致。它不会复制
-`cases.json`、`rubric.json`、隐藏 `expected`、其他 fixture、reports 或 Git 历史。
+`cases.json`、`rubric.json`、隐藏 `expected`、fixture 语义标签、其他 fixture、reports 或 Git 历史。
+派生 Trace 只替换 manifest/scope 的运行身份并重算节点完整性，任务事实与用户问题保持原样。
 
-Claude Code 必须从隔离 workspace 运行，运行结果保存到 workspace 之外：
+下面的 Claude Code cwd 方式只用于功能 smoke，不构成评分隔离，运行结果保存到 workspace 之外：
 
 ```bash
-(cd "$FORWARD_ROOT/known-root" && claude --bare -p \
+(cd "$FORWARD_ROOT/$OPAQUE_CASE_ID" && claude --bare -p \
   --permission-mode plan \
   --allowedTools "Read,Bash(python3 *)" < prompt-claude.md) \
-  > "$FORWARD_ROOT/known-root.claude.stdout" \
-  2> "$FORWARD_ROOT/known-root.claude.stderr"
+  > "$FORWARD_ROOT/claude.stdout" \
+  2> "$FORWARD_ROOT/claude.stderr"
 ```
 
-OpenCode 评分使用独立可执行文件；`OPENCODE_BIN` 可以指向 release binary。模型和 provider
-配置通过正常环境变量或 `OPENCODE_CONFIG_CONTENT` 提供，不写入 case workspace：
+runner 有两个明确模式：`smoke` 可使用本机或源码构建，仅验证发现、provider 和执行链，永不计分；
+`scored` 必须同时具备可工作的 Docker 或 Podman 文件系统沙箱，以及外部 Linux release
+`OPENCODE_BIN`（ELF）。macOS binary、本仓库 source build、仅切换 cwd 均会被拒绝为评分输入。
+
+Smoke 示例：
 
 ```bash
-export OPENCODE_BIN=/absolute/path/to/opencode
+export OPENCODE_BIN=/absolute/path/to/local/opencode
 python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
-  --batch-root "$FORWARD_ROOT/opencode-run"
+  --mode smoke --case known-root \
+  --batch-root "$FORWARD_ROOT/smoke"
 ```
 
-runner 为每个 case 创建独立 workspace、HOME 和 XDG 目录，并以 workspace 作为 Agent cwd。
-`results.jsonl` 只记录运行事实，初始状态为 `unscored_pending_evaluator`。Agent 退出后，只有评估器
-在 workspace 外读取 `pressure/cases.json` 和 `pressure/rubric.json`，将实际输出与隐藏期望进行
-比较。仓库内 Bun source-build 仅可用于 Skill discovery/provider smoke test，不能作为隔离评分结果。
+Scored 示例。模型和 provider 配置通过正常环境变量或 `OPENCODE_CONFIG_CONTENT` 提供，不写入
+case workspace；secret 值不写入命令或 audit：
+
+```bash
+export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
+python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
+  --mode scored --container-runtime docker \
+  --batch-root "$FORWARD_ROOT/scored"
+```
+
+Scored 容器只 bind mount 当前 opaque workspace 到 `/workspace`、Linux binary 到
+`/opt/opencode`，不会 mount workspace 的父目录、兄弟 case、repo、batch、audit 或 evaluator 数据。
+runner 先执行 canary 探针，确认这些路径在容器内不可见；容器只接收白名单 provider 环境变量名。
+命令审计不包含变量值，stdout/stderr 中意外回显的 URL、API key 或 provider 配置也会在写盘前
+事后脱敏，不改变传给 OpenCode 的原始环境。`results.jsonl` 留在宿主机 batch 目录且不在任何
+mount 中。Agent 退出后，只有评估器在容器外读取
+`pressure/cases.json`、fixture-to-opaque 映射和 `pressure/rubric.json`。本地 cwd 隔离只是 smoke，
+不构成 scored filesystem isolation。
 
 ## 使用离线归因 CLI
 
