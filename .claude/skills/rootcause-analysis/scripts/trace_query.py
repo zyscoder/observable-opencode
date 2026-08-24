@@ -618,22 +618,28 @@ class TraceIndex:
                 )
 
             for component in relative_path.parts[:-1]:
-                next_fd = os.open(
-                    component,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=directory_fd,
-                )
-                opened_directory = os.fstat(next_fd)
-                named_directory = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
-                if not stat.S_ISDIR(opened_directory.st_mode) or not self._same_file(
-                    named_directory, opened_directory
-                ):
-                    os.close(next_fd)
-                    raise ArtifactIntegrityError(
-                        "Artifact {0} path cannot be safely opened".format(artifact_id)
+                next_fd = None
+                try:
+                    next_fd = os.open(
+                        component,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=directory_fd,
                     )
-                os.close(directory_fd)
-                directory_fd = next_fd
+                    opened_directory = os.fstat(next_fd)
+                    named_directory = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(opened_directory.st_mode) or not self._same_file(
+                        named_directory, opened_directory
+                    ):
+                        raise ArtifactIntegrityError(
+                            "Artifact {0} path cannot be safely opened".format(artifact_id)
+                        )
+                    previous_fd = directory_fd
+                    directory_fd = next_fd
+                    next_fd = None
+                    os.close(previous_fd)
+                finally:
+                    if next_fd is not None:
+                        os.close(next_fd)
 
             artifact_fd = os.open(
                 relative_path.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd

@@ -437,6 +437,88 @@ class TraceQueryTests(unittest.TestCase):
                     index.artifact(ARTIFACT_ID, 20000)
             self.assertTrue(replaced)
 
+    def test_artifact_closes_new_directory_descriptor_after_identity_failure(self):
+        with self.copied_known_root() as (trace, _):
+            module = self.trace_query_module()
+            index = module.TraceIndex.load(trace)
+            original_open = module.os.open
+            original_stat = module.os.stat
+            original_close = module.os.close
+            opened = []
+            closed = []
+
+            def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+                descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+                opened.append((path, descriptor, dir_fd))
+                return descriptor
+
+            def fail_intermediate_identity(path, *arguments, **keywords):
+                if path == "artifacts" and keywords.get("dir_fd") is not None:
+                    raise OSError("forced intermediate identity failure")
+                return original_stat(path, *arguments, **keywords)
+
+            def tracking_close(descriptor):
+                closed.append(descriptor)
+                return original_close(descriptor)
+
+            with mock.patch.object(module.os, "open", side_effect=tracking_open):
+                with mock.patch.object(module.os, "stat", side_effect=fail_intermediate_identity):
+                    with mock.patch.object(module.os, "close", side_effect=tracking_close):
+                        with self.assertRaises(module.ArtifactIntegrityError):
+                            index.artifact(ARTIFACT_ID, 20000)
+
+        intermediate_descriptor = next(
+            descriptor for path, descriptor, _ in opened if path == "artifacts"
+        )
+        self.assertEqual(closed.count(intermediate_descriptor), 1)
+
+    def test_artifact_max_chars_at_content_length_is_not_truncated(self):
+        expected = (KNOWN_ROOT.parent / "artifacts" / "sha256" / (
+            "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"
+        )).read_text(encoding="utf-8")
+        payload = self.query_json(
+            "artifact",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--id",
+            ARTIFACT_ID,
+            "--max-chars",
+            str(len(expected)),
+        )
+        self.assertEqual(payload["content"], expected)
+        self.assertFalse(payload["truncated"])
+
+    def test_artifact_max_chars_one_below_content_length_truncates(self):
+        expected = (KNOWN_ROOT.parent / "artifacts" / "sha256" / (
+            "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"
+        )).read_text(encoding="utf-8")
+        payload = self.query_json(
+            "artifact",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--id",
+            ARTIFACT_ID,
+            "--max-chars",
+            str(len(expected) - 1),
+        )
+        self.assertEqual(payload["content"], expected[:-1])
+        self.assertTrue(payload["truncated"])
+
+    def test_artifact_rejects_non_positive_max_chars(self):
+        for max_chars in ("0", "-1"):
+            with self.subTest(max_chars=max_chars):
+                result = self.run_query(
+                    "artifact",
+                    "--trace",
+                    str(KNOWN_ROOT),
+                    "--id",
+                    ARTIFACT_ID,
+                    "--max-chars",
+                    max_chars,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("max_chars must be at least 1", result.stderr)
+
     def test_neighbors_traverse_downstream_eligible_edges(self):
         payload = self.query_json(
             "neighbors",
