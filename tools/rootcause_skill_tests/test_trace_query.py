@@ -88,7 +88,123 @@ class TraceQueryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         payload = json.loads(result.stdout)
         self.assertTrue(payload["valid"])
+        self.assertEqual(payload["trace_version"], "6.0")
         self.assertEqual(payload["causal_ir_version"], "1.0")
+        self.assertEqual(payload["lifecycle"]["status"], "success")
+        self.assertTrue(payload["lifecycle"]["terminal"])
+        self.assertTrue(payload["recovery"]["source_complete"])
+        self.assertEqual(payload["diagnostics"]["recorded_count"], 0)
+
+    def test_validate_rejects_running_snapshot_with_finalize_guidance(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["manifest"]["status"] = "running"
+            self.write_trace(trace, payload)
+            result = self.run_query("validate", "--trace", str(trace))
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("nonterminal status 'running'", result.stderr)
+        self.assertIn("observable-trace finalize", result.stderr)
+
+    def test_validate_rejects_unsupported_trace_versions_with_guidance(self):
+        for field, unsupported, supported in (
+            ("trace_version", "7.0", "6.0"),
+            ("causal_ir_version", "2.0", "1.0"),
+        ):
+            with self.subTest(field=field):
+                with self.copied_known_root() as (trace, _):
+                    payload = json.loads(trace.read_text(encoding="utf-8"))
+                    payload[field] = unsupported
+                    self.write_trace(trace, payload)
+                    result = self.run_query("validate", "--trace", str(trace))
+
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unsupported {0} '{1}'".format(field, unsupported), result.stderr)
+                self.assertIn("supported: {0}".format(supported), result.stderr)
+                self.assertIn("observable-trace finalize", result.stderr)
+
+    def test_validate_accepts_cancelled_sigterm_as_finalized(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["manifest"].update(
+                {
+                    "status": "cancelled",
+                    "case_status": "cancelled",
+                    "server_status": "cancelled",
+                    "process_status": "cancelled",
+                    "shutdown_signal": "SIGTERM",
+                    "shutdown_disposition": "interrupted_before_case_completion",
+                }
+            )
+            self.write_trace(trace, payload)
+            response = self.query_json("validate", "--trace", str(trace))
+
+        self.assertEqual(
+            response["lifecycle"],
+            {
+                "status": "cancelled",
+                "terminal": True,
+                "case_status": "cancelled",
+                "server_status": "cancelled",
+                "process_status": "cancelled",
+                "shutdown_signal": "SIGTERM",
+                "shutdown_disposition": "interrupted_before_case_completion",
+            },
+        )
+        self.assertTrue(response["recovery"]["source_complete"])
+
+    def test_validate_and_summary_surface_recovery_and_diagnostic_completeness(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["manifest"].update(
+                {
+                    "status": "error",
+                    "recovery_status": "incomplete_journal_replay",
+                    "historical_interruptions": True,
+                    "recovery": {"dropped_lines": 2, "segments": [{"status": "interrupted_unfinalized"}]},
+                    "segment_summary": {
+                        "count": 3,
+                        "completed": 1,
+                        "failed": 1,
+                        "cancelled": 0,
+                        "interrupted_unfinalized": 1,
+                        "running": 0,
+                    },
+                }
+            )
+            payload["journal"]["poisoned"] = True
+            payload["diagnostics"] = [{"code": "journal_replay_incomplete"}]
+            payload["metrics"]["trace_health"] = {"issues": [{"code": "missing_terminal"}]}
+            self.write_trace(trace, payload)
+            validated = self.query_json("validate", "--trace", str(trace))
+            summary = self.query_json("summary", "--trace", str(trace))
+
+        expected_recovery = {
+            "status": "incomplete_journal_replay",
+            "source_complete": False,
+            "historical_interruptions": True,
+            "dropped_lines": 2,
+            "journal_poisoned": True,
+        }
+        expected_segments = {
+            "count": 3,
+            "completed": 1,
+            "failed": 1,
+            "cancelled": 0,
+            "interrupted_unfinalized": 1,
+            "running": 0,
+        }
+        expected_diagnostics = {
+            "recorded_count": 1,
+            "complete_for_available_data": True,
+            "source_data_complete": False,
+            "trace_health_available": True,
+            "trace_health_issue_count": 1,
+        }
+        for response in (validated, summary):
+            self.assertEqual(response["recovery"], expected_recovery)
+            self.assertEqual(response["segments"], expected_segments)
+            self.assertEqual(response["diagnostics"], expected_diagnostics)
 
     def test_validate_rejects_html_and_segment_journal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -319,10 +435,25 @@ class TraceQueryTests(unittest.TestCase):
 
     def test_backward_paths_follow_only_eligible_recorded_edges(self):
         payload = self.query_json("paths", "--trace", str(KNOWN_ROOT), "--start", "node:final_1")
-        paths = [item["node_refs"] for item in payload["paths"]]
-        self.assertIn(
-            ["node:final_1", "node:tool_1", "node:dec_1", "node:ctx_1", "node:req_1"],
-            paths,
+        self.assertEqual(len(payload["paths"]), 1)
+        self.assertEqual(
+            payload["paths"][0]["node_refs"],
+            [
+                "node:final_1",
+                "node:tool_1",
+                "node:dec_1",
+                "node:ctx_1",
+                "node:req_1",
+            ],
+        )
+        self.assertEqual(
+            payload["paths"][0]["edge_refs"],
+            [
+                "edge:edge_tool_final",
+                "edge:edge_dec_tool",
+                "edge:edge_ctx_dec",
+                "edge:edge_req_ctx",
+            ],
         )
         self.assertNotIn("node:unrelated_1", json.dumps(payload))
 
@@ -336,8 +467,10 @@ class TraceQueryTests(unittest.TestCase):
             "--direction",
             "upstream",
         )
+        self.assertEqual(len(payload["edges"]), 1)
         self.assertEqual(payload["edges"][0]["relation"], "context_influences_decision")
         self.assertEqual(payload["edges"][0]["evidence_refs"], ["node:ctx_1"])
+        self.assertNotEqual(payload["edges"][0]["relation"], "record_source")
 
     def test_query_limit_marks_output_truncated_without_hiding_frontier(self):
         payload = self.query_json(
@@ -674,12 +807,10 @@ class TraceQueryTests(unittest.TestCase):
     def test_neighbors_use_branching_breadth_first_order_and_frontier(self):
         with self.copied_known_root() as (trace, _):
             payload = json.loads(trace.read_text(encoding="utf-8"))
-            for node in payload["nodes"]:
-                node["source_refs"] = []
             payload["nodes"].extend(
                 [
-                    {"node_id": "branch_a"},
-                    {"node_id": "branch_b"},
+                    {"node_id": "branch_a", "source_refs": ["node:branch_a_root"]},
+                    {"node_id": "branch_b", "source_refs": ["node:branch_b_root"]},
                     {"node_id": "branch_a_root"},
                     {"node_id": "branch_b_root"},
                 ]

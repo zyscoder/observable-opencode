@@ -350,6 +350,29 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("temporal adjacency", lower)
         self.assertIn("remaining_frontier_refs", lower)
 
+    def test_trace_structure_matches_finalization_and_traversal_contracts(self):
+        structure = self.references["trace-structure.md"].lower()
+        for phrase in (
+            "trace_version` `6.0`",
+            "causal_ir_version` `1.0`",
+            "`success`, `error`, or `cancelled`",
+            "running",
+            "observable-trace finalize",
+            "shutdown signal does not make a finalized trace invalid",
+            "source_data_complete",
+            "historical_interruptions",
+            "interrupted_unfinalized",
+            "one traversal relation per source-target pair",
+            "recorded edge takes precedence",
+        ):
+            self.assertIn(phrase, structure)
+
+    def test_skill_inspects_validation_completeness_without_rejecting_cancellation(self):
+        text = self.skill_text.lower()
+        self.assertIn("inspect the returned lifecycle, recovery, segment, and diagnostic facts", text)
+        self.assertIn("cancelled status or shutdown signal alone is not invalid", text)
+        self.assertIn("qualify conclusions", text)
+
     def test_documented_query_options_exactly_match_runtime_parser(self):
         structure = self.references["trace-structure.md"]
         documented = {}

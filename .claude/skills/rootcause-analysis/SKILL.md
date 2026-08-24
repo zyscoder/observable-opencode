@@ -34,7 +34,7 @@ Only write optional report files at a validated prefix outside the analyzed syst
 
 ## Required Workflow
 
-1. **Validate input.** Run `python3 scripts/trace_query.py validate --trace <absolute-trace-path>`; stop with finalize guidance on invalid input.
+1. **Validate input.** Run `python3 scripts/trace_query.py validate --trace <absolute-trace-path>`; stop with finalize guidance on invalid input. Inspect the returned lifecycle, recovery, segment, and diagnostic facts. A cancelled status or shutdown signal alone is not invalid; qualify conclusions when source or diagnostic completeness is limited.
 2. **Bind the question.** Record expectation, actual behavior, exact discrepancy, and stated final impact without substituting a generic failure.
 3. **Establish the premise.** Classify expectation and observation as `supported`, `contradicted`, or `unknown` from cited facts.
 4. **Select starts.** Choose direct evidence of the questioned action, omission boundary, or final effect; record why.

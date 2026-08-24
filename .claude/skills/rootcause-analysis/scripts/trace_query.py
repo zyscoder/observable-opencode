@@ -19,6 +19,9 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 
 FINALIZE_HINT = "Run observable-trace finalize and pass its logical trace.json output."
+SUPPORTED_TRACE_VERSIONS = ("6.0",)
+SUPPORTED_CAUSAL_IR_VERSIONS = ("1.0",)
+TERMINAL_STATUSES = ("success", "error", "cancelled")
 SAFE_DESCRIPTOR_SUPPORT = (
     hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
@@ -125,6 +128,32 @@ def _finalized_collections(trace: Mapping[str, object]) -> Tuple[Sequence[object
     ):
         raise TraceInputError("Trace is missing the finalized Causal IR envelope. {0}".format(FINALIZE_HINT))
 
+    for field, supported in (
+        ("trace_version", SUPPORTED_TRACE_VERSIONS),
+        ("causal_ir_version", SUPPORTED_CAUSAL_IR_VERSIONS),
+    ):
+        version = _string(trace.get(field))
+        if version not in supported:
+            raise TraceInputError(
+                "Trace has unsupported {0} '{1}' (supported: {2}). {3}".format(
+                    field, version, ", ".join(supported), FINALIZE_HINT
+                )
+            )
+
+    manifest = _mapping(trace.get("manifest"))
+    status = _string(manifest.get("status"))
+    if status not in TERMINAL_STATUSES:
+        raise TraceInputError(
+            "Trace has nonterminal status '{0}'; pass a finalized terminal trace. {1}".format(
+                status or "missing", FINALIZE_HINT
+            )
+        )
+    for field in ("artifacts", "diagnostics"):
+        if not isinstance(trace.get(field), list):
+            raise TraceInputError(
+                "Trace is missing finalized {0}. {1}".format(field, FINALIZE_HINT)
+            )
+
     canonical_nodes = trace.get("nodes")
     canonical_edges = trace.get("edges")
     compatibility_nodes = trace.get("records")
@@ -144,12 +173,85 @@ def _finalized_collections(trace: Mapping[str, object]) -> Tuple[Sequence[object
     )
 
 
+def _count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _finalization_facts(trace: Mapping[str, object]) -> Tuple[Mapping[str, object], ...]:
+    manifest = _mapping(trace.get("manifest"))
+    journal = _mapping(trace.get("journal"))
+    metrics = _mapping(trace.get("metrics"))
+    lifecycle = {
+        "status": _string(manifest.get("status")),
+        "terminal": True,
+    }
+    for field in (
+        "case_status",
+        "server_status",
+        "process_status",
+        "shutdown_signal",
+        "shutdown_disposition",
+    ):
+        value = _string(manifest.get(field))
+        if value:
+            lifecycle[field] = value
+
+    segment_summary = _mapping(manifest.get("segment_summary"))
+    segments = {
+        field: _count(segment_summary.get(field))
+        for field in (
+            "count",
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted_unfinalized",
+            "running",
+        )
+    }
+    recorded_recovery = _mapping(manifest.get("recovery"))
+    recovery_status = _string(manifest.get("recovery_status")) or "complete"
+    historical_interruptions = manifest.get("historical_interruptions") is True
+    dropped_lines = _count(recorded_recovery.get("dropped_lines"))
+    journal_poisoned = journal.get("poisoned") is True
+    source_complete = not (
+        recovery_status != "complete"
+        or historical_interruptions
+        or dropped_lines
+        or journal_poisoned
+        or segments["interrupted_unfinalized"]
+        or segments["running"]
+    )
+    recovery = {
+        "status": recovery_status,
+        "source_complete": source_complete,
+        "historical_interruptions": historical_interruptions,
+        "dropped_lines": dropped_lines,
+        "journal_poisoned": journal_poisoned,
+    }
+
+    trace_health = metrics.get("trace_health")
+    health_issues = _mapping(trace_health).get("issues") if isinstance(trace_health, MappingABC) else None
+    trace_health_available = isinstance(health_issues, list)
+    diagnostics = {
+        "recorded_count": len(trace.get("diagnostics", [])),
+        "complete_for_available_data": True,
+        "source_data_complete": source_complete,
+        "trace_health_available": trace_health_available,
+        "trace_health_issue_count": len(health_issues) if trace_health_available else None,
+    }
+    return lifecycle, recovery, segments, diagnostics
+
+
 class TraceIndex:
     def __init__(
         self,
         *,
+        trace_version: object,
         causal_ir_version: object,
         lifecycle: Mapping[str, object],
+        recovery: Mapping[str, object],
+        segments: Mapping[str, object],
+        diagnostics: Mapping[str, object],
         artifacts: Sequence[object],
         nodes: Sequence[NodeView],
         edges: Sequence[EdgeView],
@@ -157,8 +259,12 @@ class TraceIndex:
         aliases: Mapping[str, str],
         case_directory: Path,
     ) -> None:
+        self.trace_version = trace_version
         self.causal_ir_version = causal_ir_version
         self.lifecycle = _freeze(dict(lifecycle))
+        self.recovery = _freeze(dict(recovery))
+        self.segments = _freeze(dict(segments))
+        self.diagnostics = _freeze(dict(diagnostics))
         self.artifacts = tuple(_freeze(item) for item in artifacts)
         self.nodes = tuple(nodes)
         self.edges = tuple(edges)
@@ -285,7 +391,7 @@ class TraceIndex:
             )
 
         known_refs = {node.ref for node in nodes}
-        traversal_edges = [
+        traversal_candidates = [
             edge
             for edge in edges
             if edge.eligible_for_attribution
@@ -299,7 +405,7 @@ class TraceIndex:
                 source = aliases.get(source_ref, source_ref)
                 if source == node.ref or source not in known_refs:
                     continue
-                traversal_edges.append(
+                traversal_candidates.append(
                     EdgeView(
                         ref="edge:record_source:{0}:{1}".format(node.ref, source),
                         source=source,
@@ -312,11 +418,23 @@ class TraceIndex:
                     )
                 )
 
-        manifest = _mapping(trace.get("manifest"))
-        lifecycle = {"status": _string(manifest.get("status"))}
+        traversal_edges = []
+        traversal_relations = set()
+        for edge in traversal_candidates:
+            relation = (edge.source, edge.target)
+            if relation in traversal_relations:
+                continue
+            traversal_relations.add(relation)
+            traversal_edges.append(edge)
+
+        lifecycle, recovery, segments, diagnostics = _finalization_facts(trace)
         return cls(
+            trace_version=trace.get("trace_version"),
             causal_ir_version=trace.get("causal_ir_version"),
             lifecycle=lifecycle,
+            recovery=recovery,
+            segments=segments,
+            diagnostics=diagnostics,
             artifacts=trace.get("artifacts") if isinstance(trace.get("artifacts"), list) else (),
             nodes=nodes,
             edges=edges,
@@ -329,13 +447,29 @@ class TraceIndex:
         """Return lifecycle, component, node, edge, and Artifact counts."""
         components = Counter(node.component for node in self.nodes if node.component)
         return {
+            "trace_version": self.trace_version,
             "causal_ir_version": self.causal_ir_version,
             "lifecycle": _json_value(self.lifecycle),
+            "recovery": _json_value(self.recovery),
+            "segments": _json_value(self.segments),
+            "diagnostics": _json_value(self.diagnostics),
             "components": dict(sorted(components.items())),
             "node_count": len(self.nodes),
             "edge_count": len(self.edges),
             "eligible_edge_count": sum(edge.eligible_for_attribution for edge in self.edges),
             "artifact_count": len(self.artifacts),
+        }
+
+    def validation(self) -> Mapping[str, object]:
+        """Return compatibility and finalized-source facts."""
+        return {
+            "valid": True,
+            "trace_version": self.trace_version,
+            "causal_ir_version": self.causal_ir_version,
+            "lifecycle": _json_value(self.lifecycle),
+            "recovery": _json_value(self.recovery),
+            "segments": _json_value(self.segments),
+            "diagnostics": _json_value(self.diagnostics),
         }
 
     def search(
@@ -771,7 +905,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         index = TraceIndex.load(args.trace)
         if args.command == "validate":
-            _write_json({"valid": True, "causal_ir_version": index.causal_ir_version})
+            _write_json(index.validation())
         elif args.command == "summary":
             _write_json(index.summary())
         elif args.command == "search":

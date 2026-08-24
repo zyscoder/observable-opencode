@@ -9,6 +9,10 @@ Pass the logical case-root `trace.json` produced by `observable-trace finalize`.
 - canonical Causal IR: `nodes[]` and `edges[]`;
 - compatibility projection: `records[]` and `dataflow_edges[]`.
 
+The helper supports `trace_version` `6.0` and `causal_ir_version` `1.0`. The manifest status must be terminal: `success`, `error`, or `cancelled`. It rejects a `running` snapshot, missing terminal status, or unsupported version with `observable-trace finalize` guidance. A `cancelled` status or shutdown signal does not make a finalized Trace invalid.
+
+Successful `validate` and `summary` responses expose `lifecycle`, `recovery`, `segments`, and `diagnostics` facts. Inspect `source_complete`, `source_data_complete`, `historical_interruptions`, `dropped_lines`, `journal_poisoned`, segment `interrupted_unfinalized`/`running` counts, recorded diagnostics, and Trace-health availability before judging evidence coverage. A finalized Trace can remain queryable when journal replay or historical segment recovery is incomplete; qualify claims to the available data instead of treating missing source data as negative evidence.
+
 Canonical fields win when both projections exist. Nodes preserve kind/event type, component, status, title, scope, payload, typed `aliases`, `input_refs`, `output_refs`, `source_refs`, and `artifact_refs`. Compatibility records expose empty lists for ref fields absent from that projection. Artifacts are declared in top-level `artifacts[]` and may be referenced by nodes.
 
 HTML reports and physical `records.jsonl` segment journals are not canonical inputs. If validation rejects either, finalize the case and pass the resulting `trace.json`.
@@ -69,6 +73,8 @@ An upstream or downstream hop is eligible only when it is one of:
 3. a `record_source` hop synthesized by the helper from an explicit `source_refs` entry that resolves to a different known node.
 
 The helper excludes an edge from traversal when it is explicitly ineligible, has `evidence_tier: temporal_advisory`, has an unresolved endpoint, or is a self-edge. Temporal adjacency alone is never causal evidence, even if two events appear consecutively. Preserve each returned relation, derivation method, evidence tier, and `evidence_refs` when making a causal claim.
+
+Traversal uses one traversal relation per source-target pair. A recorded edge takes precedence over a synthesized `record_source` relation for the same pair; otherwise the first eligible recorded relation is stable. This prevents equivalent provenance projections from multiplying paths. The `node` command still returns all recorded edges, including duplicates and ineligible relations, for inspection.
 
 `node` may display ineligible recorded edges for inspection; only `neighbors` and `paths` apply the traversal rules. Do not silently promote a displayed edge into causal evidence.
 
