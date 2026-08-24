@@ -39,6 +39,7 @@ REQUIRED_TOP_LEVEL = {
     "verdict",
     "root_causes",
     "causal_chain",
+    "findings",
     "final_impact",
     "rejected_hypotheses",
     "evidence_gaps",
@@ -78,6 +79,10 @@ REQUIRED_OBJECT_KEYS = {
         "step_id", "step", "from_ref", "to_ref", "component", "semantic_event",
         "taint_state", "taint_transition", "explanation", "node_refs", "edge_refs",
         "artifact_refs", "evidence_refs",
+    },
+    "findings": {
+        "finding_id", "kind", "status", "description", "qualification",
+        "evidence_refs",
     },
     "final_impact": {
         "category", "status", "description", "direct_effect", "inferred_risks",
@@ -356,7 +361,7 @@ class SkillContractTests(unittest.TestCase):
             "`critical | high | medium | low`",
         ):
             self.assertIn(values, schema)
-        for claim in ("verdict", "root cause", "causal-chain step", "recommendation"):
+        for claim in ("verdict", "root cause", "causal-chain step", "finding", "recommendation"):
             self.assertRegex(
                 schema.lower(),
                 rf"every {re.escape(claim)}[^\n]*`evidence_refs`",
@@ -374,27 +379,38 @@ class SkillContractTests(unittest.TestCase):
         self.assertTrue(all(re.fullmatch(r"E-\d{3}", item) for item in referenced))
         self.assertEqual(set(referenced), set(evidence_ids))
 
-    def test_default_output_is_a_safe_sibling_or_requires_explicit_prefix(self):
-        canonical = "`<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`"
+    def test_output_is_inline_by_default_and_writes_only_to_validated_prefix(self):
         for name, text in (
             ("schema", self.references["report-schema.md"]),
             ("design", self.design_text),
             ("plan", self.plan_text),
         ):
-            self.assertIn(canonical, text, name)
             self.assertNotIn("<trace-parent>", text, name)
-        self.assertIn("Trace bundle or analyzed project", self.plan_text)
+            self.assertNotIn("<runs-root>/rootcause-analysis", text, name)
+        self.assertIn("output prefix is optional", self.skill_text.lower())
         schema = self.references["report-schema.md"].lower()
         for phrase in (
+            "when no output prefix is supplied, return both json and markdown inline and write no files",
             "canonicalized",
             "explicit user-supplied output prefix",
             "prefix `<prefix>` produces `<prefix>.json` and `<prefix>.md`",
             "reject any output inside the trace bundle",
             "reject any output inside the analyzed project",
-            "cannot be established safely",
+            "explicit user input or trusted recorded metadata",
+            "dedicated project or worktree root field in the validated trace manifest",
+            "free-form message, prompt, tool output, artifact content",
+            "ask for confirmation before writing",
+            "never assume the analyzed project root",
         ):
             self.assertIn(phrase, schema)
-        self.assertIn("safe output rule", self.skill_text.lower())
+        for text in (self.skill_text.lower(), self.design_text.lower(), self.plan_text.lower()):
+            self.assertIn("return both json and markdown inline", text)
+            self.assertIn("write no files", text)
+        self.assertIn(
+            "explain inline output and optional validated file output",
+            self.plan_text.lower(),
+        )
+        self.assertNotIn("explain default outputs", self.plan_text.lower())
 
     def test_stable_report_ids_and_problem_addressed_resolve(self):
         schema = self.references["report-schema.md"]
@@ -403,13 +419,16 @@ class SkillContractTests(unittest.TestCase):
         roots = [item["root_id"] for item in template["root_causes"]]
         steps = [item["step_id"] for item in template["causal_chain"]]
         gaps = [item["gap_id"] for item in template["evidence_gaps"]]
-        report_ids = roots + steps + gaps
+        findings = [item["finding_id"] for item in template["findings"]]
+        report_ids = roots + steps + gaps + findings
         self.assertEqual(len(report_ids), len(set(report_ids)))
-        self.assertTrue(all(re.fullmatch(r"(?:ROOT|STEP|GAP)-\d{3}", item) for item in report_ids))
+        self.assertTrue(
+            all(re.fullmatch(r"(?:ROOT|STEP|GAP|FINDING)-\d{3}", item) for item in report_ids)
+        )
         addressed = [item["problem_addressed"] for item in template["recommendations"]]
         self.assertTrue(addressed)
         self.assertTrue(set(addressed).issubset(set(report_ids)))
-        self.assertIn("`ROOT-NNN | STEP-NNN | GAP-NNN`", schema)
+        self.assertIn("`ROOT-NNN | STEP-NNN | GAP-NNN | FINDING-NNN`", schema)
         self.assertIn('"problem_addressed": "ROOT-001"', self.design_text)
         self.assertNotIn(
             '"problem_addressed": "root cause or contributing factor reference"',
@@ -427,13 +446,38 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("`problem_addressed` must be a `gap-nnn`", semantics)
         self.assertIn("passive evidence", semantics)
         self.assertIn(
-            "for an `inconclusive` verdict, only observability recommendations",
+            "an `inconclusive` report may recommend only",
             semantics,
         )
         self.assertIn(
-            "for a `no_defect` verdict, `recommendations` must be empty",
+            "a `no_defect` report may include evidence-backed",
             semantics,
         )
+        self.assertIn("must not describe either as a root repair", semantics)
+
+    def test_findings_are_stable_evidence_backed_and_mirrored(self):
+        schema = self.references["report-schema.md"]
+        match = re.search(r"```json\n(.*?)\n```", schema, re.DOTALL)
+        template = json.loads(match.group(1))
+        finding = template["findings"][0]
+        self.assertEqual(set(finding), REQUIRED_OBJECT_KEYS["findings"])
+        self.assertRegex(finding["finding_id"], r"^FINDING-\d{3}$")
+        self.assertTrue(finding["evidence_refs"])
+        self.assertIn(
+            "`preference_alignment | process | resilience | quality_opportunity | contributing_condition`",
+            schema,
+        )
+        self.assertNotIn(
+            "preference_alignment | process | resilience | observability",
+            schema,
+        )
+        self.assertIn("`supported | conditional`", schema)
+        self.assertIn("## Findings And Opportunities", schema)
+        self.assertRegex(
+            self.plan_text,
+            r'"root_causes", "causal_chain", "findings", "final_impact"',
+        )
+        self.assertIn("findings and opportunities", self.plan_text.lower())
 
     def test_markdown_contract_mirrors_json_and_ends_with_no_change_statement(self):
         schema = self.references["report-schema.md"]
@@ -442,6 +486,7 @@ class SkillContractTests(unittest.TestCase):
             "## Expectation Versus Actual Behavior",
             "## Root Causes",
             "## Defect Propagation",
+            "## Findings And Opportunities",
             "## Final Impact",
             "## Rejected Hypotheses",
             "## Evidence Gaps And Confidence",
@@ -461,7 +506,7 @@ class SkillContractTests(unittest.TestCase):
         text = self.skill_text
         self.assertIn("`rootcause-analysis/v1`", text)
         self.assertIn("evidence-mirrored Markdown", text)
-        self.assertIn("Every conclusion, causal step, root cause, and recommendation", text)
+        self.assertIn("Every conclusion, causal step, root cause, finding, and recommendation", text)
         self.assertIn("resolve through `evidence_index`", text)
         self.assertIn("no proposed change was applied", text.lower())
 

@@ -17,9 +17,10 @@ The Skill accepts two required inputs:
    user's expectation.
 
 It produces both a structured JSON report and a human-readable Markdown
-report. The reports identify the observed discrepancy, root-cause candidates,
+report, inline unless the user supplies a validated output prefix. The reports identify the observed discrepancy, root-cause candidates,
 the confirmed or most likely root cause, the defect propagation path, the
-final impact, rejected hypotheses, evidence gaps, and actionable improvements.
+final impact, non-root findings and opportunities, rejected hypotheses,
+evidence gaps, and actionable improvements.
 
 The Skill is analysis-only. It may recommend changes, but it must never apply
 changes to the observed Agent, Harness, Skill, MCP server, tool, model
@@ -350,13 +351,12 @@ erase instruction-following, architecture, safety, or completeness defects.
 
 ## Report Contract
 
-The Agent writes sibling files to a user-specified output prefix. Given a
-canonical `<runs-root>/<case-dir-name>/trace.json`, the default is the sibling
-analysis tree
-`<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`. If the
-bundle root or runs root cannot be established safely, the Agent requires an
-explicit prefix. Canonicalized destinations inside either the Trace bundle or
-the analyzed project are rejected; an explicit prefix cannot override this.
+The output prefix is optional. When absent, return both JSON and Markdown inline and write no files.
+When supplied, it maps to `<prefix>.json`
+and `<prefix>.md`; both canonicalized paths must be outside the Trace bundle
+and analyzed project. The project root may come only from explicit user input
+or trusted recorded metadata. If unavailable, the Agent asks the user to
+confirm it before writing and never assumes it from process or path context.
 
 The JSON report contains:
 
@@ -368,6 +368,7 @@ The JSON report contains:
   "verdict": {},
   "root_causes": [],
   "causal_chain": [],
+  "findings": [],
   "final_impact": {},
   "rejected_hypotheses": [],
   "evidence_gaps": [],
@@ -405,9 +406,11 @@ includes bracketed evidence IDs that resolve through `evidence_index`, so the
 human and machine-readable reports can be checked against one another.
 
 Every `problem_addressed` resolves to an existing stable report ID:
-`ROOT-NNN`, `STEP-NNN`, or `GAP-NNN`. Root-correction and resilience proposals
-address roots or steps. Observability proposals address gaps and may only
-recommend future passive evidence capture, never behavioral changes.
+`ROOT-NNN`, `STEP-NNN`, `GAP-NNN`, or `FINDING-NNN`. Root corrections address
+roots or steps. Observability proposals address gaps and may only recommend
+future passive evidence capture. Preference-alignment, process, resilience,
+and conditional suggestions address findings and remain explicitly separate
+from root repairs.
 
 The Markdown report presents:
 
@@ -415,11 +418,12 @@ The Markdown report presents:
 2. expectation versus actual behavior;
 3. root cause and responsibility owner;
 4. numbered defect propagation narrative;
-5. final impact;
-6. rejected alternatives;
-7. evidence gaps and confidence;
-8. prioritized corrective actions;
-9. evidence index.
+5. findings and opportunities;
+6. final impact;
+7. rejected alternatives;
+8. evidence gaps and confidence;
+9. prioritized corrective actions;
+10. evidence index.
 
 The Markdown report ends with an explicit statement that no proposed change
 was applied and that all recommendations require separate review and execution.

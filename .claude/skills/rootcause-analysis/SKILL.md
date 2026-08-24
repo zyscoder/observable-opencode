@@ -16,6 +16,11 @@ Diagnose unmet expectations from Trace evidence. Judge semantics; retrieve facts
 
 Ask for missing inputs.
 
+## Optional Output
+
+- Output prefix is optional. Without it, return both JSON and Markdown inline and write no files.
+- For file output, accept a user-supplied prefix and a project root established only by explicit user input or trusted recorded metadata. If the project root remains unknown, ask the user to confirm it before writing. Never infer it.
+
 ## Analysis-Only Boundary
 
 This Skill is **analysis-only**:
@@ -25,7 +30,7 @@ This Skill is **analysis-only**:
 - must not mutate the Trace, annotate it in place, or append analysis to it;
 - must not feed conclusions or recommendations back to the observed Agent or resume its session.
 
-Only write reports outside the analyzed system and Trace bundle; recommendations remain proposals.
+Only write optional report files at a validated prefix outside the analyzed system and Trace bundle; recommendations remain proposals.
 
 ## Required Workflow
 
@@ -39,7 +44,7 @@ Only write reports outside the analyzed system and Trace bundle; recommendations
 8. **Backtrack or expand.** Reject contradicted branches, revisit alternatives, and retrieve evidence while unresolved candidates could change the verdict.
 9. **Confirm each root independently.** Require an evidence-backed path, introduction or independent causation, no stronger upstream introducer, reasoning-only counterfactual, and compared alternatives.
 10. **Explain propagation and impact.** State what each component produced or omitted, what followed, and how the task outcome changed.
-11. **Emit JSON and Markdown.** Resolve and validate the destination using the report schema's safe output rule, then write `rootcause-analysis/v1` JSON and evidence-mirrored Markdown outside the analyzed system and Trace bundle. Every conclusion, causal step, root cause, and recommendation must cite IDs that resolve through `evidence_index`; the two reports must mutually corroborate. Every recommendation must cite its motivating evidence refs. End Markdown by stating that no proposed change was applied and all recommendations require separate review and execution.
+11. **Emit JSON and Markdown.** Produce `rootcause-analysis/v1` JSON and evidence-mirrored Markdown. Without an output prefix, return both JSON and Markdown inline and write no files. With one, validate it against the canonical Trace bundle and an explicitly supplied or trusted recorded project root before writing; never assume either boundary. Every conclusion, causal step, root cause, finding, and recommendation must cite IDs that resolve through `evidence_index`; the two representations must mutually corroborate. Every recommendation must cite its motivating evidence refs. End Markdown by stating that no proposed change was applied and all recommendations require separate review and execution.
 12. **Stop without repair.** State that no proposed change was applied and that implementation requires a separate task.
 
 Use plain task language, not unexplained event-type labels. Explain what evidence established and how it was used; an event kind is not a cause by itself. Final reports follow the language of the user's question unless requested otherwise.

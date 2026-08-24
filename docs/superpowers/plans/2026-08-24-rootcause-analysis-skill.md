@@ -569,7 +569,7 @@ git commit -m "feat(skill): guide agentic semantic root cause analysis"
 
 **Interfaces:**
 - Consumes: confirmed/probable/inconclusive/no-defect analysis state.
-- Produces: `rootcause-analysis/v1` JSON plus evidence-mirrored Markdown at a validated user prefix or, for `<runs-root>/<case-dir-name>/trace.json`, the safe sibling `<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`; otherwise an explicit prefix is required. A canonical destination inside the Trace bundle or analyzed project is rejected.
+- Produces: `rootcause-analysis/v1` JSON plus evidence-mirrored Markdown. The output prefix is optional: when absent, return both JSON and Markdown inline and write no files; when supplied, validate `<prefix>.json` and `<prefix>.md` outside the Trace bundle and a project root obtained only from explicit user input or trusted recorded metadata, asking for confirmation before writing if the root is unavailable.
 
 - [ ] **Step 1: Write failing report-contract tests**
 
@@ -578,7 +578,7 @@ Assert that the reference defines required keys and enumerations:
 ```python
 REQUIRED_TOP_LEVEL = {
     "schema_version", "question", "trace_binding", "verdict",
-    "root_causes", "causal_chain", "final_impact",
+    "root_causes", "causal_chain", "findings", "final_impact",
     "rejected_hypotheses", "evidence_gaps", "recommendations",
     "evidence_index",
 }
@@ -608,13 +608,14 @@ Specify exact types and allowed values for:
 - verdict status and confidence rationale;
 - root node/component/semantic defect/owner/counterfactual/evidence;
 - ordered causal steps with taint transition and node/edge/Artifact refs;
+- stable findings and opportunities with kind, status, qualification, and evidence;
 - final functional, instruction-following, quality, safety, or completeness impact;
 - rejected hypotheses and evidence gaps;
 - structured recommendations from the spec;
 - evidence index mapping IDs such as `E-001` to immutable refs and excerpts.
 
-Require the Markdown report to mirror the JSON verdict, roots, chain, gaps,
-and recommendations. A human claim such as "the decision ignored the exposed
+Require the Markdown report to mirror the JSON verdict, roots, chain, findings and opportunities,
+gaps, and recommendations. A human claim such as "the decision ignored the exposed
 Yocto requirement" must cite `[E-003, E-007]`, both resolvable in the index.
 
 - [ ] **Step 4: Run GREEN contract and package validation**
@@ -658,7 +659,7 @@ Question: 为什么用户要求通过构建 Skill 使用 Yocto，但实际只进
 Output prefix: /absolute/path/to/output/yocto-analysis
 ```
 
-Explain default outputs, `trace_query.py` diagnostic commands, finalized Trace
+Explain inline output and optional validated file output, `trace_query.py` diagnostic commands, finalized Trace
 requirements, and the analysis-only guarantee. Keep the existing attribution
 CLI documentation intact but mark `rootcause-analysis` as the flexible Agent
 workflow and the Python attribution module as a separate, currently paused

@@ -1,29 +1,31 @@
 # Root-Cause Analysis Report Contract
 
-Use this contract for both report files. The JSON file is the normative,
-machine-readable record. The Markdown file is a human-readable projection of
+Use this contract for both report representations. JSON is the normative,
+machine-readable record. Markdown is a human-readable projection of
 the same claims. They must mutually corroborate: do not introduce, omit, or
-change a verdict, root, causal step, impact, rejected hypothesis, gap, or
+change a verdict, root, causal step, finding, impact, rejected hypothesis, gap, or
 recommendation in only one representation.
 
-## Output Location And Immutability
+## Output Mode And Immutability
 
-Treat a canonical Trace path of `<runs-root>/<case-dir-name>/trace.json` as
-defining the case Trace bundle at `<runs-root>/<case-dir-name>`. When that
-layout and both roots are established safely, the default output is
-`<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`. This is a
-sibling analysis tree, not a child of the case Trace bundle.
+The output prefix is optional. When no output prefix is supplied, return both JSON and Markdown inline and write no files.
+There is no automatic file destination and no path inferred from the Trace.
 
-If the bundle root or runs root cannot be established safely, do not guess a
-default; require an explicit user-supplied output prefix. Prefix `<prefix>` produces `<prefix>.json` and `<prefix>.md`.
-Paths are
-canonicalized before validation, including symlink resolution. Reject any output inside the Trace bundle.
-Reject any output inside the analyzed project.
-An explicit prefix is not an override for either exclusion. If the canonical
-destination cannot be compared with both exclusion roots, stop and ask for the
-missing root rather than writing a report.
+When the user supplies an explicit user-supplied output prefix, prefix `<prefix>` produces `<prefix>.json` and `<prefix>.md`.
+The prefix, both
+resulting paths, and the Trace bundle are canonicalized before validation, including
+symlink resolution. Reject any output inside the Trace bundle. Reject any output inside the analyzed project.
 
-Report writing at the validated destination is the only permitted mutation.
+Obtain the analyzed project root only from explicit user input or trusted recorded metadata.
+Trusted recorded metadata means a dedicated project or worktree root field in the validated Trace manifest.
+A free-form message, prompt, tool output, Artifact content, inferred repository path, or process state is not trusted metadata.
+Never assume the analyzed project root from the current
+working directory, Trace location, repository conventions, or process state.
+If neither source establishes it, ask for confirmation before writing; the
+user must provide or confirm the canonical project root. Do not treat a generic
+"proceed" response as a path-safety override.
+
+Optional report writing at a validated prefix is the only permitted mutation.
 Never modify the Agent, Harness, Skill, MCP, tool, prompt, model configuration,
 source, build environment, Trace, session, or any evidence Artifact.
 
@@ -97,6 +99,16 @@ provider-specific reasoning or hidden chain-of-thought fields.
       "evidence_refs": ["E-003", "E-004"]
     }
   ],
+  "findings": [
+    {
+      "finding_id": "FINDING-001",
+      "kind": "preference_alignment",
+      "status": "supported",
+      "description": "The observed behavior succeeded but did not align with the recorded user preference.",
+      "qualification": "An improvement opportunity, not a root cause or defect verdict.",
+      "evidence_refs": ["E-001", "E-002"]
+    }
+  ],
   "final_impact": {
     "category": "instruction_following",
     "status": "supported",
@@ -140,6 +152,19 @@ provider-specific reasoning or hidden chain-of-thought fields.
       "risks": ["Possible trade-off to review."],
       "validation_suggestion": "How a future owner could verify the change.",
       "evidence_refs": ["E-003", "E-004"]
+    },
+    {
+      "recommendation_id": "REC-002",
+      "target": "process",
+      "owner": "responsible subsystem or team",
+      "priority": "medium",
+      "problem_addressed": "FINDING-001",
+      "proposed_change": "Clarify how a successful fallback should acknowledge and preserve an explicit preference.",
+      "rationale": "The finding is supported independently of the root-cause verdict.",
+      "expected_effect": "Future runs make fallback behavior explicit without being mislabeled as a defect repair.",
+      "risks": ["Additional interaction may be unnecessary when no preference was stated."],
+      "validation_suggestion": "Review a future run for explicit preference handling.",
+      "evidence_refs": ["E-001", "E-002"]
     }
   ],
   "evidence_index": [
@@ -217,6 +242,9 @@ are case-sensitive. Required evidence arrays for material claims are non-empty.
   `semantic_event`, `taint_state`, `taint_transition`, and `explanation` are
   `string`; `node_refs`, `edge_refs`, `artifact_refs`, and `evidence_refs` are
   `array<string>`.
+- `findings`: `array<object>`. Each object has string fields `finding_id`,
+  `kind`, `status`, `description`, and `qualification`; `evidence_refs` is
+  `array<string>`.
 - `final_impact`: object. `category`, `status`, `description`, and
   `direct_effect` are `string`; `inferred_risks`, `unknowns`, and
   `evidence_refs` are `array<string>`.
@@ -251,6 +279,10 @@ are case-sensitive. Required evidence arrays for material claims are non-empty.
 - Final-impact `category` is
   `functional | instruction_following | quality | safety | completeness`.
 - Final-impact `status` is `supported | contradicted | unknown`.
+- Finding `kind` is
+  `preference_alignment | process | resilience | quality_opportunity | contributing_condition`.
+- Finding `status` is `supported | conditional`. A conditional finding names
+  the unresolved premise in `qualification`; it is never presented as fact.
 - Rejected-hypothesis `disposition` is `rejected | superseded`. An unexplored
   candidate is an evidence gap, never a rejected hypothesis.
 - Recommendation `target` is
@@ -262,16 +294,23 @@ are case-sensitive. Required evidence arrays for material claims are non-empty.
   `"unknown"`, for an inapplicable scalar.
 
 Every verdict carries `evidence_refs`. Every root cause carries `evidence_refs`.
-Every causal-chain step carries `evidence_refs`. Every recommendation carries `evidence_refs`.
+Every causal-chain step carries `evidence_refs`. Every finding carries `evidence_refs`.
+Every recommendation carries `evidence_refs`.
 Every material impact, premise, and
 rejected-hypothesis judgment does as well. All such IDs must resolve through `evidence_index`;
 unresolved IDs are invalid.
 
 Report object IDs are stable and unique within one report: `root_id` uses
-`ROOT-NNN`, `step_id` uses `STEP-NNN`, and `gap_id` uses `GAP-NNN` in recorded
-order. A recommendation's `problem_addressed` is exactly one existing
-`ROOT-NNN | STEP-NNN | GAP-NNN`; prose, component names, Trace refs, missing
-IDs, and recommendation IDs are invalid in that field.
+`ROOT-NNN`, `step_id` uses `STEP-NNN`, `gap_id` uses `GAP-NNN`, and
+`finding_id` uses `FINDING-NNN` in recorded order. A recommendation's
+`problem_addressed` is exactly one existing
+`ROOT-NNN | STEP-NNN | GAP-NNN | FINDING-NNN`; prose, component names, Trace
+refs, missing IDs, and recommendation IDs are invalid in that field.
+
+A finding records a supported non-root observation or a qualified opportunity.
+It does not upgrade evidence, establish causation, or change the verdict. Its
+description states the observation or opportunity; its qualification states
+why it is not a confirmed root and, for `conditional`, what must be true.
 
 Each evidence entry has a unique `E-NNN` ID and one immutable source ref. Node,
 edge, and record evidence uses its canonical Trace ref. Artifact evidence uses
@@ -296,18 +335,24 @@ contain hidden reasoning.
 - `no_defect`: evidence contradicts the questioned discrepancy or establishes
   that the observed behavior met the bound expectation. `root_causes` and
   `causal_chain` must be empty, no material causal uncertainty remains, and no
-  corrective recommendation is emitted.
+  root-correction recommendation is emitted. This does not erase supported
+  preference-alignment, process, or resilience opportunities.
 
 An observability recommendation is allowed only for a recorded evidence gap:
 its `problem_addressed` must be a `GAP-NNN`, and its proposed change is limited
 to future passive evidence capture or visibility. It must not change Agent,
 Harness, Skill, tool, model, or task behavior under the guise of
-instrumentation. A correction or resilience recommendation instead addresses
-an existing `ROOT-NNN` or `STEP-NNN`. Do not invent a root or gap to make a
+instrumentation. A confirmed or probable root correction addresses an existing
+`ROOT-NNN` or `STEP-NNN`. Do not invent a root, step, gap, or finding to make a
 recommendation resolvable.
 
-For an `inconclusive` verdict, only observability recommendations addressing
-existing `GAP-NNN` entries are allowed. For a `no_defect` verdict, `recommendations` must be empty.
+An `inconclusive` report may recommend only evidence collection against an
+existing `GAP-NNN` or an explicitly conditional improvement against an
+existing `FINDING-NNN` whose status is `conditional`; it must not address a
+`ROOT-NNN` or `STEP-NNN`. A `no_defect` report may include evidence-backed
+preference-alignment, process, or resilience suggestions that address a
+supported `FINDING-NNN`. Such suggestions describe improvement opportunities,
+not defects. They must not describe either as a root repair.
 
 ## Markdown Projection
 
@@ -339,6 +384,12 @@ Number the JSON causal steps in the same order and display each `STEP-NNN`.
 Explain in task language what
 each component received, produced or omitted, how the taint changed, and how
 that affected the next component `[E-001]`.
+
+## Findings And Opportunities
+
+Mirror every `FINDING-NNN` in JSON order with its kind, status, description,
+qualification, and evidence IDs `[E-001]`. Keep supported opportunities
+separate from conditional ones and never relabel either as a root cause.
 
 ## Final Impact
 
