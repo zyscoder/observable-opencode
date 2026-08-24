@@ -9,7 +9,7 @@ Pass the logical case-root `trace.json` produced by `observable-trace finalize`.
 - canonical Causal IR: `nodes[]` and `edges[]`;
 - compatibility projection: `records[]` and `dataflow_edges[]`.
 
-Canonical fields win when both projections exist. Nodes preserve kind/event type, component, status, title, scope, payload, typed `source_refs`, `artifact_refs`, and aliases. Artifacts are declared in top-level `artifacts[]` and may be referenced by nodes.
+Canonical fields win when both projections exist. Nodes preserve kind/event type, component, status, title, scope, payload, typed `aliases`, `input_refs`, `output_refs`, `source_refs`, and `artifact_refs`. Compatibility records expose empty lists for ref fields absent from that projection. Artifacts are declared in top-level `artifacts[]` and may be referenced by nodes.
 
 HTML reports and physical `records.jsonl` segment journals are not canonical inputs. If validation rejects either, finalize the case and pass the resulting `trace.json`.
 
@@ -21,6 +21,8 @@ A node result preserves:
 
 - `ref`, `kind`, `component`, `status`, and `title` as identity and locator fields;
 - `scope` and `payload` as recorded semantic data;
+- `aliases` as declared, normalized lookup identities;
+- `input_refs` and `output_refs` as explicit recorded dataflow references;
 - `source_refs` as explicit typed upstream references;
 - `artifact_refs` as declared semantic-content references.
 
@@ -41,7 +43,7 @@ Run from the Skill directory, or replace `scripts/trace_query.py` with its absol
 ```bash
 python3 scripts/trace_query.py validate --trace <absolute-trace-path>
 python3 scripts/trace_query.py summary --trace <absolute-trace-path>
-python3 scripts/trace_query.py search --trace <absolute-trace-path> --query <text> [--kind <kind>] [--component <component>] [--status <status>] [--limit <batch-limit>]
+python3 scripts/trace_query.py search --trace <absolute-trace-path> [--query <text>] [--kind <kind>] [--component <component>] [--status <status>] [--limit <batch-limit>] [--offset <next-offset>]
 python3 scripts/trace_query.py node --trace <absolute-trace-path> --ref <node-or-record-ref>
 python3 scripts/trace_query.py neighbors --trace <absolute-trace-path> --ref <ref> --direction upstream|downstream [--depth <batch-depth>] [--limit <batch-limit>]
 python3 scripts/trace_query.py paths --trace <absolute-trace-path> --start <ref> [--max-depth <batch-depth>] [--limit <batch-limit>]
@@ -50,7 +52,7 @@ python3 scripts/trace_query.py artifact --trace <absolute-trace-path> --id <arti
 
 - `validate` verifies the finalized semantic envelope.
 - `summary` returns lifecycle, component, node, edge, and Artifact counts.
-- `search` filters normalized nodes in recorded order.
+- `search` returns a recorded-order page with `nodes`, `matched_count`, `returned_count`, `offset`, `limit`, `truncated`, and `next_offset`.
 - `node` hydrates one node plus all recorded incoming and outgoing edges.
 - `neighbors` traverses eligible edges in one direction and returns relation metadata.
 - `paths` returns bounded backward paths without ranking them.
@@ -74,6 +76,8 @@ The helper excludes an edge from traversal when it is explicitly ineligible, has
 
 `--depth`, `--max-depth`, `--limit`, and `--max-chars` control one response size. They do not cap semantic recursion or candidate count. If a query returns `truncated: true`, record its `remaining_frontier_refs` and request another relevant batch whenever that frontier could change the verdict. Empty eligible paths mean only that the recorded eligible graph does not connect the requested nodes.
 
+Search has a separate continuation contract. Begin at `offset` zero, then pass each non-null `next_offset` into `--offset` until `truncated` is `false`. If analysis stops earlier, preserve the remaining page as unexplored candidates in the hypothesis ledger; never treat one page as all matches.
+
 ## Artifact Evidence
 
-Use `artifact` only for a top-level declared Artifact ID. The helper requires a path below the Trace case directory, rejects symlink/path escape and replacement races, and checks the declared SHA-256 before returning text. Cite the Artifact ID and digest with claims based on its content. On missing files, invalid UTF-8, path rejection, or hash mismatch, preserve the reference and mark its semantic content `unknown`.
+Use `artifact` only for a top-level declared Artifact ID. Content reads require a valid declared SHA-256 in `content_hash` or compatible `hash`; the helper fails closed when the digest is absent, malformed, conflicting, or mismatched. It also requires a path below the Trace case directory and rejects symlink/path escape and replacement races. Cite the Artifact ID and digest with claims based on returned content. On any integrity failure, preserve the reference and mark its semantic content `unknown`.

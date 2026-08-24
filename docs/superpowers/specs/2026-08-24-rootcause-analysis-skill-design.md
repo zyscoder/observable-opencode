@@ -103,12 +103,18 @@ runtime state is outside this Skill's scope.
 `trace_query.py` must only perform deterministic, read-only operations:
 
 - validate and summarize a finalized Causal IR Trace;
-- search records by ID, type, component, status, title, scope, or text;
-- show a hydrated node with its explicit references and eligible edges;
+- search records by ID, type, component, status, title, scope, or text through
+  resumable pages containing `nodes`, `matched_count`, `returned_count`,
+  `offset`, `limit`, `truncated`, and `next_offset`;
+- show a hydrated node with canonical `aliases`, `input_refs`, `output_refs`,
+  preserved `source_refs` and `artifact_refs`, and all recorded incoming and
+  outgoing edges with eligibility metadata; traversal alone filters to
+  eligible edges;
 - list bounded upstream and downstream neighborhoods;
 - find bounded backward paths over attribution-eligible recorded edges;
-- read referenced artifacts relative to the Trace bundle after validating the
-  declared SHA-256 digest when available;
+- read referenced artifacts relative to the Trace bundle only after validating
+  a valid declared SHA-256 from `content_hash` or compatible `hash`, and fail
+  closed when it is absent, malformed, conflicting, or mismatched;
 - emit compact JSON suitable for Agent context.
 
 The helper must not classify defects, rank root causes, infer an unrecorded
@@ -131,7 +137,9 @@ The helper supports the current canonical and compatibility fields:
 - `nodes[]` and `edges[]` from Causal IR;
 - `records[]` and `dataflow_edges[]` from the formal compatibility projection;
 - top-level `artifacts[]` and record-level Artifact references;
-- typed references, legacy aliases, and record IDs;
+- typed `aliases`, `input_refs`, `output_refs`, `source_refs`, `artifact_refs`,
+  legacy aliases, and record IDs; compatibility fields may be empty when the
+  source projection does not contain them;
 - `manifest`, lifecycle state, diagnostics, and metrics.
 
 Every returned fact preserves its source node, edge, Artifact, or manifest
@@ -203,6 +211,10 @@ of these states:
 
 These states describe a hypothesis about semantic propagation. They must cite
 facts and may change when later evidence contradicts the current branch.
+
+For `blocked`, terminate that upstream propagation branch for the current
+effect, record the blocker and its evidence, then inspect downstream for an
+independent reintroduction. A blocker does not prove all later outputs clean.
 
 #### Per-Node Judgment
 

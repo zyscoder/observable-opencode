@@ -39,12 +39,15 @@ class ArtifactIntegrityError(ValueError):
 @dataclass(frozen=True)
 class NodeView:
     ref: str
+    aliases: Tuple[str, ...]
     kind: str
     component: str
     status: str
     title: str
     scope: Mapping[str, object]
     payload: Mapping[str, object]
+    input_refs: Tuple[str, ...]
+    output_refs: Tuple[str, ...]
     source_refs: Tuple[str, ...]
     artifact_refs: Tuple[str, ...]
 
@@ -213,17 +216,21 @@ class TraceIndex:
                 raise TraceInputError("Trace contains duplicate semantic node ids. {0}".format(FINALIZE_HINT))
             register_alias(ref, ref)
             register_alias("{0}:{1}".format("node" if record_mode else "record", identifier), ref)
-            for alias in _normalize_refs(source.get("aliases")):
+            node_aliases = _normalize_refs(source.get("aliases"))
+            for alias in node_aliases:
                 register_alias(alias, ref)
             nodes.append(
                 NodeView(
                     ref=ref,
+                    aliases=node_aliases,
                     kind=_string(source.get("event_type" if record_mode else "kind")),
                     component=_string(source.get("component")),
                     status=_string(source.get("status")),
                     title=_string(source.get("title")),
                     scope=_freeze(_node_scope(source)),
                     payload=_freeze(_node_payload(source)),
+                    input_refs=_normalize_refs(source.get("input_refs")),
+                    output_refs=_normalize_refs(source.get("output_refs")),
                     source_refs=_normalize_refs(source.get("source_refs")),
                     artifact_refs=_normalize_refs(source.get("artifact_refs")),
                 )
@@ -339,10 +346,13 @@ class TraceIndex:
         component: str = "",
         status: str = "",
         limit: int = 50,
-    ) -> Sequence[NodeView]:
-        """Return matching nodes in recorded order up to one response limit."""
+        offset: int = 0,
+    ) -> Mapping[str, object]:
+        """Return one resumable page of matching nodes in recorded order."""
         if limit < 1:
             raise ValueError("limit must be at least 1")
+        if offset < 0:
+            raise ValueError("offset must be at least 0")
         query = query.casefold()
         kind = kind.casefold()
         component = component.casefold()
@@ -359,9 +369,18 @@ class TraceIndex:
             if query and query not in searchable:
                 continue
             matches.append(node)
-            if len(matches) == limit:
-                break
-        return tuple(matches)
+        nodes = tuple(matches[offset : offset + limit])
+        next_offset = offset + len(nodes)
+        truncated = next_offset < len(matches)
+        return {
+            "nodes": [_node_to_dict(node) for node in nodes],
+            "matched_count": len(matches),
+            "returned_count": len(nodes),
+            "offset": offset,
+            "limit": limit,
+            "truncated": truncated,
+            "next_offset": next_offset if truncated else None,
+        }
 
     def node(self, ref: str) -> Mapping[str, object]:
         """Return one hydrated node plus explicit incoming and outgoing edges."""
@@ -680,12 +699,15 @@ class TraceIndex:
 def _node_to_dict(node: NodeView) -> Mapping[str, object]:
     return {
         "ref": node.ref,
+        "aliases": list(node.aliases),
         "kind": node.kind,
         "component": node.component,
         "status": node.status,
         "title": node.title,
         "scope": _json_value(node.scope),
         "payload": _json_value(node.payload),
+        "input_refs": list(node.input_refs),
+        "output_refs": list(node.output_refs),
         "source_refs": list(node.source_refs),
         "artifact_refs": list(node.artifact_refs),
     }
@@ -721,6 +743,7 @@ def _parser() -> argparse.ArgumentParser:
     search.add_argument("--component", default="")
     search.add_argument("--status", default="")
     search.add_argument("--limit", default=50, type=int)
+    search.add_argument("--offset", default=0, type=int)
     node = commands.add_parser("node")
     node.add_argument("--trace", required=True, type=Path)
     node.add_argument("--ref", required=True)
@@ -752,14 +775,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif args.command == "summary":
             _write_json(index.summary())
         elif args.command == "search":
-            nodes = index.search(
-                query=args.query,
-                kind=args.kind,
-                component=args.component,
-                status=args.status,
-                limit=args.limit,
+            _write_json(
+                index.search(
+                    query=args.query,
+                    kind=args.kind,
+                    component=args.component,
+                    status=args.status,
+                    limit=args.limit,
+                    offset=args.offset,
+                )
             )
-            _write_json({"nodes": [_node_to_dict(node) for node in nodes], "limit": args.limit})
         elif args.command == "node":
             _write_json(index.node(args.ref))
         elif args.command == "neighbors":

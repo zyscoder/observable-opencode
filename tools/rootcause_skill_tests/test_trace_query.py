@@ -136,15 +136,92 @@ class TraceQueryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         payload = json.loads(result.stdout)
         self.assertEqual([node["ref"] for node in payload["nodes"]], ["node:req_1", "node:ctx_1"])
+        self.assertEqual(payload["matched_count"], 3)
+        self.assertEqual(payload["returned_count"], 2)
         self.assertEqual(payload["limit"], 2)
+        self.assertEqual(payload["offset"], 0)
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["next_offset"], 2)
 
-    def test_node_hydrates_only_recorded_edges(self):
-        result = self.run_query("node", "--trace", str(KNOWN_ROOT), "--ref", "node:dec_1")
-        self.assertEqual(result.returncode, 0)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["ref"], "node:dec_1")
-        self.assertEqual([edge["ref"] for edge in payload["incoming_edges"]], ["edge:edge_ctx_dec"])
-        self.assertEqual([edge["ref"] for edge in payload["outgoing_edges"]], ["edge:edge_dec_tool"])
+    def test_search_offset_continues_without_gaps_or_duplicates(self):
+        refs = []
+        offset = 0
+        while True:
+            payload = self.query_json(
+                "search",
+                "--trace",
+                str(KNOWN_ROOT),
+                "--query",
+                "yocto",
+                "--limit",
+                "1",
+                "--offset",
+                str(offset),
+            )
+            refs.extend(node["ref"] for node in payload["nodes"])
+            if not payload["truncated"]:
+                self.assertIsNone(payload["next_offset"])
+                break
+            self.assertGreater(payload["next_offset"], offset)
+            offset = payload["next_offset"]
+
+        self.assertEqual(refs, ["node:req_1", "node:ctx_1", "node:dec_1"])
+        self.assertEqual(payload["matched_count"], 3)
+
+    def test_search_rejects_negative_offset(self):
+        result = self.run_query(
+            "search", "--trace", str(KNOWN_ROOT), "--offset", "-1"
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("offset must be at least 0", result.stderr)
+
+    def test_canonical_node_exposes_aliases_and_dataflow_refs(self):
+        payload = self.query_json("node", "--trace", str(KNOWN_ROOT), "--ref", "node:dec_1")
+        self.assertEqual(payload["aliases"], ["record:decision_legacy"])
+        self.assertEqual(payload["input_refs"], ["node:ctx_1"])
+        self.assertEqual(payload["output_refs"], ["node:tool_1"])
+        self.assertEqual(payload["source_refs"], ["node:ctx_1"])
+        self.assertEqual(payload["artifact_refs"], [])
+
+    def test_compatibility_node_exposes_empty_unprojected_refs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace.json"
+            self.write_trace(trace, self.compatibility_only_payload())
+            payload = self.query_json("node", "--trace", str(trace), "--ref", "record:dec_1")
+
+        self.assertEqual(payload["aliases"], [])
+        self.assertEqual(payload["input_refs"], [])
+        self.assertEqual(payload["output_refs"], [])
+        self.assertEqual(payload["source_refs"], ["node:ctx_1"])
+        self.assertEqual(payload["artifact_refs"], [])
+
+    def test_node_hydrates_all_recorded_edges_with_eligibility(self):
+        with self.copied_known_root() as (trace, _):
+            trace_payload = json.loads(trace.read_text(encoding="utf-8"))
+            trace_payload["edges"].append(
+                self.edge(
+                    "edge_final_unrelated",
+                    "final_1",
+                    "unrelated_1",
+                    eligible_for_attribution=False,
+                    normalized_relation="recorded_for_diagnostics",
+                    evidence_tier="diagnostic",
+                )
+            )
+            self.write_trace(trace, trace_payload)
+            payload = self.query_json("node", "--trace", str(trace), "--ref", "node:final_1")
+
+        self.assertEqual(payload["ref"], "node:final_1")
+        self.assertEqual(
+            [edge["ref"] for edge in payload["incoming_edges"]],
+            ["edge:edge_tool_final", "edge:edge_unrelated_final"],
+        )
+        self.assertTrue(payload["incoming_edges"][0]["eligible_for_attribution"])
+        self.assertFalse(payload["incoming_edges"][1]["eligible_for_attribution"])
+        self.assertEqual(payload["incoming_edges"][1]["evidence_tier"], "temporal_advisory")
+        self.assertEqual([edge["ref"] for edge in payload["outgoing_edges"]], ["edge:edge_final_unrelated"])
+        self.assertFalse(payload["outgoing_edges"][0]["eligible_for_attribution"])
+        self.assertEqual(payload["outgoing_edges"][0]["evidence_tier"], "diagnostic")
         self.assertFalse(
             {"root_score", "root_ranking", "defect_label"}.intersection(payload),
             "node output must remain factual rather than making attribution judgments",
@@ -383,6 +460,16 @@ class TraceQueryTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["integrity"], "verified")
+
+    def test_artifact_without_declared_digest_fails_closed(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["artifacts"][0].pop("hash")
+            self.write_trace(trace, payload)
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("valid sha-256", result.stderr.lower())
 
     def test_artifact_rejects_conflicting_hash_declarations(self):
         with self.copied_known_root() as (trace, _):

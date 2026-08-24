@@ -14,6 +14,17 @@ Use this protocol to locate where a question-specific semantic defect first ente
 
 Classify the precise defect bound from the user's question. The same node can be clean for one question and defective for another.
 
+## Blocked Transition
+
+When a node is `blocked` for the current effect:
+
+1. terminate that upstream propagation branch for this defect and effect;
+2. record the blocker, its output, and the evidence that propagation stopped;
+3. do not recurse farther upstream on that branch as an explanation of the current effect;
+4. inspect downstream from the blocker for an independent reintroduction of the same or a materially related defect.
+
+If downstream evidence reintroduces the defect, open a separate hypothesis at that introduction point. The blocker remains chain evidence; it is not evidence that every later output is clean.
+
 ## Per-Node Semantic Judgment
 
 Answer all eight questions for every node retained in a candidate chain:
@@ -52,9 +63,10 @@ Never erase a rejected hypothesis. Preserve why it lost so the final report can 
 2. Inspect the current node with the eight questions.
 3. For `inherited`, `transformed`, or `amplified`, enqueue plausible eligible upstream sources that could contain or introduce the same defect.
 4. For `absent` or contradictory evidence, reject or revise that branch and backtrack to the next ledger candidate.
-5. For `unknown`, retrieve another bounded neighborhood or record the exact evidence gap.
-6. For `introduced`, test downstream reachability, stronger upstream explanations, the counterfactual, and competing hypotheses before confirmation.
-7. Continue while any unexplored item could change the verdict.
+5. For `blocked`, apply the blocked transition and do not continue upstream for the current effect.
+6. For `unknown`, retrieve another bounded neighborhood or record the exact evidence gap.
+7. For `introduced`, test downstream reachability, stronger upstream explanations, the counterfactual, and competing hypotheses before confirmation.
+8. Continue while any unexplored item could change the verdict.
 
 There is **no fixed semantic depth** and **no fixed candidate budget**. Query depth and result limits bound one retrieval batch only. When output is truncated, preserve `remaining_frontier_refs` in the ledger and continue if that frontier could change the conclusion. Do not stop at the first plausible cause.
 
