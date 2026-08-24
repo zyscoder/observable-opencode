@@ -1,15 +1,18 @@
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 KNOWN_ROOT = ROOT / "tools" / "rootcause_skill_tests" / "fixtures" / "known-root" / "trace.json"
 SCRIPT = ROOT / ".claude" / "skills" / "rootcause-analysis" / "scripts" / "trace_query.py"
+ARTIFACT_ID = "build-requirement"
 
 
 class TraceQueryTests(unittest.TestCase):
@@ -43,6 +46,18 @@ class TraceQueryTests(unittest.TestCase):
             )
             edge["metadata"] = metadata
         return payload
+
+    def query_json(self, *arguments):
+        result = self.run_query(*arguments)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    @contextmanager
+    def copied_known_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_directory = Path(directory) / "known-root"
+            shutil.copytree(KNOWN_ROOT.parent, case_directory)
+            yield case_directory / "trace.json", case_directory
 
     def test_validate_accepts_finalized_causal_ir(self):
         result = self.run_query("validate", "--trace", str(KNOWN_ROOT))
@@ -200,6 +215,138 @@ class TraceQueryTests(unittest.TestCase):
         result = self.run_query("node", "--trace", str(KNOWN_ROOT), "--ref", "node:missing")
         self.assertEqual(result.returncode, 2)
         self.assertIn("node:missing", result.stderr)
+
+    def test_backward_paths_follow_only_eligible_recorded_edges(self):
+        payload = self.query_json("paths", "--trace", str(KNOWN_ROOT), "--start", "node:final_1")
+        paths = [item["node_refs"] for item in payload["paths"]]
+        self.assertIn(
+            ["node:final_1", "node:tool_1", "node:dec_1", "node:ctx_1", "node:req_1"],
+            paths,
+        )
+        self.assertNotIn("node:unrelated_1", json.dumps(payload))
+
+    def test_neighbors_preserve_relation_and_evidence_refs(self):
+        payload = self.query_json(
+            "neighbors",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--ref",
+            "node:dec_1",
+            "--direction",
+            "upstream",
+        )
+        self.assertEqual(payload["edges"][0]["relation"], "context_influences_decision")
+        self.assertEqual(payload["edges"][0]["evidence_refs"], ["node:ctx_1"])
+
+    def test_query_limit_marks_output_truncated_without_hiding_frontier(self):
+        payload = self.query_json(
+            "neighbors",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--ref",
+            "node:final_1",
+            "--direction",
+            "upstream",
+            "--limit",
+            "1",
+        )
+        self.assertTrue(payload["truncated"])
+        self.assertTrue(payload["remaining_frontier_refs"])
+
+    def test_neighbor_depth_bound_exposes_remaining_frontier(self):
+        payload = self.query_json(
+            "neighbors",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--ref",
+            "node:final_1",
+            "--direction",
+            "upstream",
+            "--depth",
+            "1",
+            "--limit",
+            "20",
+        )
+        self.assertTrue(payload["truncated"])
+        self.assertIn("node:tool_1", payload["remaining_frontier_refs"])
+
+    def test_path_depth_bound_returns_partial_path_and_frontier(self):
+        payload = self.query_json(
+            "paths",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--start",
+            "node:final_1",
+            "--max-depth",
+            "1",
+            "--limit",
+            "20",
+        )
+        self.assertIn(["node:final_1", "node:tool_1"], [item["node_refs"] for item in payload["paths"]])
+        self.assertTrue(payload["truncated"])
+        self.assertIn("node:tool_1", payload["remaining_frontier_refs"])
+
+    def test_artifact_verifies_sha256_before_returning_content(self):
+        payload = self.query_json("artifact", "--trace", str(KNOWN_ROOT), "--id", ARTIFACT_ID)
+        self.assertEqual(payload["integrity"], "verified")
+        self.assertIn("Yocto", payload["content"])
+
+    def test_artifact_accepts_unprefixed_sha256_digest(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["artifacts"][0]["hash"] = payload["artifacts"][0]["hash"].split(":", 1)[1]
+            trace.write_text(json.dumps(payload), encoding="utf-8")
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["integrity"], "verified")
+
+    def test_artifact_hash_mismatch_returns_integrity_error(self):
+        with self.copied_known_root() as (trace, case_directory):
+            artifact = case_directory / "artifacts" / "sha256" / (
+                "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"
+            )
+            artifact.write_text("corrupted", encoding="utf-8")
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("hash mismatch", result.stderr.lower())
+
+    def test_artifact_rejects_path_escape(self):
+        with self.copied_known_root() as (trace, case_directory):
+            outside = case_directory.parent / "outside.txt"
+            outside.write_text("not part of the trace", encoding="utf-8")
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["artifacts"][0]["path"] = "../outside.txt"
+            trace.write_text(json.dumps(payload), encoding="utf-8")
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("path", result.stderr.lower())
+
+    def test_artifact_rejects_symlink_and_missing_files(self):
+        with self.copied_known_root() as (trace, case_directory):
+            outside = case_directory.parent / "outside.txt"
+            outside.write_text("not part of the trace", encoding="utf-8")
+            artifact = case_directory / "artifacts" / "sha256" / (
+                "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"
+            )
+            artifact.unlink()
+            artifact.symlink_to(outside)
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("symlink", result.stderr.lower())
+
+        with self.copied_known_root() as (trace, case_directory):
+            artifact = case_directory / "artifacts" / "sha256" / (
+                "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"
+            )
+            artifact.unlink()
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("missing", result.stderr.lower())
 
 
 if __name__ == "__main__":

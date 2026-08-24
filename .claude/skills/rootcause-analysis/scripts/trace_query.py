@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,10 @@ FINALIZE_HINT = "Run observable-trace finalize and pass its logical trace.json o
 
 class TraceInputError(ValueError):
     """The supplied path is not a finalized semantic trace."""
+
+
+class ArtifactIntegrityError(ValueError):
+    """A declared Artifact cannot be safely read from the Trace bundle."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,8 @@ class EdgeView:
     relation: str
     eligible_for_attribution: bool
     evidence_refs: Tuple[str, ...]
+    evidence_tier: str
+    derivation_method: str
 
 
 def _freeze(value: object) -> object:
@@ -133,15 +140,24 @@ class TraceIndex:
         artifacts: Sequence[object],
         nodes: Sequence[NodeView],
         edges: Sequence[EdgeView],
+        traversal_edges: Sequence[EdgeView],
         aliases: Mapping[str, str],
+        case_directory: Path,
     ) -> None:
         self.causal_ir_version = causal_ir_version
         self.lifecycle = _freeze(dict(lifecycle))
         self.artifacts = tuple(_freeze(item) for item in artifacts)
         self.nodes = tuple(nodes)
         self.edges = tuple(edges)
+        self._traversal_edges = tuple(traversal_edges)
         self._nodes_by_ref = {node.ref: node for node in self.nodes}
         self._aliases = dict(aliases)
+        self._case_directory = case_directory
+        self._upstream_edges = {}
+        self._downstream_edges = {}
+        for edge in self._traversal_edges:
+            self._upstream_edges.setdefault(edge.target, []).append(edge)
+            self._downstream_edges.setdefault(edge.source, []).append(edge)
 
     @classmethod
     def load(cls, path: Path) -> "TraceIndex":
@@ -211,11 +227,22 @@ class TraceIndex:
             if not identifier:
                 raise TraceInputError("Trace contains a semantic edge without an id. {0}".format(FINALIZE_HINT))
             metadata = _mapping(source.get("metadata"))
-            relation = (
-                _string(source.get("normalized_relation"))
-                or _string(source.get("relation"))
-                or _string(metadata.get("normalized_relation"))
-            )
+            if record_mode:
+                relation = (
+                    _string(source.get("relation"))
+                    or _string(source.get("normalized_relation"))
+                    or _string(metadata.get("normalized_relation"))
+                    or _string(source.get("original_relation"))
+                    or _string(metadata.get("original_relation"))
+                )
+            else:
+                relation = (
+                    _string(source.get("original_relation"))
+                    or _string(metadata.get("original_relation"))
+                    or _string(source.get("normalized_relation"))
+                    or _string(source.get("relation"))
+                    or _string(metadata.get("normalized_relation"))
+                )
             eligibility = source.get("eligible_for_attribution")
             if not isinstance(eligibility, bool):
                 eligibility = metadata.get("eligible_for_attribution")
@@ -227,8 +254,40 @@ class TraceIndex:
                     relation=relation,
                     eligible_for_attribution=eligibility is True,
                     evidence_refs=_normalize_refs(source.get("evidence_refs")),
+                    evidence_tier=_string(source.get("evidence_tier"))
+                    or _string(metadata.get("evidence_tier")),
+                    derivation_method=_string(source.get("derivation_method"))
+                    or _string(metadata.get("derivation_method")),
                 )
             )
+
+        known_refs = {node.ref for node in nodes}
+        traversal_edges = [
+            edge
+            for edge in edges
+            if edge.eligible_for_attribution
+            and edge.evidence_tier.casefold() != "temporal_advisory"
+            and edge.source != edge.target
+            and edge.source in known_refs
+            and edge.target in known_refs
+        ]
+        for node in nodes:
+            for source_ref in node.source_refs:
+                source = aliases.get(source_ref, source_ref)
+                if source == node.ref or source not in known_refs:
+                    continue
+                traversal_edges.append(
+                    EdgeView(
+                        ref="edge:record_source:{0}:{1}".format(node.ref, source),
+                        source=source,
+                        target=node.ref,
+                        relation="record_source",
+                        eligible_for_attribution=True,
+                        evidence_refs=(source_ref,),
+                        evidence_tier="explicit",
+                        derivation_method="source_refs",
+                    )
+                )
 
         manifest = _mapping(trace.get("manifest"))
         lifecycle = {"status": _string(manifest.get("status"))}
@@ -238,7 +297,9 @@ class TraceIndex:
             artifacts=trace.get("artifacts") if isinstance(trace.get("artifacts"), list) else (),
             nodes=nodes,
             edges=edges,
+            traversal_edges=traversal_edges,
             aliases=aliases,
+            case_directory=path.parent.resolve(),
         )
 
     def summary(self) -> Mapping[str, object]:
@@ -297,6 +358,214 @@ class TraceIndex:
         payload["outgoing_edges"] = [_edge_to_dict(edge) for edge in self.edges if edge.source == node.ref]
         return payload
 
+    def neighbors(
+        self,
+        ref: str,
+        direction: str,
+        depth: int,
+        limit: int,
+    ) -> Mapping[str, object]:
+        """Return bounded eligible upstream or downstream recorded edges."""
+        if direction not in ("upstream", "downstream"):
+            raise ValueError("direction must be upstream or downstream")
+        if depth < 1:
+            raise ValueError("depth must be at least 1")
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        start_ref = self._canonical_node_ref(ref)
+        adjacency = self._upstream_edges if direction == "upstream" else self._downstream_edges
+        queue = deque([(start_ref, 0)])
+        visited = {start_ref}
+        edges = []
+        remaining = []
+
+        while queue:
+            current_ref, current_depth = queue.popleft()
+            if current_depth == depth:
+                continue
+            candidates = adjacency.get(current_ref, ())
+            for position, edge in enumerate(candidates):
+                if len(edges) == limit:
+                    remaining.extend(
+                        self._edge_neighbor(candidate, direction) for candidate in candidates[position:]
+                    )
+                    remaining.append(current_ref)
+                    remaining.extend(item[0] for item in queue)
+                    return self._neighbors_response(
+                        start_ref, direction, depth, limit, edges, remaining
+                    )
+                edges.append(_edge_to_dict(edge))
+                neighbor = self._edge_neighbor(edge, direction)
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                if current_depth + 1 < depth:
+                    queue.append((neighbor, current_depth + 1))
+                elif adjacency.get(neighbor):
+                    remaining.append(neighbor)
+
+        return self._neighbors_response(start_ref, direction, depth, limit, edges, remaining)
+
+    def backward_paths(
+        self,
+        start_ref: str,
+        max_depth: int,
+        limit: int,
+    ) -> Mapping[str, object]:
+        """Return bounded breadth-first paths over eligible recorded edges."""
+        if max_depth < 1:
+            raise ValueError("max_depth must be at least 1")
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        canonical_start = self._canonical_node_ref(start_ref)
+        queue = deque([((canonical_start,), ())])
+        paths = []
+        remaining = []
+
+        while queue and len(paths) < limit:
+            node_refs, path_edges = queue.popleft()
+            current_ref = node_refs[-1]
+            candidates = [
+                edge for edge in self._upstream_edges.get(current_ref, ()) if edge.source not in node_refs
+            ]
+            if len(path_edges) == max_depth:
+                paths.append(self._path_to_dict(node_refs, path_edges))
+                if candidates:
+                    remaining.append(current_ref)
+                continue
+            if not candidates:
+                paths.append(self._path_to_dict(node_refs, path_edges))
+                continue
+            for edge in candidates:
+                if len(queue) >= limit:
+                    remaining.append(edge.source)
+                    continue
+                queue.append((node_refs + (edge.source,), path_edges + (edge,)))
+
+        remaining.extend(node_refs[-1] for node_refs, _ in queue)
+        return {
+            "start_ref": canonical_start,
+            "paths": paths,
+            "limit": limit,
+            "max_depth": max_depth,
+            "truncated": bool(remaining),
+            "remaining_frontier_refs": self._unique_refs(remaining),
+        }
+
+    def artifact(self, artifact_id: str, max_chars: int) -> Mapping[str, object]:
+        """Hydrate one declared UTF-8 Artifact after verifying its SHA-256."""
+        if max_chars < 1:
+            raise ValueError("max_chars must be at least 1")
+        artifact = next(
+            (
+                _mapping(item)
+                for item in self.artifacts
+                if _string(_mapping(item).get("artifact_id")) == artifact_id
+            ),
+            None,
+        )
+        if artifact is None:
+            raise KeyError(artifact_id)
+        relative_path = _string(artifact.get("path"))
+        digest = self._sha256_digest(_string(artifact.get("hash")))
+        if not relative_path:
+            raise ArtifactIntegrityError("Artifact {0} has no declared path".format(artifact_id))
+        if not digest:
+            raise ArtifactIntegrityError("Artifact {0} has an invalid SHA-256 digest".format(artifact_id))
+
+        artifact_path = self._artifact_path(relative_path, artifact_id)
+        try:
+            content_bytes = artifact_path.read_bytes()
+        except OSError as error:
+            raise ArtifactIntegrityError("Artifact {0} is missing".format(artifact_id)) from error
+        observed_digest = hashlib.sha256(content_bytes).hexdigest()
+        if observed_digest != digest:
+            raise ArtifactIntegrityError("Artifact {0} hash mismatch".format(artifact_id))
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ArtifactIntegrityError("Artifact {0} is not UTF-8 text".format(artifact_id)) from error
+        return {
+            "artifact_id": artifact_id,
+            "path": relative_path,
+            "integrity": "verified",
+            "content_sha256": observed_digest,
+            "content": content[:max_chars],
+            "truncated": len(content) > max_chars,
+        }
+
+    def _canonical_node_ref(self, ref: str) -> str:
+        canonical_ref = self._aliases.get(ref, ref)
+        if canonical_ref not in self._nodes_by_ref:
+            raise KeyError(ref)
+        return canonical_ref
+
+    @staticmethod
+    def _edge_neighbor(edge: EdgeView, direction: str) -> str:
+        return edge.source if direction == "upstream" else edge.target
+
+    def _neighbors_response(
+        self,
+        ref: str,
+        direction: str,
+        depth: int,
+        limit: int,
+        edges: Sequence[Mapping[str, object]],
+        remaining: Sequence[str],
+    ) -> Mapping[str, object]:
+        remaining_refs = self._unique_refs(remaining)
+        return {
+            "ref": ref,
+            "direction": direction,
+            "depth": depth,
+            "limit": limit,
+            "edges": list(edges),
+            "truncated": bool(remaining_refs),
+            "remaining_frontier_refs": remaining_refs,
+        }
+
+    @staticmethod
+    def _path_to_dict(
+        node_refs: Sequence[str], edges: Sequence[EdgeView]
+    ) -> Mapping[str, object]:
+        return {
+            "node_refs": list(node_refs),
+            "edge_refs": [edge.ref for edge in edges],
+            "edges": [_edge_to_dict(edge) for edge in edges],
+        }
+
+    @staticmethod
+    def _unique_refs(refs: Sequence[str]) -> Sequence[str]:
+        return list(dict.fromkeys(ref for ref in refs if ref))
+
+    @staticmethod
+    def _sha256_digest(value: str) -> str:
+        if value.startswith("sha256:"):
+            value = value[len("sha256:") :]
+        if len(value) != 64 or any(character not in "0123456789abcdefABCDEF" for character in value):
+            return ""
+        return value.casefold()
+
+    def _artifact_path(self, declared_path: str, artifact_id: str) -> Path:
+        relative_path = Path(declared_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ArtifactIntegrityError("Artifact {0} path escapes the Trace case directory".format(artifact_id))
+        candidate = self._case_directory / relative_path
+        current = self._case_directory
+        for part in relative_path.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ArtifactIntegrityError("Artifact {0} path contains a symlink".format(artifact_id))
+        if not candidate.exists() or not candidate.is_file():
+            raise ArtifactIntegrityError("Artifact {0} is missing".format(artifact_id))
+        try:
+            candidate.resolve().relative_to(self._case_directory)
+        except ValueError as error:
+            raise ArtifactIntegrityError(
+                "Artifact {0} path escapes the Trace case directory".format(artifact_id)
+            ) from error
+        return candidate
+
 
 def _node_to_dict(node: NodeView) -> Mapping[str, object]:
     return {
@@ -320,6 +589,8 @@ def _edge_to_dict(edge: EdgeView) -> Mapping[str, object]:
         "relation": edge.relation,
         "eligible_for_attribution": edge.eligible_for_attribution,
         "evidence_refs": list(edge.evidence_refs),
+        "evidence_tier": edge.evidence_tier,
+        "derivation_method": edge.derivation_method,
     }
 
 
@@ -343,6 +614,21 @@ def _parser() -> argparse.ArgumentParser:
     node = commands.add_parser("node")
     node.add_argument("--trace", required=True, type=Path)
     node.add_argument("--ref", required=True)
+    neighbors = commands.add_parser("neighbors")
+    neighbors.add_argument("--trace", required=True, type=Path)
+    neighbors.add_argument("--ref", required=True)
+    neighbors.add_argument("--direction", choices=("upstream", "downstream"), required=True)
+    neighbors.add_argument("--depth", default=1, type=int)
+    neighbors.add_argument("--limit", default=50, type=int)
+    paths = commands.add_parser("paths")
+    paths.add_argument("--trace", required=True, type=Path)
+    paths.add_argument("--start", required=True)
+    paths.add_argument("--max-depth", default=8, type=int)
+    paths.add_argument("--limit", default=50, type=int)
+    artifact = commands.add_parser("artifact")
+    artifact.add_argument("--trace", required=True, type=Path)
+    artifact.add_argument("--id", required=True)
+    artifact.add_argument("--max-chars", default=20000, type=int)
     return parser
 
 
@@ -364,8 +650,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 limit=args.limit,
             )
             _write_json({"nodes": [_node_to_dict(node) for node in nodes], "limit": args.limit})
-        else:
+        elif args.command == "node":
             _write_json(index.node(args.ref))
+        elif args.command == "neighbors":
+            _write_json(index.neighbors(args.ref, args.direction, args.depth, args.limit))
+        elif args.command == "paths":
+            _write_json(index.backward_paths(args.start, args.max_depth, args.limit))
+        else:
+            _write_json(index.artifact(args.id, args.max_chars))
+    except ArtifactIntegrityError as error:
+        print(str(error), file=sys.stderr)
+        return 3
     except (TraceInputError, ValueError, KeyError) as error:
         print(str(error), file=sys.stderr)
         return 2
