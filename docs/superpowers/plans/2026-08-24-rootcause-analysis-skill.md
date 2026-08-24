@@ -6,7 +6,7 @@
 
 **Architecture:** Store one canonical Skill under `.claude/skills/rootcause-analysis`, which both Claude Code and this OpenCode fork discover. Keep semantic judgment in the Agent workflow and use a standalone Python standard-library helper only for deterministic, bounded, read-only Trace retrieval. Preserve the current attribution module unchanged.
 
-**Tech Stack:** Agent Skills Markdown/YAML, Python 3.9 standard library, `unittest`, Causal IR `trace.json`, Claude Code non-interactive pressure tests, Skill Creator validation through `uv` + PyYAML.
+**Tech Stack:** Agent Skills Markdown/YAML, Python 3.9 standard library, `unittest`, Causal IR `trace.json`, opaque evaluation bundles, Skill Creator validation through `uv` + PyYAML.
 
 **Spec:** `docs/superpowers/specs/2026-08-24-rootcause-analysis-skill-design.md`
 
@@ -20,11 +20,10 @@
 - Retrieval limits bound one query response, not semantic analysis depth or root-candidate count.
 - Every report conclusion and recommendation cites resolvable Trace evidence.
 - Recommendations are proposals only; the Skill never applies or validates a repair.
-- Scored forward runs require Docker or Podman filesystem isolation and an external Linux release OpenCode binary. A local process with an isolated cwd is smoke only and is never scored.
-- Agent-visible paths, prompts, and derived Trace identities use opaque per-run IDs. Only the evaluator retains fixture mappings, derivation provenance, `pressure/cases.json`, hidden outcomes, and `pressure/rubric.json`; none enter a container mount.
-- Scored trust roots require an explicitly digest-pinned `name@sha256:<64hex>` image, an expected release SHA-256, a complete supported Linux ELF64 header, architecture-matched platform, and a zero-exit forced-entrypoint `--version` preflight before any case.
-- Mount sources are strict resolved paths without comma/control characters or symlinks. Probe and Agent entrypoints are forced to `/bin/sh` and `/opt/opencode` respectively.
-- Provider secrets include recursively discovered sensitive leaves in `OPENCODE_CONFIG_CONTENT`; raw and encoded forms are removed from all host audit projections, and malformed scored JSON fails closed.
+- This repository prepares evaluation inputs only. It does not implement scored Provider-backed execution or accept execution credentials.
+- Agent-visible paths, prompts, and derived Trace identities use opaque per-run IDs. Only the evaluator retains fixture mappings, derivation provenance, `pressure/cases.json`, hidden outcomes, and `pressure/rubric.json`; none enter a bundle.
+- Scored bundles must be submitted to an existing trusted benchmark Harness or isolated execution service. Credential, filesystem, network, runtime cleanup, image attestation, and audit boundaries are independently owned by that service.
+- Local or repository-source Agent attempts are unscored smoke only and are not launched through a root-cause test helper.
 
 ## File Map
 
@@ -57,7 +56,6 @@
 - `tools/rootcause_skill_tests/pressure/cases.json`: questions and hidden expected outcomes for all forward-test fixtures.
 - `tools/rootcause_skill_tests/pressure/rubric.json`: machine-readable forward-test rubric.
 - `tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py`: evaluator-side builder for one selected Trace, its verified Artifacts, the canonical Skill, and runtime-specific prompts.
-- `tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`: explicit smoke/scored runner; scored mode mounts one opaque workspace and one external Linux release binary into Docker or Podman.
 - `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-baseline.md`: observed pre-Skill behavior.
 - `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md`: post-Skill comparison and remaining limitations.
 - `README.md`: invocation, inputs, outputs, and analysis-only boundary.
@@ -643,19 +641,16 @@ git commit -m "feat(skill): define evidence-linked root cause reports"
 
 ---
 
-### Task 6: Document Usage And Forward-Test The Skill
+### Task 6: Document Usage And Prepare Evaluation Handoffs
 
 **Files:**
 - Modify: `README.md`
 - Create: `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md`
 - Modify: `tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py`
-- Create: `tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`
-- Modify: `.claude/skills/rootcause-analysis/SKILL.md` only if forward testing exposes a transferable reasoning gap.
-- Modify: `.claude/skills/rootcause-analysis/references/*.md` only if forward testing exposes a transferable reasoning gap.
 
 **Interfaces:**
 - Consumes: completed Skill, pressure fixtures, and rubric.
-- Produces: user-facing invocation instructions and evidence that the Skill improves known-root analysis without inventing an ambiguous root.
+- Produces: user-facing invocation instructions and seven opaque, integrity-valid bundles for an external trusted benchmark Harness.
 
 - [ ] **Step 1: Add README usage without reviving the old attribution CLI**
 
@@ -694,7 +689,7 @@ uv run --with pyyaml \
 git diff --check
 ```
 
-- [ ] **Step 3: Build isolated workspaces and run GREEN forward tests**
+- [ ] **Step 3: Build isolated workspaces for trusted-Harness submission**
 
 The evaluator builds each opaque workspace before launching an Agent. The workspace
 contains only the selected finalized Trace and verified Artifacts, the
@@ -703,58 +698,28 @@ rubric, hidden expected outcome, sibling fixture, report, Git history, or
 symlink back to the repository.
 
 ```bash
-FORWARD_ROOT=$(mktemp -d /tmp/rootcause-forward.XXXXXX)
+HANDOFF_ROOT=$(mktemp -d /tmp/rootcause-handoff.XXXXXX)
 OPAQUE_CASE_ID=$(python3 -c 'import uuid; print("case-" + uuid.uuid4().hex)')
-BUNDLE="$FORWARD_ROOT/$OPAQUE_CASE_ID"
+BUNDLE="$HANDOFF_ROOT/$OPAQUE_CASE_ID"
 python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
   --case known-root --opaque-case-id "$OPAQUE_CASE_ID" \
   --agent-trace-path /workspace/trace.json --destination "$BUNDLE" \
-  > "$FORWARD_ROOT/evaluator-provenance.json"
-
-(cd "$BUNDLE" && claude --bare -p \
-  --permission-mode plan \
-  --allowedTools "Read,Bash(python3 *)" < prompt-claude.md) \
-  > "$FORWARD_ROOT/known-root.claude.stdout" \
-  2> "$FORWARD_ROOT/known-root.claude.stderr"
+  > "$HANDOFF_ROOT/evaluator-provenance.json"
 ```
 
-The Claude cwd command above and local/source OpenCode execution are smoke only.
-They can validate Skill discovery and provider setup but cannot be scored.
-
-For scored OpenCode, use an external Linux release ELF and a working Docker or
-Podman filesystem sandbox. The runner mounts only the selected workspace at
-`/workspace` and the binary at `/opt/opencode`; repo, batch, audit, evaluator,
-workspace parent, sibling fixtures, and hidden mappings stay host-side:
-
-```bash
-export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
-export OPENCODE_SHA256='<trusted SHA-256 from the reviewed release SHA256SUMS>'
-export ROOTCAUSE_CONTAINER_IMAGE='registry.example/python@sha256:<64hex-digest>'
-python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
-  --mode scored --container-runtime docker \
-  --container-image "$ROOTCAUSE_CONTAINER_IMAGE" \
-  --opencode-sha256 "$OPENCODE_SHA256" \
-  --batch-root "$FORWARD_ROOT/opencode-run"
-```
-
-The image has no mutable default and must be an explicit `name@sha256:` trust
-root. Before building cases the runner checks the exact release hash, complete
-ELF64 little-endian header, supported x86_64/aarch64 architecture, and matching
-container platform. It then forces `--entrypoint /opt/opencode` for a secret-free
-`--version` preflight. Probe commands force `--entrypoint /bin/sh`; Agent commands
-force `/opt/opencode`. Any preflight nonzero exit or implausible version blocks
-all scored cases.
-The expected release hash must come from a separately reviewed release manifest;
-hashing the downloaded binary and reusing that value does not establish identity.
-
-Repeat all seven cases. `prepare_isolated_bundle.py` is the evaluator-side
+Repeat all seven cases. `prepare_isolated_bundle.py` is the sole evaluator-side
 boundary: it reads only each case's `fixture` and exact `question` from
 `pressure/cases.json` and never copies `expected` data. After Agent execution,
 the evaluator alone reads `cases.json` and `rubric.json` to score captured
-outputs outside all mounts. Agent-visible identity is opaque; fixture mapping,
-derived provenance, and rubric stay evaluator-only. Running the Bun source
-entry point, a host-native binary, or any process merely given an isolated cwd
-is permitted only as a Skill-discovery/provider smoke test and is not scored.
+outputs outside the submitted bundle. Agent-visible identity is opaque; fixture
+mapping, derived provenance, and rubric stay evaluator-only.
+
+Submit each bundle to an existing trusted benchmark Harness or isolated
+execution service. This repository does not implement credential injection,
+filesystem/network isolation, runtime cleanup, image attestation, process
+termination, or execution auditing. Those controls must be independently
+managed by the receiving Harness. Local or source-tree Agent execution is
+unscored smoke only and no repository helper accepts Provider secrets.
 
 - [ ] **Step 4: Evaluate results against the rubric**
 
@@ -767,10 +732,10 @@ the question-specific semantic introduction point rather than collapsing all
 outcomes into generic missing verification. Every run must remain
 analysis-only and produce structured recommendations.
 
-Record raw outcomes, passed rubric items, differences from baseline, and
-remaining gaps in `2026-08-24-rootcause-analysis-skill-results.md`. If an Agent
-fails, update only generalizable Skill guidance, rerun the same case, then run
-the other cases to detect overfitting.
+The external evaluator records raw outcomes, passed rubric items, differences
+from baseline, and remaining gaps. If an Agent fails, update only generalizable
+Skill guidance, rerun the same case through the trusted Harness, then run the
+other cases to detect overfitting.
 
 - [ ] **Step 5: Verify the analyzed fixtures were not changed**
 
@@ -803,4 +768,5 @@ git commit -m "docs(skill): explain and validate root cause analysis"
 - [ ] JSON and Markdown reports mutually reference the same evidence.
 - [ ] Recommendations are structured but never applied.
 - [ ] Full deterministic tests, Skill validation, `py_compile`, and `git diff --check` pass.
-- [ ] Forward-test limitations, provider failures, or unavailable OpenCode binaries are reported explicitly rather than hidden.
+- [ ] Seven opaque bundles pass integrity and hidden-answer audits before handoff.
+- [ ] Scored execution is delegated to a trusted benchmark Harness; this repository does not claim an execution trust boundary.

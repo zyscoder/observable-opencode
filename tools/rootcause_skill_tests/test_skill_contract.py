@@ -19,12 +19,12 @@ RAW_FORWARD_REPORT_PATH = (
     / "reports"
     / "2026-08-24-rootcause-analysis-skill-raw-attempts.md"
 )
-FORWARD_RUNNER_PATH = (
+FINAL_SCOPE_REPORT_PATH = (
     REPO_ROOT
-    / "tools"
-    / "rootcause_skill_tests"
-    / "pressure"
-    / "run_isolated_opencode.py"
+    / "docs"
+    / "superpowers"
+    / "reports"
+    / "2026-08-25-rootcause-analysis-skill-strategic-scope-correction.md"
 )
 DESIGN_PATH = (
     REPO_ROOT
@@ -193,63 +193,47 @@ class SkillContractTests(unittest.TestCase):
         ):
             self.assertNotIn("$rootcause-analysis", text, name)
 
-    def test_scored_forward_wrapper_requires_container_and_external_linux_binary(self):
-        self.assertTrue(FORWARD_RUNNER_PATH.is_file())
-        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
-        for phrase in (
-            "prepare_isolated_bundle.py",
-            '"OPENCODE_BIN"',
-            '"prompt-opencode.md"',
-            '"--mode"',
-            '"smoke"',
-            '"scored"',
-            '"docker"',
-            '"podman"',
-            '"/workspace"',
-            '"/opt/opencode"',
-            "build_scored_container_command",
-            "validate_linux_release_binary",
-            "validate_container_image",
-            '"--opencode-sha256"',
-            "build_scored_preflight_command",
-            "run_scored_preflight",
-            '"/bin/sh"',
-            '"--entrypoint"',
-        ):
-            self.assertIn(phrase, wrapper)
-        self.assertNotIn('"packages/opencode/src/index.ts"', wrapper)
-        self.assertNotIn('cwd=REPO', wrapper)
-        self.assertIn("unscored_smoke", wrapper)
-        self.assertIn("scored_pending_evaluator", wrapper)
-        self.assertIn("SANITIZED_PROVIDER_ENV", wrapper)
-        self.assertNotIn("DEFAULT_CONTAINER_IMAGE", wrapper)
-        self.assertIn(
-            "tools/rootcause_skill_tests/pressure/run_isolated_opencode.py",
-            self.raw_forward_report_text,
+    def test_scored_execution_is_delegated_to_a_trusted_external_harness(self):
+        self.assertTrue(FINAL_SCOPE_REPORT_PATH.is_file())
+        documents = {
+            "README": self.readme_text,
+            "plan": self.plan_text,
+            "results": (
+                REPO_ROOT
+                / "docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md"
+            ).read_text(encoding="utf-8"),
+            "scope report": FINAL_SCOPE_REPORT_PATH.read_text(encoding="utf-8"),
+        }
+        for name, text in documents.items():
+            self.assertRegex(text, r"(?i)trusted benchmark harness|可信.*benchmark harness", name)
+            self.assertRegex(text, r"(?i)does not implement|不实现|不承担", name)
+            for retired_api in (
+                "run_" + "isolated_opencode.py",
+                "--container-image",
+                "--opencode-sha256",
+                "ROOTCAUSE_FORWARD_BATCH_ROOT",
+            ):
+                self.assertNotIn(retired_api, text, name)
+
+    def test_no_active_or_historical_doc_references_the_retired_runner(self):
+        retired_name = "run_" + "isolated_opencode.py"
+        paths = [README_PATH, PLAN_PATH]
+        paths.extend(
+            sorted(
+                (REPO_ROOT / "docs/superpowers/reports").glob(
+                    "*rootcause-analysis-skill*.md"
+                )
+            )
         )
-        self.assertIn("unscored", self.raw_forward_report_text)
+        for path in paths:
+            self.assertNotIn(retired_name, path.read_text(encoding="utf-8"), str(path))
 
-    def test_scored_docs_require_pinned_image_release_hash_and_preflight(self):
-        for name, text in (
-            ("README", self.readme_text),
-            ("plan", self.plan_text),
-        ):
-            self.assertIn("name@sha256:", text, name)
-            self.assertIn("--opencode-sha256", text, name)
-            self.assertIn("--container-image", text, name)
-            self.assertRegex(text, r"(?i)preflight|预检", name)
-            self.assertRegex(text, r"(?i)entrypoint", name)
-
-    def test_docs_do_not_equate_cwd_isolation_with_scored_isolation(self):
-        for name, text in (
-            ("README", self.readme_text),
-            ("plan", self.plan_text),
-            ("results", (REPO_ROOT / "docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md").read_text(encoding="utf-8")),
-        ):
-            self.assertIn("Docker", text, name)
-            self.assertIn("Podman", text, name)
-            self.assertIn("Linux release", text, name)
-            self.assertRegex(text, r"(?i)cwd.{0,120}(smoke|不构成评分隔离)", name)
+    def test_historical_attempts_are_superseded_unscored_evidence_only(self):
+        text = self.raw_forward_report_text.lower()
+        self.assertIn("historical", text)
+        self.assertIn("unscored", text)
+        self.assertIn("superseded", text)
+        self.assertNotIn("provider secret", text)
 
     def test_readme_artifact_example_uses_discoverable_fixture_id(self):
         self.assertIn("artifact_refs", self.readme_text)
@@ -270,42 +254,6 @@ class SkillContractTests(unittest.TestCase):
             if isinstance(artifact, dict)
         }
         self.assertIn("build-requirement", artifact_ids)
-
-    def test_forward_wrapper_has_unique_or_explicit_batch_root(self):
-        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
-        compile(wrapper, str(RAW_FORWARD_REPORT_PATH), "exec")
-        self.assertIn('"--batch-root"', wrapper)
-        self.assertIn("ROOTCAUSE_FORWARD_BATCH_ROOT", wrapper)
-        self.assertIn("uuid.uuid4", wrapper)
-        self.assertIn("os.getpid", wrapper)
-        self.assertIn("exist_ok=False", wrapper)
-
-    def test_forward_wrapper_audits_safe_signal_delivery_and_cleanup(self):
-        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
-        for phrase in (
-            "process.poll()",
-            "except ProcessLookupError",
-            "except PermissionError",
-            '"signal_attempted"',
-            '"signal_sent"',
-            '"last_signal_sent"',
-            '"post_signal_returncode"',
-            '"final_cleanup"',
-        ):
-            self.assertIn(phrase, wrapper)
-        self.assertIn('"raw_returncode": raw_returncode', wrapper)
-
-    def test_forward_wrapper_records_case_errors_and_continues(self):
-        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
-        self.assertIn('"wrapper_error"', wrapper)
-        self.assertRegex(
-            wrapper,
-            re.compile(r"for fixture in selected_cases:.*?try:.*?run_case", re.DOTALL),
-        )
-        self.assertRegex(
-            wrapper,
-            re.compile(r"except Exception as error:.*?continue", re.DOTALL),
-        )
 
     def test_skill_preserves_the_required_workflow_order(self):
         steps = [

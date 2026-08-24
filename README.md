@@ -796,12 +796,13 @@ python3 "$TRACE_QUERY" artifact --trace "$TRACE" --id build-requirement --max-ch
 Trace，不修改 Agent、Harness、Skill、MCP、Tool、Prompt、模型配置、代码、构建环境、Trace 或
 原 Session，也不会把结论反馈给原 Agent。报告中的优化项仅是建议，必须由独立任务评审和实施。
 
-### Root-Cause Skill Forward Test
+### Root-Cause Skill 评估交接
 
-对 Skill 做效果评分时，不能直接从本仓库启动 Agent 并把仓库内 fixture 路径交给它，否则 Agent
-可能读取 `cases.json`、隐藏期望、rubric、其他 fixture 或 Git 历史，评分不具备隔离性。先由评估器
-构造单 case workspace。Agent 可见目录、prompt 和派生 Trace 只使用每轮新生成的 opaque ID；
-fixture 到 opaque ID 的映射、原始/派生摘要和隐藏 rubric 只保存在评估器侧：
+本仓库只负责生成评估输入，不实现 scored Provider-backed 执行，也不承担执行环境的信任边界。
+对 Skill 做效果评分时，不能直接把仓库内 fixture 路径交给 Agent，否则 Agent 可能读取
+`cases.json`、隐藏期望、rubric、其他 fixture 或 Git 历史。先由评估器构造单 case workspace。
+Agent 可见目录、prompt 和派生 Trace 只使用每轮新生成的 opaque ID；fixture 到 opaque ID 的
+映射、原始/派生摘要和隐藏 rubric 只保存在评估器侧：
 
 ```bash
 export FORWARD_ROOT=$(mktemp -d /tmp/rootcause-forward.XXXXXX)
@@ -818,73 +819,19 @@ python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
 规范 `.claude/skills/rootcause-analysis`，以及 `prompt-claude.md`、`prompt-opencode.md`。builder
 拒绝覆盖已有目录、symlink 越界、节点完整性错误和 Artifact 摘要不一致。它不会复制
 `cases.json`、`rubric.json`、隐藏 `expected`、fixture 语义标签、其他 fixture、reports 或 Git 历史。
-派生 Trace 只替换 manifest/scope 的运行身份并重算节点完整性，任务事实与用户问题保持原样。
+每个 canonical node 必须声明有效 `source_hash`；`--agent-trace-path` 必须是无控制字符、无 `..`
+的绝对 POSIX 路径。派生 Trace 只替换 manifest/scope 的运行身份并重算节点完整性，任务事实与
+用户问题保持原样。
 
-下面的 Claude Code cwd 方式只用于功能 smoke，不构成评分隔离，运行结果保存到 workspace 之外：
+把 opaque workspace 提交给组织现有的 **可信 benchmark Harness / 隔离执行服务**。该外部系统
+必须独立管理认证凭据、文件系统与网络隔离、运行时清理、镜像或执行环境证明、输出审计及超时终止；
+这些能力不由本仓库实现或声明。本仓库也不提供任何接收 Provider secret、启动 Agent 或包装本地
+源码执行的 root-cause 测试 helper。Harness 完成执行后，只有评估器可以在 Agent workspace 之外
+读取 provenance、`pressure/cases.json` 和 `pressure/rubric.json` 并评分。
 
-```bash
-(cd "$FORWARD_ROOT/$OPAQUE_CASE_ID" && claude --bare -p \
-  --permission-mode plan \
-  --allowedTools "Read,Bash(python3 *)" < prompt-claude.md) \
-  > "$FORWARD_ROOT/claude.stdout" \
-  2> "$FORWARD_ROOT/claude.stderr"
-```
-
-runner 有两个明确模式：`smoke` 可使用本机或源码构建，仅验证发现、provider 和执行链，永不计分；
-`scored` 必须同时具备可工作的 Docker 或 Podman 文件系统沙箱，以及外部 Linux release
-`OPENCODE_BIN`（ELF64）。macOS binary、本仓库 source build、仅切换 cwd 均会被拒绝为评分输入。
-
-Smoke 示例：
-
-```bash
-export OPENCODE_BIN=/absolute/path/to/local/opencode
-python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
-  --mode smoke --case known-root \
-  --batch-root "$FORWARD_ROOT/smoke"
-```
-
-Scored 示例。模型和 provider 配置通过正常环境变量或 `OPENCODE_CONFIG_CONTENT` 提供，不写入
-case workspace；secret 值不写入命令或 audit：
-
-```bash
-export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
-export OPENCODE_SHA256='<trusted SHA-256 from the reviewed release SHA256SUMS>'
-# 必须使用镜像仓库给出的不可变 digest；没有 mutable 默认镜像。
-export ROOTCAUSE_CONTAINER_IMAGE='registry.example/python@sha256:<64hex-digest>'
-python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
-  --mode scored --container-runtime docker \
-  --container-image "$ROOTCAUSE_CONTAINER_IMAGE" \
-  --opencode-sha256 "$OPENCODE_SHA256" \
-  --batch-root "$FORWARD_ROOT/scored"
-```
-
-`--container-image` 必须符合 `name@sha256:<64 个小写十六进制字符>`；tag-only、leading dash、
-控制字符和可变默认值都会被拒绝。runner 会计算 `OPENCODE_BIN` 的实际摘要并与
-`--opencode-sha256` 精确比对，然后验证完整 ELF64 little-endian header，只接受 Linux
-`x86_64` 或 `aarch64`，并自动选择匹配的 `linux/amd64` 或 `linux/arm64` 平台。
-`OPENCODE_SHA256` 必须来自已评审的 release manifest/`SHA256SUMS` 等独立可信来源；不要对
-当前下载文件现算摘要后直接把它当成“期望值”，那只能检查传输一致性，不能建立 release 身份。
-
-创建 case 前，runner 在不传入任何 provider secret 的环境中执行容器预检：固定
-`--entrypoint /opt/opencode` 并运行 `--version`，要求进程自行以 `0` 退出且产生可信版本文本。
-预检审计只保存 release SHA-256、架构、平台、镜像 digest 和版本，不保存 binary 路径或 secret。
-canary/probe 强制 `--entrypoint /bin/sh`，正式 Agent 强制 `--entrypoint /opt/opencode`，不采用
-镜像自身的 mutable entrypoint。
-
-Scored 容器只 bind mount 当前 opaque workspace 到 `/workspace`、Linux binary 到
-`/opt/opencode`，不会 mount workspace 的父目录、兄弟 case、repo、batch、audit 或 evaluator 数据。
-两个 mount source 必须是绝对且已经严格解析的真实目录/文件；包含逗号、换行、控制字符、
-symlink 或非规范路径都会在构造容器命令前被拒绝。
-runner 先执行 canary 探针，确认这些路径在容器内不可见；容器只接收白名单 provider 环境变量名。
-`OPENCODE_CONFIG_CONTENT` 会被递归解析；`apiKey`、`token`、`password`、`secret`、
-`authorization`、`credential` 等规范化敏感键下的叶子值，与 API key/provider secret 环境变量
-一起形成脱敏材料。原文、JSON escaped、URL percent/plus encoded、slash escaped 等常见序列化
-形式都会从 stdout、stderr、error 和最终 audit 中移除；scored 模式遇到不可解析 JSON 会 fail
-closed。该处理只作用于宿主机审计投影，不改变传给 OpenCode 的原始环境。
-`results.jsonl` 留在宿主机 batch 目录且不在任何
-mount 中。Agent 退出后，只有评估器在容器外读取
-`pressure/cases.json`、fixture-to-opaque 映射和 `pressure/rubric.json`。本地 cwd 隔离只是 smoke，
-不构成 scored filesystem isolation。
+人工直接运行 Claude/OpenCode 或从本仓库源码启动 Agent，只能作为 Skill 发现、Prompt 可读性等
+**unscored smoke** 检查，不能作为评分结果，也不能通过本仓库的 bundle helper 传入 Provider
+凭据。执行、凭据注入和日志审计应完全留在既有可信 Harness 中。
 
 ## 使用离线归因 CLI
 

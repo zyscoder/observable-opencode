@@ -7,7 +7,7 @@ import json
 import re
 import shutil
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -65,6 +65,17 @@ def relative_artifact_path(value):
     return path
 
 
+def validate_agent_trace_path(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError("Agent Trace path must be a non-empty absolute POSIX path")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("Agent Trace path must not contain control characters")
+    path = PurePosixPath(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("Agent Trace path must be an absolute contained POSIX path")
+    return str(path)
+
+
 def regular_file(source, relative, label):
     root = source.resolve(strict=True)
     if source.is_symlink():
@@ -114,7 +125,7 @@ def validate_trace(trace, case):
         if declared_payload != canonical_hash(node.get("payload")):
             raise ValueError(f"Node payload digest mismatch: {node.get('node_id')}")
         declared_source = integrity.get("source_hash")
-        if declared_source is not None and declared_source != source_hash(node):
+        if not isinstance(declared_source, str) or declared_source != source_hash(node):
             raise ValueError(f"Node source digest mismatch: {node.get('node_id')}")
 
 
@@ -195,6 +206,7 @@ def prepare(case, destination, opaque_case_id=None, agent_trace_path="/workspace
     opaque_case_id = opaque_case_id or f"case-{uuid.uuid4().hex}"
     if not OPAQUE_CASE_PATTERN.fullmatch(opaque_case_id):
         raise ValueError("Opaque case ID must match case-<32 lowercase hex characters>")
+    agent_trace_path = validate_agent_trace_path(agent_trace_path)
     destination = destination.resolve(strict=False)
     if destination.name != opaque_case_id:
         raise ValueError("Agent-visible destination basename must equal the opaque case ID")
