@@ -175,7 +175,7 @@ OpenCode 会依次加载并合并全局配置目录（通常为 `~/.config/openc
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "{env:MODEL}",
+  "model": "compatible/{env:MODEL}",
   "provider": {
     "compatible": {
       "npm": "@ai-sdk/openai-compatible",
@@ -207,6 +207,28 @@ export MODEL="<provider-model-id>"
 export URL="https://<openai-compatible-host>/v1"
 export APIKEY="<api-key>"
 ```
+
+在启动 OpenCode 前，建议先直接验证兼容接口。`URL` 是 Base URL，下面的命令会在其后
+追加 `/chat/completions`；因此常见服务应把 `URL` 配成以 `/v1` 结尾，而不是把完整
+`/v1/chat/completions` 写入 `URL`：
+
+```bash
+curl -sS --fail-with-body \
+  --connect-timeout 10 \
+  --max-time 120 \
+  -H "Authorization: Bearer $APIKEY" \
+  -H "Content-Type: application/json" \
+  "${URL%/}/chat/completions" \
+  --data "$(jq -nc --arg model "$MODEL" '{
+    model: $model,
+    messages: [{role: "user", content: "只回答数字：1+2等于多少？"}],
+    stream: false
+  }')" | jq .
+```
+
+应同时确认 HTTP 请求成功、响应中包含 assistant 消息、返回模型与 `$MODEL` 一致或符合网关
+映射。只得到 HTTP 200 并不等于模型配置正确；若响应不是预期答案，应先核对 `$URL` 是否缺少
+`/v1`、模型 ID 是否受网关支持，以及返回体中的错误或路由信息。
 
 企业网络无法稳定访问 `models.dev` 时，可关闭启动阶段的远程模型目录刷新。程序会使用
 编译进可执行文件的模型快照：
@@ -435,6 +457,36 @@ segment 顺序、session/run identity、continuation、状态和当前 generatio
 视图，但 runtime 不会把后续 run 追加到旧 flat journal。已有 `trace.html` 也不会被 runtime
 删除或更新，resume 或重新 finalization 后必须显式重新 render。
 
+### 长任务恢复操作
+
+长 session 不依赖进程内完整快照。运行时持续追加当前 segment journal，退出时只关闭
+segment；统一 `trace.json` 由独立 materializer 从所有 segment 重建。推荐按以下顺序处理：
+
+1. 正常退出、`Ctrl-C` 或 `SIGTERM` 后，先查看终端打印的 logical case directory 和
+   `trace.json` 路径。
+2. 如果有 `session.json` 和 `segments/*/records.jsonl`，但没有当前 generation 的
+   `trace.json`，执行 `observable-trace finalize <logical-case-dir>`。
+3. 如果进程因 OOM 或 `SIGKILL` 消失，使用原命令和 `opencode -s <session-id>
+   <project-dir>` 恢复 session。新进程会创建新 segment，旧 segment 保持只读并标记为
+   `interrupted_unfinalized`。
+4. 完成后再次执行 `finalize`，再用 `render` 生成供人工查看的 HTML。
+
+可用下面的命令快速检查 logical Trace 是否可恢复：
+
+```bash
+CASE_DIR="/data/evo-bench/traces/benchmark-case-001"
+
+jq '{logical_case_id, generation, segments}' "$CASE_DIR/session.json"
+find "$CASE_DIR/segments" -maxdepth 2 \
+  -type f \( -name segment.json -o -name records.jsonl \) -print
+./observable-trace-linux-x64 finalize "$CASE_DIR"
+jq '{case_id: .manifest.case_id, status: .manifest.status, records: (.records | length)}' \
+  "$CASE_DIR/trace.json"
+```
+
+`session.json` 与 segment journal 是恢复依据，不要手工合并、截断或移动其中的文件。若需要
+归档，应复制整个 logical case directory，确保 manifest、所有 segment 和 artifacts 一起保留。
+
 ## 离线渲染 Trace
 
 运行时不会生成 HTML。下载与 OpenCode runtime 相同平台后缀的
@@ -515,7 +567,7 @@ python -m trace_attribution \
 
 推荐先使用 CLI 默认候选预算：`max_nodes=48`、`max_frontier_items=96`、
 `max_hypotheses=24`、`max_investigation_rounds=12`、`max_judge_requests=128`。只有在报告
-明确显示预算耗尽时再扩大相应参数。`--judge-max-tokens` 默认是 `4096`；推理模型输出
+明确显示预算耗尽时再扩大相应参数。`--judge-max-tokens` 默认是 `8192`；推理模型输出
 较长 JSON 时可像上例提高，但需确认服务端支持该上限。
 
 `--question` 用于描述用户真正想定位的缺陷，例如：
@@ -568,7 +620,28 @@ message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程
 ├── case-001.message-lineage.json       # 离线重建的消息、上下文和数据流
 ├── case-001.judge-cache.jsonl          # 已完成的 LLM Judge 判断缓存
 └── case-001.checkpoint/                # 递归分析断点，用于中断续跑
+    ├── question-premise.json           # 用户问题前提判断及物理请求预留
+    ├── manifest.json                   # Trace、问题、模型、预算等兼容性绑定
+    ├── frontier.jsonl                  # 待分析/已分析节点
+    ├── hypotheses.jsonl                # 多假设状态
+    ├── investigation-actions.jsonl     # Judge、确认、预算和 Provider 生命周期
+    ├── commit.json                     # 三类 journal 的一致提交点
+    └── output-commit.json              # JSON 与 lineage 的原子发布状态
 ```
+
+`--question` 首先经过独立的 premise gate，判断 Trace 是否支持“用户描述的偏差确实发生”。该结果
+会在首次 Provider 请求前以 `inflight` 预留写入 `question-premise.json`，成功后原子替换为完整
+assessment。这样，中断恢复不会重复调用 Provider，也不会把一次未可靠落盘的响应伪装成已完成
+判断。premise、递归归因和缺陷解释共同受 `--max-judge-requests` 的物理请求上限约束；报告中的
+`metadata.shared_judge_request_budget` 会分别列出三阶段的使用量。
+
+归因被 `Ctrl-C`、`SIGTERM`、网络超时或进程重启打断时，应使用**完全相同的命令**重跑，包括
+Trace、问题、模型、endpoint、预算、输出路径和 checkpoint 路径。CLI 会从已 fsync 的提交点恢复，
+不会重放已完成 Judge 请求。若改变问题、模型、预算或 Trace，应使用新的 `--out`、
+`--checkpoint-dir` 和 `--judge-cache`；不要删除旧 checkpoint 后覆盖原报告，以便保留审计链。
+
+旧的未完成 checkpoint 如果没有无损保存 premise，会明确拒绝恢复，而不是重新询问模型并改变
+因果输入。此时请保留旧目录用于审计，并使用新的输出与 checkpoint 路径重新分析。
 
 `trace.html` 只用于人工查看 Agent 的原始执行流程，不承载归因结论。归因结果中的 Trace 引用
 可以回到同一 case 的 `trace.html` 或 `trace.json` 核验，但不要把 HTML 当作归因输入。

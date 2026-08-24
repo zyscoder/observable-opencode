@@ -389,6 +389,7 @@ journals plus transactional commit manifests under
 
 ```text
 case.attribution.checkpoint/
+  question-premise.json
   manifest.json
   commit.json
   frontier.jsonl
@@ -407,6 +408,15 @@ three members before atomically publishing `commit.json`, which anchors every co
 count and hash. Restore never combines uncommitted members from different snapshots. A deleted
 committed tail, mixed run ID, wrong head, interior corruption, reorder, hash-chain break, or stale
 configuration stops resume with an explicit error.
+
+`question-premise.json` is a checkpoint-bound sidecar for the user's defect premise. Its identity
+binds the effective Trace, normalized question, and selected question seed. Before the first premise
+Provider call, the analyzer atomically writes an `inflight` reservation under the same checkpoint
+lock used by recursive state. A completed assessment atomically replaces that reservation. On
+resume, an `inflight` premise remains an accounted unknown and is never sent to the Provider again;
+this preserves at-most-once physical execution without fabricating a response. A completed legacy
+checkpoint can migrate its recorded premise losslessly. An incomplete legacy checkpoint without a
+recorded premise fails closed and requires a new checkpoint path.
 
 A parseable final record without its newline is still treated as incomplete. Initialization
 durably repairs its delimiter only when the committed head proves its identity; otherwise it
@@ -449,6 +459,12 @@ again and is never treated as a fabricated success. A bounded Provider allowance
 reserved before crossing the Provider boundary. A completed call reconciles that reservation to
 the exact physical delta; an in-flight call keeps the reservation consumed and increments
 `metadata.judge_request_uncertainty_count`.
+
+`--max-judge-requests` is a service-wide physical request cap, not only a recursive-search budget.
+It covers premise verification, recursive attribution, and the final defect explanation. The
+report's `metadata.shared_judge_request_budget` exposes each stage's physical count, the total, and
+the remaining allowance. Every Provider boundary is checked against this shared cap, including
+explanation generation after a root has been confirmed.
 
 SIGINT and SIGTERM use the same graceful behavior. The handler only sets a stop flag and remains
 installed through output publication. At the next safe analysis boundary all journals are fsynced
