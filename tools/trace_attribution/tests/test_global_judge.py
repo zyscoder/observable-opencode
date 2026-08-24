@@ -1044,6 +1044,67 @@ class GlobalCandidateJudgeContractTest(unittest.TestCase):
                     for segment in path["segments"]
                 )
             )
+
+    def test_factual_context_does_not_require_full_capsule_to_fit_candidate_budget(self):
+        request = sample_request()
+        first = request.capsules[0]
+        path = (
+            first.candidate_ref,
+            *("record:long-path-{0:03d}".format(index) for index in range(120)),
+            request.seed_ref,
+        )
+        path_references = tuple(
+            {
+                "raw_ref": ref,
+                "resolved_ref": ref,
+                "canonical_ref": ref,
+                "resolution_status": "resolved",
+            }
+            for ref in path
+        )
+        causal_edges = tuple(
+            {
+                "from_ref": source,
+                "to_ref": target,
+                "relation": "decision_guided_change",
+                "evidence_type": "confirmed",
+                "eligible_for_attribution": True,
+                "edge_origin": "trace.dataflow_edges",
+            }
+            for source, target in zip(path, path[1:])
+        )
+        oversized = replace(
+            first,
+            downstream_path=path,
+            downstream_path_references=path_references,
+            causal_path_edges=causal_edges,
+            validation_source={
+                **dict(first.validation_source),
+                "downstream_path": path,
+            },
+            episode_facts={
+                **dict(first.episode_facts),
+                "grounded_hops": len(path) - 1,
+            },
+        )
+        enlarged_request = replace(
+            request,
+            capsules=(oversized, *request.capsules[1:]),
+        )
+
+        factual = global_judge_module._global_active_failure_factual_context(
+            enlarged_request
+        )
+
+        self.assertEqual(
+            factual["failure_signature"]["fingerprint"],
+            request.active_defect.fingerprint,
+        )
+        self.assertEqual(len(factual["tiered_paths"]), 2)
+        self.assertEqual(
+            factual["tiered_paths"][0]["path_refs"],
+            list(path),
+        )
         serialized = stable_json(factual).lower()
         self.assertNotIn("human_root", serialized)
         self.assertNotIn("ground_truth_root", serialized)

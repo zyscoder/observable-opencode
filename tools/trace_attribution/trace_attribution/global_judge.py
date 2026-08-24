@@ -44,7 +44,6 @@ from .restoration_obligation import RestorationObligation
 
 GLOBAL_JUDGE_CANDIDATE_CAPSULE_MAX_BYTES = 8192
 GLOBAL_JUDGE_CONTEXT_CAPSULE_MAX_BYTES = 4096
-GLOBAL_JUDGE_FACTUAL_CAPSULE_MAX_BYTES = 8192
 GLOBAL_CANDIDATE_PROMPT_SCHEMA_VERSION = GLOBAL_CANDIDATE_JUDGMENT_SCHEMA_VERSION
 GLOBAL_JUDGE_DIAGNOSTICS_SCHEMA = "global-judge-diagnostics/v1"
 GLOBAL_JUDGE_PROMPT_PROJECTION_SCHEMA = "global-judge-prompt-projection/v2"
@@ -322,10 +321,7 @@ def _global_active_failure_factual_context(
     entries = []
     competitors = []
     for capsule in request.capsules:
-        payload = capsule.compact_judge_dict(
-            max_bytes=GLOBAL_JUDGE_FACTUAL_CAPSULE_MAX_BYTES
-        )
-        candidate = payload.get("candidate")
+        candidate = _thaw(capsule.candidate)
         node = (
             candidate.get("node")
             if isinstance(candidate, Mapping)
@@ -336,11 +332,10 @@ def _global_active_failure_factual_context(
                 "candidate_ref": capsule.candidate_ref,
                 "candidate_node": node,
                 "path_refs": list(capsule.downstream_path),
-                "path_references": payload.get(
-                    "downstream_path_references"
-                )
-                or (),
-                "edges": payload.get("causal_path_edges") or (),
+                "path_references": _thaw(
+                    capsule.downstream_path_references
+                ),
+                "edges": _thaw(capsule.causal_path_edges),
             }
         )
         competitors.append(

@@ -77,8 +77,11 @@ opencode /data/repos/target-project
 `compatible/$MODEL`。`URL` 必须填写服务实际要求的 Base URL；如果接口路径是
 `/v1/chat/completions`，通常应以 `/v1` 结尾。
 
-在 TUI 中完成提问后正常退出。终端会打印本次 root session 的 `trace.json` 和
-`partial/latest.json` 路径。HTML 仅由独立 renderer 在离线时生成。HTTP benchmark 使用方式见
+在 TUI 中完成提问后正常退出。程序会尝试关闭当前 segment、离线合并全部 segment，并在成功时
+打印本次 root session 的 `trace.json` 和 `partial/latest.json` 路径。如果目录中暂时只有
+`session.json` 和 `segments/`，原始 Trace 并未丢失，需要使用独立的 `observable-trace finalize`
+发布统一 `trace.json`。完整命令见[从 Segment 生成 Trace](#从-segment-生成-trace)。HTML 仅由
+独立 renderer 离线生成。HTTP benchmark 使用方式见
 [启动 HTTP Server 并记录 Trace](#启动-http-server-并记录-trace)，离线分析方式见
 [使用离线归因 CLI](#使用离线归因-cli)。
 
@@ -129,7 +132,9 @@ if [ -n "$CURRENT_OPENCODE" ]; then
   cp "$CURRENT_OPENCODE" "${CURRENT_OPENCODE}.backup.$(date +%Y%m%d%H%M%S)"
 fi
 sudo install -m 755 opencode-observable-linux-x64 /usr/local/bin/opencode
+sudo install -m 755 observable-trace-linux-x64 /usr/local/bin/observable-trace
 opencode --version
+command -v observable-trace
 ```
 
 macOS 校验可执行：
@@ -150,10 +155,18 @@ chmod +x "$TRACE_ASSET"
 ./"$ASSET" --version
 ```
 
+如需全局调用 renderer：
+
+```bash
+sudo install -m 755 observable-trace-darwin-arm64 /usr/local/bin/observable-trace
+command -v observable-trace
+```
+
 如果 macOS 阻止运行从浏览器下载的二进制，可在确认校验和及来源后移除隔离属性：
 
 ```bash
 xattr -d com.apple.quarantine opencode-observable-darwin-arm64
+xattr -d com.apple.quarantine observable-trace-darwin-arm64
 ```
 
 ## 配置模型与 Provider
@@ -411,111 +424,288 @@ HTTP server 与 TUI 使用同一 logical-root/immutable-segment 格式。删除 
 segment evidence 恢复。自动发布失败不会改变 HTTP response 或 session 数据，可在 server 外部
 用同一个 `observable-trace finalize <logical-case-dir>` 命令重试。
 
-## Trace 目录
+## 从 Segment 生成 Trace
 
-一个 root session 对应一个 logical Trace directory；同一 session 的每个 process lifetime
-写入一个新的 segment。一个进程仍可因 `/new`、多个 HTTP root session 或 process-level
-事件生成多个 logical roots。以 `benchmark-case-001` 为例：
+Observable OpenCode 与 Trace 工具承担不同职责：
+
+| 程序 | 职责 | 是否调用 Agent 或 LLM |
+| --- | --- | --- |
+| `opencode-observable-<platform>` | 运行 Agent，并持续把语义事实追加到当前 segment | 是 |
+| `observable-trace-<platform> finalize` | 合并 logical case 的全部 segment，发布统一 `trace.json` | 否 |
+| `observable-trace-<platform> render` | 从已有 Trace 生成供人查看的 `trace.html` | 否 |
+
+`segments/` 中的 journal 才是原始、持久化的事实记录。`trace.json` 是从这些事实重建出来的
+统一 Causal IR，也是离线归因模块的标准输入。因此，**只看到 `segments/` 和 `session.json`
+并不表示 Trace 丢失**，而是表示统一 Trace 尚未发布或需要重新发布。
+
+### 一次完整操作
+
+下面以 Linux x86_64 release 为例。macOS Apple Silicon 只需把 `TRACE_BIN` 换成
+`./observable-trace-darwin-arm64`，其他平台使用 Release 中相同平台后缀的资产。
+
+```bash
+TRACE_ROOT="/data/evo-bench/traces"
+TRACE_BIN="./observable-trace-linux-x64"
+
+# 1. 找到 logical case。每个有效 case 目录的根部都有 session.json。
+find "$TRACE_ROOT" -mindepth 2 -maxdepth 2 -name session.json -print
+
+# 2. 从上一步选择目标 session.json。不要选择 segments/<id> 目录。
+SESSION_FILE="<将上一步输出中的目标 session.json 完整路径填在这里>"
+CASE_DIR="${SESSION_FILE%/session.json}"
+
+# 3. 查看该 logical case 包含哪些 process-lifetime segments。
+jq '{logical_case_id, session_id, generation, segments}' "$SESSION_FILE"
+
+# 4. 从全部 segments 发布统一 Trace。重复执行是安全的。
+"$TRACE_BIN" finalize "$CASE_DIR"
+
+# 5. 验证正式归因输入已经生成。
+test -s "$CASE_DIR/trace.json"
+jq '{
+  case_id: .manifest.case_id,
+  status: .manifest.status,
+  session_generation: .manifest.session_generation,
+  segment_count: (.manifest.segments | length),
+  record_count: (.records | length),
+  edge_count: (.dataflow_edges | length)
+}' "$CASE_DIR/trace.json"
+
+# 6. 可选：生成人工查看页面。
+"$TRACE_BIN" render "$CASE_DIR"
+echo "$CASE_DIR/trace.html"
+```
+
+`finalize` 成功时会明确打印：
+
+```text
+completeness: complete
+trace: <logical-case-dir>/trace.json
+manifest: <logical-case-dir>/manifest.json
+partial: <logical-case-dir>/partial/latest.json
+```
+
+`completeness: incomplete` 表示仍成功生成了可查看、可分析的统一 Trace，但至少一个 segment
+没有完整 terminal record，例如进程曾被 `SIGKILL` 或 OOM 终止。此状态不能被当作一次正常
+完成的 Agent 执行，归因时也应保留该中断事实。
+
+### 如何确定 CASE_DIR
+
+`OPENCODE_CASE_TRACE_DIR` 是所有 Trace 的**根目录**，不是某个 case 的输入目录。
+`OPENCODE_CASE_ID` 是期望的 case 名称，但 `/new`、多个 HTTP root session、名称冲突和
+process-level 记录可能产生带 session/digest 后缀的 sibling directory：
 
 ```text
 /data/evo-bench/traces/
-├── benchmark-case-001/                               # first logical root
-├── benchmark-case-001--<session>--<digest>/          # another root session
-└── benchmark-case-001--process--<digest>/            # process-level root
+├── benchmark-case-001/
+│   ├── session.json                    # 一个 logical root
+│   └── segments/
+├── benchmark-case-001--ses_...--a1b2c3d4/
+│   ├── session.json                    # 另一个 logical root
+│   └── segments/
+└── benchmark-case-001--process--e5f6a7b8/
+    ├── session.json                    # process-level root
+    └── segments/
 ```
 
-新的 segmented logical root 布局如下：
+退出时打印的 `directory:` 是最可靠的 `CASE_DIR`。如果没有收到退出回执，可列出全部
+`session.json`，再根据 `session_id`、`logical_case_id` 和 segment 时间选择目标：
+
+```bash
+find "$TRACE_ROOT" -mindepth 2 -maxdepth 2 -name session.json -print \
+  | while IFS= read -r session_file; do
+      jq -r --arg directory "${session_file%/session.json}" \
+        '[$directory, .logical_case_id, .session_id, .generation,
+          (.segments[-1].started_at // "-")] | @tsv' "$session_file"
+    done
+```
+
+不要把 `OPENCODE_CASE_TRACE_DIR`、`segments/`、`segments/<segment-id>` 或某个
+`records.jsonl` 当作 `finalize` 的 `<case-dir>`。正确目录必须在根部直接包含 `session.json`。
+
+## Trace 目录结构
+
+### 采集中或尚未 finalize
+
+Agent 执行期间，看到下面的最小结构是正常现象：
 
 ```text
 <logical-case-dir>/
-├── session.json                       # atomic ordered segment manifest + generation
-├── segments/
-│   ├── <segment-id-1>/
-│   │   ├── segment.json               # immutable process-lifetime identity
-│   │   ├── records.jsonl              # authoritative append-only Causal IR journal
-│   │   ├── events.jsonl
-│   │   ├── raw-events.jsonl
-│   │   ├── index.sqlite               # private observer index
-│   │   └── artifacts/                 # immutable large semantic payloads
-│   └── <segment-id-2>/
-│       └── ...
-├── trace.json                         # generation-switched unified derived output
-├── provenance-trace.json              # derived compatibility projection
-├── legacy-trace.json                  # derived compatibility projection
-├── manifest.json                      # derived unified manifest
-├── partial/latest.json                # derived terminal/recovery view
-└── artifacts/                         # compatibility links/copies only
+├── session.json                        # segment 顺序、session identity 和 generation
+└── segments/
+    └── <segment-id>/
+        ├── segment.json                # 本次 process lifetime 的身份和状态
+        ├── records.jsonl               # 权威的 append-only Causal IR journal
+        ├── events.jsonl                # 兼容事件流
+        ├── raw-events.jsonl            # 原始兼容事件流
+        ├── index.sqlite                # observer 私有索引
+        └── artifacts/                  # 大文本、Tool 输出等语义载荷
 ```
 
-`records.jsonl` 与 segment artifacts 是 durable authority。`session.json` 使用原子替换记录
-segment 顺序、session/run identity、continuation、状态和当前 generation。root `trace.json`
-及相关文件只是一个 generation 的统一派生输出，可以在不改变任何 prior evidence 的情况下
-重建和替换。新的 segmented run 不会在 root 创建可变 `records.jsonl` alias。
+此时不要求存在 `trace.json`。运行时持续追加 segment，不在 Agent 进程内反复构造完整 Trace 或
+HTML，以避免长上下文 session 的内存和 I/O 开销。
 
-现有 flat root 仍作为 read-only legacy segment zero 支持：原有 root `records.jsonl`、
-`index.sqlite` 和 artifacts 保持原位且不被改写；renderer/materializer 可以读取它们并生成派生
-视图，但 runtime 不会把后续 run 追加到旧 flat journal。已有 `trace.html` 也不会被 runtime
-删除或更新，resume 或重新 finalization 后必须显式重新 render。
+### finalize 后
 
-### 长任务恢复操作
+`observable-trace finalize <case-dir>` 会从 `session.json` 指定顺序的所有 segment 重建并原子
+发布一个 generation：
 
-长 session 不依赖进程内完整快照。运行时持续追加当前 segment journal，退出时只关闭
-segment；统一 `trace.json` 由独立 materializer 从所有 segment 重建。推荐按以下顺序处理：
+```text
+<logical-case-dir>/
+├── session.json
+├── segments/                           # 原始证据，finalize 不改写
+├── .derived/                           # generation 管理，勿手工编辑
+├── trace.json                          # 统一 Causal IR；归因标准输入
+├── manifest.json                       # 本次统一发布的元数据
+├── partial/latest.json                 # 完整性、终态和恢复视图
+├── provenance-trace.json               # 兼容投影
+├── legacy-trace.json                   # 旧格式兼容投影
+└── artifacts/                          # 对 segment artifacts 的兼容访问
+```
 
-1. 正常退出、`Ctrl-C` 或 `SIGTERM` 后，先查看终端打印的 logical case directory 和
-   `trace.json` 路径。
-2. 如果有 `session.json` 和 `segments/*/records.jsonl`，但没有当前 generation 的
-   `trace.json`，执行 `observable-trace finalize <logical-case-dir>`。
-3. 如果进程因 OOM 或 `SIGKILL` 消失，使用原命令和 `opencode -s <session-id>
-   <project-dir>` 恢复 session。新进程会创建新 segment，旧 segment 保持只读并标记为
-   `interrupted_unfinalized`。
-4. 完成后再次执行 `finalize`，再用 `render` 生成供人工查看的 HTML。
+根部派生文件由 `.derived` 中的当前 generation 原子切换，具体是符号链接还是兼容副本属于实现
+细节。使用者应始终访问根部的 `trace.json`、`manifest.json` 和 `partial/latest.json`，不要直接
+绑定某个 `.derived/generations/<n>` 路径。
 
-可用下面的命令快速检查 logical Trace 是否可恢复：
+`records.jsonl` 与 segment artifacts 是 durable authority；`session.json` 是 ordered segment
+manifest；root `trace.json` 是可重建的统一派生输出。不要手工合并、截断或移动 segment 文件。
+归档时应复制整个 logical case directory，而不是只复制 `trace.json`。
+
+现有 flat root 仍作为只读 legacy segment zero 支持。原有 root `records.jsonl`、`index.sqlite`
+和 artifacts 不会被 runtime 改写；后续 continuation 会写入新 segment。
+
+## 使用 observable-trace 工具
+
+### finalize：正式发布 trace.json
+
+```text
+usage: observable-trace finalize <case-dir>
+```
+
+`finalize` 只接受 logical case directory。它会读取当前 `session.json.generation`，从每个
+ordered segment 的 valid journal prefix 重建统一 Trace，再原子发布 root derived outputs。
+如果 finalization 期间 session generation 持续变化，命令会拒绝发布并提示 session changed；
+应等待当前 Agent 请求结束或关闭 session 后重试。
+
+典型命令：
 
 ```bash
-CASE_DIR="/data/evo-bench/traces/benchmark-case-001"
-
-jq '{logical_case_id, generation, segments}' "$CASE_DIR/session.json"
-find "$CASE_DIR/segments" -maxdepth 2 \
-  -type f \( -name segment.json -o -name records.jsonl \) -print
-./observable-trace-linux-x64 finalize "$CASE_DIR"
-jq '{case_id: .manifest.case_id, status: .manifest.status, records: (.records | length)}' \
-  "$CASE_DIR/trace.json"
+"$TRACE_BIN" finalize "$CASE_DIR"
 ```
 
-`session.json` 与 segment journal 是恢复依据，不要手工合并、截断或移动其中的文件。若需要
-归档，应复制整个 logical case directory，确保 manifest、所有 segment 和 artifacts 一起保留。
+以下场景都可以重复执行 `finalize`：
 
-## 离线渲染 Trace
+- 自动 materialization 失败，只剩 `session.json` 和 `segments/`；
+- `SIGKILL`、OOM 或机器重启后恢复已有 journal；
+- 使用 `opencode -s <session-id>` 续跑，新增了 segment；
+- `trace.json` 的 `.manifest.session_generation` 落后于 `session.json.generation`；
+- 需要确认当前 root projection 与全部 segment 一致。
 
-运行时不会生成 HTML。下载与 OpenCode runtime 相同平台后缀的
-`observable-trace-<platform>`。自动 materialization 失败、SIGKILL recovery 或需要显式刷新
-root generation 时，先执行可重复的 manual finalization：
+### render：生成人工查看的 trace.html
+
+```text
+usage: observable-trace render <case-dir-or-file> [--output <path>]
+```
+
+推荐把 logical case directory 作为输入：
 
 ```bash
-./observable-trace-linux-x64 finalize /data/evo-bench/traces/benchmark-case-001
+"$TRACE_BIN" render "$CASE_DIR"
+"$TRACE_BIN" render "$CASE_DIR" --output "/data/evo-bench/reports/case-001.html"
 ```
 
-该命令从所有 ordered segments 的 valid journal prefix 原子重建 root derived outputs；失败可
-再次运行，且不会修改 segment evidence。随后生成 HTML：
+不指定 `--output` 时，默认生成 `<case-dir>/trace.html`。`render` 还接受 root
+`session.json`、root `trace.json` 和 legacy flat `records.jsonl`。
+
+如果 case directory 只有 `session.json` 和 `segments/`，或者 root `trace.json` 已落后于当前
+generation，`render` 会在临时目录进行一次**只读 materialization**，然后生成 HTML。这个便捷
+路径不会把 `trace.json` 发布回源 case directory。因此：
+
+- 只想临时查看执行过程，可以直接 `render "$CASE_DIR"`；
+- 需要运行归因、归档统一 Trace 或得到正式 `trace.json`，必须先执行 `finalize "$CASE_DIR"`；
+- runtime 不会生成或刷新 HTML；每次新增 segment 或重新 finalize 后，应重新执行 `render`。
+
+HTML 只用于人工查看主 Agent、Subagent、任务编排、上下文压缩、message 转换、LLM、
+Tool/Skill/MCP、文件变更、验证和最终回复之间的数据流。不要把 `trace.html`、
+`legacy-trace.json`、某个 physical segment 或 segment-local output 传给归因模块。
+
+## 退出、续跑与恢复
+
+| 场景 | Segment 是否保留 | 是否自动尝试 finalize | 使用者下一步 |
+| --- | --- | --- | --- |
+| TUI 正常退出 | 是 | 是 | 收到 Trace 回执后直接使用；没有 `trace.json` 时手动 `finalize` |
+| TUI `Ctrl-C` / `SIGINT` | 是 | 是 | 等待收尾和路径回执，不要连续强杀；必要时手动 `finalize` |
+| `SIGTERM` / `SIGHUP` | 是 | 是 | 状态可能为 `cancelled`，已有语义仍保留；检查并手动 `finalize` |
+| HTTP 删除 root session | 是 | 是 | 使用回执或在 server 外手动 `finalize` |
+| HTTP server 正常关闭 | 是 | 是 | 对所有可达 root 收尾；缺失派生文件时手动 `finalize` |
+| `SIGKILL` / OOM / 断电 | 已完整 append 的记录保留 | 不可能 | 恢复 session 或直接对已有 case 执行 `finalize` |
+| `opencode -s <session-id>` 续跑 | 旧 segment 只读，新建 segment | 退出时是 | 续跑完成后重新 `finalize` 和 `render` |
+
+`SIGKILL` 无法运行任何用户态 handler，因此不能承诺当场生成 `trace.json`。下次 continuation 或
+手动 finalization 会把没有 terminal record 的旧 segment 标记为 `interrupted_unfinalized`，并从
+valid journal prefix 恢复可用事实。
+
+使用同一 session 续跑：
 
 ```bash
-./observable-trace-linux-x64 render /data/evo-bench/traces/benchmark-case-001
+export OPENCODE_CASE_TRACE=1
+export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+export OPENCODE_CASE_ID="benchmark-case-001"
+
+opencode -s "<session-id>" /data/repos/target-project
 ```
 
-默认输出是 `<case-dir>/trace.html`；也可用 `--output <path>` 写到报告目录。renderer 接受
-logical case directory、root `session.json`、root `trace.json`，以及 read-only legacy flat
-directory/file。若 root derived output 缺失或 generation 已过期，renderer 会在临时目录进行
-read-only materialization，再把完整或 incomplete recovery 状态写入 HTML，不会更新 source
-root。包含 `interrupted_unfinalized` segment 的视图会明确标为 incomplete，不能当作成功完成的
-case。
+runtime 会定位已有 logical case directory，在 `segments/` 下创建新的 process-lifetime segment，
+并用 `continuation_of` 和统一 Trace 中的 `run.continuation` 连接前一 run。已有 journal、artifact、
+index 和 `segment.json` 不会被重新打开写入、截断或删除。
 
-生成的 HTML 只用于人工查看主 Agent、Subagent、任务编排、上下文压缩、message 多层转换、
-LLM、Tool/Skill/MCP、文件变更、验证和最终回复之间的数据流。归因输入只能是 logical root
-`trace.json` 或 logical case directory；不能使用某个 physical segment、segment-local output、
-`legacy-trace.json` 或 `trace.html`。以 directory 为输入的流程必须先 finalization 当前
-`session.json.generation`，再消费统一 root Trace。
+### 常见问题
+
+**目录中只有 `segments/` 和 `session.json`**
+
+这是未发布统一 Trace 的状态。先确认 Agent/session 已停止或当前请求已结束，然后执行：
+
+```bash
+"$TRACE_BIN" finalize "$CASE_DIR"
+```
+
+**`finalize` 报 expected session.json**
+
+传入了错误层级。`CASE_DIR` 必须直接包含 `session.json`，不能传 Trace 根目录、`segments/` 或
+单个 segment。
+
+**`finalize` 报 trace session changed repeatedly during materialization**
+
+Agent 仍在产生新 segment 或更新 manifest。等待请求完成、删除 HTTP root session 或正常关闭
+TUI/server 后重试。
+
+**已经有 `trace.html`，但没有 `trace.json`**
+
+说明 HTML 可能由 `render` 的临时只读 materialization 生成。HTML 不能用于归因；执行
+`finalize "$CASE_DIR"` 正式发布 root `trace.json`。
+
+**`trace.json` 已存在，但新增 session continuation 后内容没有更新**
+
+旧文件对应上一 generation。重新执行 `finalize`，随后重新执行 `render`。可用下面命令比较：
+
+```bash
+jq -r '.generation' "$CASE_DIR/session.json"
+jq -r '.manifest.session_generation' "$CASE_DIR/trace.json"
+```
+
+**如何判断 Trace 是否可用于归因**
+
+至少确认 root `trace.json` 存在、JSON 可解析，并且 generation 一致：
+
+```bash
+test -s "$CASE_DIR/trace.json"
+jq -e . "$CASE_DIR/trace.json" >/dev/null
+test "$(jq -r '.generation' "$CASE_DIR/session.json")" = \
+  "$(jq -r '.manifest.session_generation' "$CASE_DIR/trace.json")"
+```
+
+即使 generation 一致，`manifest.status=cancelled` 或 `completeness=incomplete` 仍表示执行曾被
+取消或中断。此类 Trace 包含有效证据，但分析结论必须考虑缺少正常终态的影响。
 
 ## 使用离线归因 CLI
 
@@ -536,11 +726,15 @@ export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
 export CLAUDE_MODEL="deepseek-v4-flash"
 export CLAUDE_TIMEOUT_SECONDS=3600
 
+# 必须是 finalize 后、根部直接包含 trace.json 的实际 logical case 目录。
+export CASE_DIR="/data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4"
+test -s "$CASE_DIR/trace.json"
+
 PYTHONPATH="$OBSERVABLE_OPENCODE_HOME/tools/trace_attribution" \
 python -m trace_attribution \
   --engine recursive-agentic \
   --fusion-mode retrieval-global \
-  --trace /data/evo-bench/traces/benchmark-case-001/trace.json \
+  --trace "$CASE_DIR/trace.json" \
   --question "为什么本次修改编译失败？" \
   --out /data/evo-bench/attribution/benchmark-case-001.json \
   --judge-timeout-sec 3600 \
@@ -576,9 +770,46 @@ python -m trace_attribution \
 - `为什么编译失败？`
 - `为什么最终回复没有给出正确的配置项？`
 - `为什么 Agent 计划调用 Subagent，但实际没有执行？`
+- `项目任务属于特性迁移，migration-consistency Skill 明确要求执行一致性校验，但本次没有调用。请判断要求是否进入模型上下文、Skill 是否被发现和暴露、权限与 Skill 工具是否可用、首次偏离发生在哪里，以及偏差属于 Skill 配置、权限、上下文还是 Agent 决策。`
 
 它与兼容参数 `--objective` 互斥。推荐使用 `recursive-agentic` 引擎执行
 “候选检索、递归后向污点、多假设回溯、独立根因确认”的融合流程。
+
+### Skill 调用遗漏归因
+
+新版本 Trace 会被动记录正式语义节点 `skill.catalog.exposed`，其中包括：
+
+- 各来源中发现的 Skill 候选、来源族和 `global/project/configured` 作用域；
+- frontmatter 解析失败、同名冲突，以及 OpenCode 原运行时最终选中的文件；
+- Agent 权限判断、实际暴露给模型的 Skill 名称和描述；
+- 当前请求是否向模型提供了 `skill` 工具；
+- catalog 节点到最终 `model_messages_built` 上下文的 Causal IR 数据流引用。
+
+归因模块不会仅凭“某个 Skill 没有调用”直接认定 Agent 有错。它会把用户请求、归因问题与
+Skill 描述做问题域匹配，得到 `expected_skill_names`，再按下面的生命周期检查首次缺席阶段：
+
+```text
+discovery -> selection -> exposure -> tool_availability -> invocation
+```
+
+结构化报告的离线问题投影中可查看：
+
+- `expected_action_projection.expected_skill_candidates`：为什么该 Skill 被视为预期动作候选；
+- `expected_action_projection.expected_skill_lifecycle`：发现、选中、暴露、权限、工具可用性和调用事实；
+- `expected_action_projection.execution_window_refs`：catalog 暴露后的 LLM 回合、实际工具选择、Subagent 和最终回复；
+- `first_absent_stage`：首次观察到动作缺席的边界；它只是定位事实，不是根因结论。
+
+如果 Skill 未发现或 frontmatter 解析失败，候选根因偏向 Skill 安装/配置；如果被权限过滤或
+`skill` 工具不可用，偏向权限或工具注册；如果 Skill 描述已随系统提示暴露、工具可用且调用仍
+缺席，归因 Judge 会继续后向检查暴露后的 LLM 决策、工具选择和退出节点，确认是 Agent 决策
+省略还是存在上游上下文影响。成功暴露 catalog 本身是契约/上下文证据，不能因为它靠近缺陷就
+直接当作 Agent 决策根因。
+
+只有 Skill 完整正文而 frontmatter `description` 没有写明触发条件时，Agent 在调用前无法看到
+正文中的“特性迁移必须调用”要求。此时 Trace 能确认“描述已暴露但触发契约不可见”，并把优化
+方向指向 Skill 描述设计；不能把未进入模型上下文的正文要求伪装成 Agent 已知事实。旧版本 Trace
+若没有 `skill.catalog.exposed`，归因会以 `question_premise_unknown` / `evidence_insufficient`
+结束，不会从普通 Tool 日志猜测 Skill 是否可用。
 
 归因 JSON 在普通报告之外增加：
 

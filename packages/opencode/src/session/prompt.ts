@@ -2141,8 +2141,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               })
             }
 
+            const skillTrace: SystemPrompt.SkillTraceContext | undefined = CaseTrace.isEnabled()
+              ? {
+                  session_id: sessionID,
+                  message_id: msg.id,
+                  step,
+                  provider_id: model.providerID,
+                  model_id: model.id,
+                  skill_tool_available: Boolean(tools.skill),
+                  source_refs: transformedContextNode ? [`context:${transformedContextNode.node_id}`] : undefined,
+                }
+              : undefined
             const [skills, env, instructions, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
+              sys.skills(agent, skillTrace),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               MessageV2.toModelMessagesEffect(msgs, model),
@@ -2183,7 +2194,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 ...(format.type === "json_schema" ? [{ name: "StructuredOutput.system_prompt" }] : []),
                 ...(isLastStep ? [{ name: "max_steps_guard" }] : []),
               ],
-              source_refs: transformedContextNode ? [`context:${transformedContextNode.node_id}`] : undefined,
+              source_refs: [
+                ...(transformedContextNode ? [`context:${transformedContextNode.node_id}`] : []),
+                ...(skillTrace?.catalog_node_ref ? [skillTrace.catalog_node_ref] : []),
+              ],
               metadata: {
                 raw_message_count: msgs.length,
                 model_message_count: modelMsgs.length,

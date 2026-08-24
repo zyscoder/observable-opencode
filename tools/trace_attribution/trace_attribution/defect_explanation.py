@@ -916,6 +916,21 @@ def _render_action(action: str) -> str:
 def _human_conclusion(
     evolution: Mapping[str, Any], report: Mapping[str, Any]
 ) -> str:
+    outcome = str(
+        report.get("analysis_outcome")
+        or evolution.get("analysis_outcome")
+        or "inconclusive"
+    )
+    if outcome == "inconclusive":
+        return str(
+            report.get("conclusion")
+            or "当前证据不足以确认用户所述偏差及其根因。"
+        )
+    if outcome == "no_defect":
+        return str(
+            report.get("conclusion")
+            or "现有 Trace 证据不支持用户所述偏差实际发生。"
+        )
     generation = _mapping(evolution.get("generation"))
     summary = str(evolution.get("summary") or "").strip()
     if generation.get("mode") == "llm_grounded_synthesis" and summary:
@@ -924,7 +939,7 @@ def _human_conclusion(
     actor = str(first.get("actor") or "相关组件").strip()
     action = str(first.get("action") or "首次作出了偏离期望的决定").strip()
     action = action.rstrip("。；; ")
-    if first:
+    if first.get("node_ref") or first.get("action"):
         expected = _render_action_sequence(
             evolution.get("expected_sequence") or ()
         ) or "既定要求"
@@ -939,6 +954,11 @@ def _human_conclusion(
 
 
 def _human_counterfactual(evolution: Mapping[str, Any]) -> str:
+    outcome = str(evolution.get("analysis_outcome") or "inconclusive")
+    if outcome == "inconclusive":
+        return "由于尚未确认首次偏离节点，当前不能形成有证据约束的反事实。"
+    if outcome == "no_defect":
+        return "现有证据未确认偏差发生，因此不需要构造缺陷修复反事实。"
     expected = _render_action_sequence(evolution.get("expected_sequence") or ())
     if expected:
         return "如果 Agent 在首次决策时遵循期望顺序（{0}），后续就不会把该顺序偏差落实为实际动作。".format(

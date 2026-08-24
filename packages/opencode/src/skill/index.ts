@@ -1,4 +1,5 @@
 import path from "path"
+import { createHash } from "crypto"
 import { pathToFileURL } from "url"
 import z from "zod"
 import { Effect, Layer, Context, Schema } from "effect"
@@ -16,6 +17,13 @@ import { Glob } from "@opencode-ai/core/util/glob"
 import * as Log from "@opencode-ai/core/util/log"
 import { Discovery } from "./discovery"
 import CUSTOMIZE_OPENCODE_SKILL_BODY from "./prompt/customize-opencode.md" with { type: "text" }
+import {
+  buildSkillCatalogSnapshot,
+  type SkillCatalogCandidate,
+  type SkillCatalogSnapshot,
+  type SkillSourceFamily,
+  type SkillSourceScope,
+} from "./catalog-observability"
 
 const log = Log.create({ service: "skill" })
 const CLAUDE_EXTERNAL_DIR = ".claude"
@@ -62,15 +70,22 @@ export const NameMismatchError = NamedError.create(
 type State = {
   skills: Record<string, Info>
   dirs: Set<string>
+  candidates: SkillCatalogCandidate[]
 }
 
 type DiscoveryState = {
-  matches: string[]
+  matches: SkillDiscoveryMatch[]
   dirs: string[]
 }
 
+type SkillDiscoveryMatch = {
+  path: string
+  source_family?: SkillSourceFamily
+  source_scope?: SkillSourceScope
+}
+
 type ScanState = {
-  matches: Set<string>
+  matches: Map<string, SkillDiscoveryMatch>
   dirs: Set<string>
 }
 
@@ -79,9 +94,11 @@ export interface Interface {
   readonly all: () => Effect.Effect<Info[]>
   readonly dirs: () => Effect.Effect<string[]>
   readonly available: (agent?: Agent.Info) => Effect.Effect<Info[]>
+  readonly catalog: () => Effect.Effect<SkillCatalogSnapshot>
 }
 
-const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.Interface) {
+const add = Effect.fnUntraced(function* (state: State, discovered: SkillDiscoveryMatch, bus: Bus.Interface) {
+  const match = discovered.path
   const md = yield* Effect.tryPromise({
     try: () => ConfigMarkdown.parse(match),
     catch: (err) => err,
@@ -94,6 +111,14 @@ const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.I
         const { Session } = yield* Effect.promise(() => import("@/session/session"))
         yield* bus.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() })
         log.error("failed to load skill", { skill: match, err })
+        state.candidates.push({
+          name: "",
+          location: match,
+          status: "parse_failed",
+          error: message,
+          source_family: discovered.source_family,
+          source_scope: discovered.source_scope,
+        })
         return undefined
       }),
     ),
@@ -102,7 +127,27 @@ const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.I
   if (!md) return
 
   const parsed = z.object({ name: z.string(), description: z.string().optional() }).safeParse(md.data)
-  if (!parsed.success) return
+  if (!parsed.success) {
+    state.candidates.push({
+      name: "",
+      location: match,
+      status: "parse_failed",
+      error: parsed.error.message,
+      source_family: discovered.source_family,
+      source_scope: discovered.source_scope,
+    })
+    return
+  }
+
+  state.candidates.push({
+    name: parsed.data.name,
+    description: parsed.data.description,
+    location: match,
+    status: "loaded",
+    content_hash: createHash("sha256").update(md.content).digest("hex"),
+    source_family: discovered.source_family,
+    source_scope: discovered.source_scope,
+  })
 
   if (state.skills[parsed.data.name]) {
     log.warn("duplicate skill name", {
@@ -125,7 +170,12 @@ const scan = Effect.fnUntraced(function* (
   state: ScanState,
   root: string,
   pattern: string,
-  opts?: { dot?: boolean; scope?: string },
+  opts?: {
+    dot?: boolean
+    scope?: string
+    source_family?: SkillSourceFamily
+    source_scope?: SkillSourceScope
+  },
 ) {
   const matches = yield* Effect.tryPromise({
     try: () =>
@@ -146,7 +196,13 @@ const scan = Effect.fnUntraced(function* (
   )
 
   for (const match of matches) {
-    state.matches.add(match)
+    if (!state.matches.has(match)) {
+      state.matches.set(match, {
+        path: match,
+        source_family: opts?.source_family,
+        source_scope: opts?.source_scope,
+      })
+    }
     state.dirs.add(path.dirname(match))
   }
 })
@@ -159,7 +215,7 @@ const discoverSkills = Effect.fnUntraced(function* (
   directory: string,
   worktree: string,
 ) {
-  const state: ScanState = { matches: new Set(), dirs: new Set() }
+  const state: ScanState = { matches: new Map(), dirs: new Set() }
 
   const externalDirs: string[] = []
   if (!Flag.OPENCODE_DISABLE_EXTERNAL_SKILLS) {
@@ -169,7 +225,12 @@ const discoverSkills = Effect.fnUntraced(function* (
     for (const dir of externalDirs) {
       const root = path.join(global.home, dir)
       if (!(yield* fsys.isDir(root))) continue
-      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "global" })
+      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, {
+        dot: true,
+        scope: "global",
+        source_family: dir === CLAUDE_EXTERNAL_DIR ? "claude" : "agents",
+        source_scope: "global",
+      })
     }
 
     const upDirs = yield* fsys
@@ -177,7 +238,13 @@ const discoverSkills = Effect.fnUntraced(function* (
       .pipe(Effect.catch(() => Effect.succeed([] as string[])))
 
     for (const root of upDirs) {
-      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, { dot: true, scope: "project" })
+      const normalized = root.replaceAll("\\", "/")
+      yield* scan(state, root, EXTERNAL_SKILL_PATTERN, {
+        dot: true,
+        scope: "project",
+        source_family: normalized.endsWith(`/${CLAUDE_EXTERNAL_DIR}`) ? "claude" : "agents",
+        source_scope: "project",
+      })
     }
   }
 
@@ -195,18 +262,24 @@ const discoverSkills = Effect.fnUntraced(function* (
       continue
     }
 
-    yield* scan(state, dir, SKILL_PATTERN)
+    yield* scan(state, dir, SKILL_PATTERN, {
+      source_family: "configured",
+      source_scope: "configured",
+    })
   }
 
   for (const url of cfg.skills?.urls ?? []) {
     const pulledDirs = yield* discovery.pull(url)
     for (const dir of pulledDirs) {
-      yield* scan(state, dir, SKILL_PATTERN)
+      yield* scan(state, dir, SKILL_PATTERN, {
+        source_family: "configured",
+        source_scope: "configured",
+      })
     }
   }
 
   return {
-    matches: Array.from(state.matches),
+    matches: Array.from(state.matches.values()),
     dirs: Array.from(state.dirs),
   }
 })
@@ -237,7 +310,7 @@ export const layer = Layer.effect(
     )
     const state = yield* InstanceState.make(
       Effect.fn("Skill.state")(function* () {
-        const s: State = { skills: {}, dirs: new Set() }
+        const s: State = { skills: {}, dirs: new Set(), candidates: [] }
         // Register the built-in skill BEFORE disk discovery so a user-disk
         // skill with the same name can override it.
         s.skills[CUSTOMIZE_OPENCODE_SKILL_NAME] = {
@@ -246,6 +319,13 @@ export const layer = Layer.effect(
           location: "<built-in>",
           content: CUSTOMIZE_OPENCODE_SKILL_BODY,
         }
+        s.candidates.push({
+          name: CUSTOMIZE_OPENCODE_SKILL_NAME,
+          description: CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION,
+          location: "<built-in>",
+          status: "loaded",
+          content_hash: createHash("sha256").update(CUSTOMIZE_OPENCODE_SKILL_BODY).digest("hex"),
+        })
         yield* loadSkills(s, yield* InstanceState.get(discovered), bus)
         return s
       }),
@@ -272,7 +352,15 @@ export const layer = Layer.effect(
       return list.filter((skill) => Permission.evaluate("skill", skill.name, agent.permission).action !== "deny")
     })
 
-    return Service.of({ get, all, dirs, available })
+    const catalog = Effect.fn("Skill.catalog")(function* () {
+      const s = yield* InstanceState.get(state)
+      return buildSkillCatalogSnapshot({
+        candidates: s.candidates,
+        selectedLocations: Object.fromEntries(Object.values(s.skills).map((item) => [item.name, item.location])),
+      })
+    })
+
+    return Service.of({ get, all, dirs, available, catalog })
   }),
 )
 

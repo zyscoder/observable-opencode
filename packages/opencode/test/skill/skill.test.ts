@@ -163,6 +163,63 @@ Just some content without YAML frontmatter.
     ),
   )
 
+  it.live("audits discovered candidates and preserves the existing duplicate winner", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Promise.all([
+              Bun.write(
+                path.join(dir, ".claude", "skills", "migration-check", "SKILL.md"),
+                `---
+name: migration-check
+description: Use for feature migration consistency checks.
+---
+
+# Claude migration check
+`,
+              ),
+              Bun.write(
+                path.join(dir, ".opencode", "skills", "migration-check", "SKILL.md"),
+                `---
+name: migration-check
+description: Validate feature migration consistency.
+---
+
+# OpenCode migration check
+`,
+              ),
+              Bun.write(
+                path.join(dir, ".opencode", "skills", "broken", "SKILL.md"),
+                `# Missing frontmatter
+`,
+              ),
+            ]),
+          )
+
+          const skill = yield* Skill.Service
+          const selected = (yield* skill.all()).find((item) => item.name === "migration-check")
+          const catalog = yield* skill.catalog()
+
+          expect(selected).toBeDefined()
+          expect(catalog.selected.find((item) => item.name === "migration-check")?.location).toBe(selected!.location)
+          expect(
+            catalog.candidates
+              .filter((item) => item.name === "migration-check")
+              .map((item) => item.source_family)
+              .toSorted(),
+          ).toEqual(["claude", "opencode"])
+          expect(catalog.conflicts.find((item) => item.name === "migration-check")?.selected_location).toBe(
+            selected!.location,
+          )
+          expect(catalog.parse_failures.map((item) => item.location)).toContain(
+            path.join(dir, ".opencode", "skills", "broken", "SKILL.md"),
+          )
+        }),
+      { git: true },
+    ),
+  )
+
   it.live("discovers skills without descriptions", () =>
     provideTmpdirInstance(
       (dir) =>
@@ -224,24 +281,27 @@ description: A skill in the .claude/skills directory.
 
   it.live("discovers global skills from ~/.claude/skills/ directory", () =>
     Effect.gen(function* () {
-      const tmp = yield* Effect.acquireRelease(
+      const project = yield* Effect.acquireRelease(
         Effect.promise(() => tmpdir({ git: true })),
         (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
       )
+      const home = process.env.OPENCODE_TEST_HOME!
+      const skillDir = path.join(home, ".claude", "skills", "global-test-skill")
 
-      yield* withHome(
-        tmp.path,
-        Effect.gen(function* () {
-          yield* Effect.promise(() => createGlobalSkill(tmp.path))
-          yield* Effect.gen(function* () {
+      yield* Effect.acquireUseRelease(
+        Effect.promise(() => createGlobalSkill(home)),
+        () =>
+          Effect.gen(function* () {
             const skill = yield* Skill.Service
             const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
             expect(list.length).toBe(1)
             expect(list[0].name).toBe("global-test-skill")
             expect(list[0].description).toBe("A global skill from ~/.claude/skills for testing.")
             expect(list[0].location).toContain(path.join(".claude", "skills", "global-test-skill", "SKILL.md"))
-          }).pipe(provideInstance(tmp.path))
-        }),
+            const catalog = yield* skill.catalog()
+            expect(catalog.candidates.find((item) => item.name === "global-test-skill")?.source_scope).toBe("global")
+          }).pipe(provideInstance(project.path)),
+        () => Effect.promise(() => fs.rm(skillDir, { recursive: true, force: true })),
       )
     }),
   )
@@ -280,6 +340,8 @@ description: A skill in the .agents/skills directory.
           const item = list.find((x) => x.name === "agent-skill")
           expect(item).toBeDefined()
           expect(item!.location).toContain(path.join(".agents", "skills", "agent-skill", "SKILL.md"))
+          const catalog = yield* skill.catalog()
+          expect(catalog.candidates.find((candidate) => candidate.name === "agent-skill")?.source_scope).toBe("project")
         }),
       { git: true },
     ),

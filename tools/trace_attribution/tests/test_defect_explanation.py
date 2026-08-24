@@ -846,6 +846,48 @@ class DefectExplanationTests(unittest.TestCase):
         self.assertEqual(transform["defect_after"], "absent")
         self.assertIn("resolveTools", transform["evidence_excerpt"])
 
+    def test_inconclusive_report_does_not_claim_a_first_deviation(self):
+        report = {
+            "case_id": "skill-omission",
+            "analysis_outcome": "inconclusive",
+            "conclusion": "现有证据不足以确认 Skill 遗漏的根因。",
+            "analysis_question": {
+                "question": "为什么迁移校验 Skill 没有调用？",
+                "premise_assessment": {
+                    "status": "unknown",
+                    "expected_behavior": "迁移时调用一致性校验 Skill。",
+                    "alleged_actual_behavior": "没有观察到该 Skill 调用。",
+                    "deviation_type": "action_omission",
+                },
+            },
+            "confirmed_roots": [],
+            "causal_chain": [],
+            "unresolved_gaps": [
+                {"kind": "missing_evidence", "reason": "skill catalog 未记录"}
+            ],
+        }
+        graph = TraceGraph.from_trace(
+            {
+                "case_id": "skill-omission",
+                "records": [
+                    {
+                        "record_id": "request",
+                        "component": "user",
+                        "event_type": "message.input",
+                        "data": {"text": "这是一次特性迁移。"},
+                    }
+                ],
+            }
+        )
+
+        evolution = service.build_defect_evolution(report, graph)
+        markdown = service.render_defect_explanation_markdown(report, evolution)
+
+        self.assertIn("现有证据不足以确认 Skill 遗漏的根因", markdown)
+        self.assertIn("首次偏离：当前证据不足以定位", markdown)
+        self.assertNotIn("首次作出了偏离期望的决定", markdown)
+        self.assertNotIn("这一决定首次打破", markdown)
+
 
 class RecordingTransport:
     def __init__(self, payload: dict):

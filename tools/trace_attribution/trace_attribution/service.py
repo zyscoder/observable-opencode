@@ -39,6 +39,7 @@ from .defect_explanation import (
     synthesize_defect_evolution,
 )
 from .errors import AttributionInputError
+from .expected_action import build_expected_action_projection
 from .graph import TraceGraph, artifact_root_for_trace_path
 from .models import stable_json
 from .recursive_analyzer import AgenticRecursiveAnalyzer
@@ -141,14 +142,35 @@ def analyze(request: AttributionRequest) -> AttributionResult:
             request.start_refs,
             question=request.normalized_question,
         )
-        if premise_assessment["status"] == "contradicted":
-            report_payload = question_bound_output_payload(
+        expected_action_projection = graph.raw_trace.get(
+            "offline_question_projection", {}
+        )
+        expected_action_projection = (
+            expected_action_projection.get("expected_action_projection")
+            if isinstance(expected_action_projection, Mapping)
+            else None
+        )
+        if premise_assessment["status"] == "contradicted" or (
+            premise_assessment["status"] == "unknown"
+            and isinstance(expected_action_projection, Mapping)
+        ):
+            terminal_report = (
                 question_premise_no_defect_report(
                     case_id=graph.case_id,
                     objective=objective,
                     seed_ref=starts[0],
                     assessment=premise_assessment,
-                ),
+                )
+                if premise_assessment["status"] == "contradicted"
+                else question_premise_inconclusive_report(
+                    case_id=graph.case_id,
+                    objective=objective,
+                    seed_ref=starts[0],
+                    assessment=premise_assessment,
+                )
+            )
+            report_payload = question_bound_output_payload(
+                terminal_report,
                 graph,
                 binding=request.question_binding,
                 starts=starts,
@@ -158,12 +180,17 @@ def analyze(request: AttributionRequest) -> AttributionResult:
                 graph,
                 transport=(
                     transport
-                    if _remaining_judge_requests(
+                    if premise_assessment["status"] == "contradicted"
+                    else None
+                )
+                if (
+                    premise_assessment["status"] == "contradicted"
+                    and _remaining_judge_requests(
                         transport, options.max_judge_requests
                     )
                     > 0
-                    else None
-                ),
+                )
+                else None,
             )
             report_payload = _annotate_shared_judge_budget(
                 report_payload,
@@ -651,7 +678,15 @@ def bind_question_hypothesis(
         stable_json(trace).encode("utf-8")
     ).hexdigest()
     record_id = "offline_question_{0}".format(binding.question_id[:20])
-    source_refs = _question_evidence_refs(graph, binding.normalized)
+    expected_action = build_expected_action_projection(graph, binding.normalized)
+    scoped_refs = (
+        tuple(expected_action.get("evidence_refs") or ())
+        if isinstance(expected_action, Mapping)
+        else ()
+    )
+    source_refs = tuple(
+        dict.fromkeys((*scoped_refs, *_question_evidence_refs(graph, binding.normalized)))
+    )[:32]
     provenance = _question_revision_provenance(graph, source_refs)
     record = {
         "record_id": record_id,
@@ -678,6 +713,11 @@ def bind_question_hypothesis(
             "offline_only": True,
             "behavior_impact": "none_offline_analysis_only",
             "root_candidate_eligible": False,
+            **(
+                {"expected_action_projection": expected_action}
+                if expected_action is not None
+                else {}
+            ),
             **provenance,
         },
     }
@@ -693,6 +733,11 @@ def bind_question_hypothesis(
         "source_trace_sha256": source_trace_hash,
         "evidence_refs": list(source_refs),
         "analysis_mode": "offline_read_only",
+        **(
+            {"expected_action_projection": expected_action}
+            if expected_action is not None
+            else {}
+        ),
     }
     return TraceGraph.from_trace(
         trace,
@@ -738,6 +783,9 @@ def assess_question_premise(
                 "Judge only whether the question premise is true; do not perform root-cause attribution yet.",
                 "When status is supported, localize the recorded behavioral contract without assigning root cause: cite the contract source, the actual event sequence, and the earliest offered ref where behavior first diverges.",
                 "When an earlier reasoning or planning decision explicitly commits to the wrong order or action, use that decision as first_deviation_ref rather than the later tool call that merely materializes it.",
+                "When expected_action_projection is present, compare each expected Skill lifecycle stage in order: discovery, selection, exposure, tool availability, then invocation; first_absent_stage localizes the observed boundary but is not itself a root-cause verdict.",
+                "A Skill catalog node that proves successful exposure is contract/context evidence, not the first deviation for a later invocation omission; localize the first post-exposure LLM decision, tool choice, or exit that omitted the expected action.",
+                "If expected_skill_names is empty or the relevant catalog artifact is unavailable, return unknown instead of guessing which Skill was required.",
                 "Use only offered refs in evidence_refs and return one JSON object with no markdown.",
             ],
             "required_output": {
@@ -1131,6 +1179,50 @@ def question_premise_no_defect_report(
     }
 
 
+def question_premise_inconclusive_report(
+    *,
+    case_id: str,
+    objective: str,
+    seed_ref: str,
+    assessment: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": "causal-attribution-report/v1",
+        "case_id": case_id,
+        "objective": objective,
+        "analysis_outcome": "inconclusive",
+        "start_refs": [seed_ref],
+        "confirmed_roots": [],
+        "co_roots": [],
+        "root_causes": [],
+        "taint_paths": [],
+        "unresolved_refs": [],
+        "rejected_candidates": [],
+        "hypotheses": [],
+        "premise_assessment": _json_safe_copy(assessment),
+        "seed_results": [
+            {
+                "start_ref": seed_ref,
+                "outcome": "evidence_gap",
+                "blocking_reasons": ["question_premise_unknown"],
+                "missing_evidence": list(
+                    assessment.get("missing_evidence") or ()
+                ),
+                "decisive_evidence_refs": list(
+                    assessment.get("evidence_refs") or ()
+                ),
+                "confirmed_root_refs": [],
+                "candidate_refs": [],
+            }
+        ],
+        "metadata": {
+            "analysis_mode": "offline_read_only",
+            "termination_reason": "question_premise_unknown",
+            "judge_stage": "question_premise_assessment",
+        },
+    }
+
+
 def _question_evidence_refs(
     graph: TraceGraph, question: str, *, limit: int = 32
 ) -> tuple[str, ...]:
@@ -1264,6 +1356,12 @@ def question_bound_output_payload(
     selected_starts = tuple(starts)
     if binding is None:
         return payload
+    offline_projection = graph.raw_trace.get("offline_question_projection")
+    expected_action_projection = (
+        offline_projection.get("expected_action_projection")
+        if isinstance(offline_projection, Mapping)
+        else None
+    )
 
     payload.update(
         {
@@ -1280,6 +1378,15 @@ def question_bound_output_payload(
                 **(
                     {"premise_assessment": _recorded_premise_assessment(graph)}
                     if _recorded_premise_assessment(graph)
+                    else {}
+                ),
+                **(
+                    {
+                        "expected_action_projection": _json_safe_copy(
+                            expected_action_projection
+                        )
+                    }
+                    if isinstance(expected_action_projection, Mapping)
                     else {}
                 ),
             },

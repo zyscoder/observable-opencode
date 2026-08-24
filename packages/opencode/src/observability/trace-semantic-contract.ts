@@ -27,6 +27,7 @@ export const FORMAL_RECORD_TYPES = [
   "tool.result",
   "tool.error",
   "mcp.call",
+  "skill.catalog.exposed",
   "skill.load",
   "subagent.call",
   "loop.decision",
