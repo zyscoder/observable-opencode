@@ -29,22 +29,29 @@ Observed result:
 The wrapper is maintained at
 `tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`. `--mode smoke`
 runs locally and is never scored. `--mode scored` requires a Docker or Podman
-filesystem sandbox and an external Linux release ELF. It mounts only the
+filesystem sandbox, an external Linux release ELF with an expected SHA-256,
+and an explicitly digest-pinned image. It mounts only the
 current opaque workspace at `/workspace` and the binary at `/opt/opencode`.
 The Agent-visible workspace contains only the identity-sanitized finalized
 Trace, verified Artifacts, canonical `rootcause-analysis` Skill, and runtime
 prompts. Evaluator mappings and derived provenance remain in host audit data.
 
 Use `--opencode-bin` or `OPENCODE_BIN` to supply the executable. Scored mode
-also requires `--container-runtime docker|podman`; successful output remains
+also requires `--container-runtime docker|podman`, `--container-image`, and
+`--opencode-sha256`. A forced-entrypoint, provider-secret-free `--version`
+preflight must pass before cases; successful output remains
 `scored_pending_evaluator` until the host-side evaluator compares it with the
 hidden cases and rubric. Provider secrets are forwarded by whitelisted variable
 name and are not serialized into command audit.
 
 ```bash
 export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
+export OPENCODE_SHA256=<release-sha256>
+export ROOTCAUSE_CONTAINER_IMAGE='registry.example/python@sha256:<64hex-digest>'
 python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
   --mode scored --container-runtime docker \
+  --container-image "$ROOTCAUSE_CONTAINER_IMAGE" \
+  --opencode-sha256 "$OPENCODE_SHA256" \
   --batch-root /tmp/rootcause-forward-<unique>
 ```
 

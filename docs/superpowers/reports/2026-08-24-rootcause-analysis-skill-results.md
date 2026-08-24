@@ -21,7 +21,7 @@ no forward result or rubric score was fabricated.
 
 | Check | Result |
 | --- | --- |
-| Root-cause Skill fixture, query, and contract suite | PASS, 106/106 with 1 explicitly blocked integration skip |
+| Root-cause Skill fixture, query, and contract suite | PASS, 113 passed and 1 explicitly blocked integration skip (114 discovered) |
 | `trace_query.py` bytecode compilation | PASS |
 | Official `quick_validate.py` Skill validation | PASS, `Skill is valid!` |
 | Skill canonical-location discovery in current OpenCode source build | PASS |
@@ -106,13 +106,27 @@ host-side evaluator.
 
 An isolated cwd is only smoke isolation. The scored OpenCode protocol requires
 a working Docker or Podman filesystem sandbox and an external Linux release
-`OPENCODE_BIN`. The container receives exactly two read-only bind mounts: one
+`OPENCODE_BIN`. The image must be an explicit immutable
+`name@sha256:<64hex>` reference; the binary must match the evaluator-supplied
+SHA-256 and a complete supported ELF64 header. Its x86_64/aarch64 machine field
+selects the matching container platform. Before case creation, a secret-free
+forced `/opt/opencode` entrypoint must self-exit zero for `--version` and emit a
+plausible version. The preflight audit contains digest/version facts only.
+
+The Agent container receives exactly two read-only bind mounts: one
 opaque workspace at `/workspace` and the binary at `/opt/opencode`. It cannot
 see the workspace parent, siblings, repository, batch root, audit JSONL,
 evaluator mapping, or hidden rubric. Provider values are passed through an
-environment-name whitelist and secrets are never serialized into command audit.
-Any provider value echoed by child stdout/stderr is redacted only in the
-host-side audit projection; the child process receives the unchanged value.
+environment-name whitelist. Strict mount construction rejects relative,
+symlinked, noncanonical, comma-bearing, or control-character paths. Probe and
+Agent entrypoints are forced to `/bin/sh` and `/opt/opencode`.
+
+`OPENCODE_CONFIG_CONTENT` is parsed recursively for normalized sensitive keys.
+Secret leaf values and explicit provider secret environment values are expanded
+to raw, JSON/slash-escaped, URL percent/plus-encoded, and layered serialized
+forms. Child stdout/stderr, wrapper errors, and final audit JSONL are scrubbed;
+the child receives unchanged inputs. Malformed config fails closed in scored
+mode.
 
 Only the evaluator reads `pressure/cases.json` and `pressure/rubric.json` after
 execution. The builder extracts the exact `question` but never copies the
@@ -191,8 +205,10 @@ code.
 The current runner accepts `--batch-root` or
 `ROOTCAUSE_FORWARD_BATCH_ROOT`, otherwise creates a unique timestamp/PID/UUID
 root, and refuses to overwrite existing directories. It requires
-`--opencode-bin` or `OPENCODE_BIN`, builds each opaque workspace before
-launch, records signal attempts separately from successful operating-system
+`--opencode-bin` or `OPENCODE_BIN`, `--opencode-sha256`, and a pinned
+`--container-image`; it completes release verification and container preflight
+before building each opaque workspace. It records signal attempts separately
+from successful operating-system
 signal calls, records post-signal state and bounded final cleanup, and
 continues after per-case `wrapper_error`. The earlier one-second `known-root`
 spot check and all prior local cwd runs are smoke only and are not scored Agent
@@ -230,8 +246,9 @@ restraint, remain **not evaluated** rather than passed or failed.
 
 ## Remaining Validation
 
-After configuring a provider, a Linux release OpenCode binary, and an available
-Docker or Podman daemon, build all seven opaque workspaces, run them through
+After configuring a provider, a hash-verified Linux release OpenCode binary, a
+digest-pinned container image, and an available Docker or Podman daemon, build
+all seven opaque workspaces, run them through
 the scored container mode, and
 let only the external evaluator score the captured JSON and Markdown against
 `tools/rootcause_skill_tests/pressure/rubric.json`. The key acceptance checks

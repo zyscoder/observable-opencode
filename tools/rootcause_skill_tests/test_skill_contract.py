@@ -209,6 +209,12 @@ class SkillContractTests(unittest.TestCase):
             '"/opt/opencode"',
             "build_scored_container_command",
             "validate_linux_release_binary",
+            "validate_container_image",
+            '"--opencode-sha256"',
+            "build_scored_preflight_command",
+            "run_scored_preflight",
+            '"/bin/sh"',
+            '"--entrypoint"',
         ):
             self.assertIn(phrase, wrapper)
         self.assertNotIn('"packages/opencode/src/index.ts"', wrapper)
@@ -216,11 +222,23 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("unscored_smoke", wrapper)
         self.assertIn("scored_pending_evaluator", wrapper)
         self.assertIn("SANITIZED_PROVIDER_ENV", wrapper)
+        self.assertNotIn("DEFAULT_CONTAINER_IMAGE", wrapper)
         self.assertIn(
             "tools/rootcause_skill_tests/pressure/run_isolated_opencode.py",
             self.raw_forward_report_text,
         )
         self.assertIn("unscored", self.raw_forward_report_text)
+
+    def test_scored_docs_require_pinned_image_release_hash_and_preflight(self):
+        for name, text in (
+            ("README", self.readme_text),
+            ("plan", self.plan_text),
+        ):
+            self.assertIn("name@sha256:", text, name)
+            self.assertIn("--opencode-sha256", text, name)
+            self.assertIn("--container-image", text, name)
+            self.assertRegex(text, r"(?i)preflight|预检", name)
+            self.assertRegex(text, r"(?i)entrypoint", name)
 
     def test_docs_do_not_equate_cwd_isolation_with_scored_isolation(self):
         for name, text in (

@@ -22,6 +22,9 @@
 - Recommendations are proposals only; the Skill never applies or validates a repair.
 - Scored forward runs require Docker or Podman filesystem isolation and an external Linux release OpenCode binary. A local process with an isolated cwd is smoke only and is never scored.
 - Agent-visible paths, prompts, and derived Trace identities use opaque per-run IDs. Only the evaluator retains fixture mappings, derivation provenance, `pressure/cases.json`, hidden outcomes, and `pressure/rubric.json`; none enter a container mount.
+- Scored trust roots require an explicitly digest-pinned `name@sha256:<64hex>` image, an expected release SHA-256, a complete supported Linux ELF64 header, architecture-matched platform, and a zero-exit forced-entrypoint `--version` preflight before any case.
+- Mount sources are strict resolved paths without comma/control characters or symlinks. Probe and Agent entrypoints are forced to `/bin/sh` and `/opt/opencode` respectively.
+- Provider secrets include recursively discovered sensitive leaves in `OPENCODE_CONFIG_CONTENT`; raw and encoded forms are removed from all host audit projections, and malformed scored JSON fails closed.
 
 ## File Map
 
@@ -725,10 +728,24 @@ workspace parent, sibling fixtures, and hidden mappings stay host-side:
 
 ```bash
 export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
+export OPENCODE_SHA256='<trusted SHA-256 from the reviewed release SHA256SUMS>'
+export ROOTCAUSE_CONTAINER_IMAGE='registry.example/python@sha256:<64hex-digest>'
 python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
   --mode scored --container-runtime docker \
+  --container-image "$ROOTCAUSE_CONTAINER_IMAGE" \
+  --opencode-sha256 "$OPENCODE_SHA256" \
   --batch-root "$FORWARD_ROOT/opencode-run"
 ```
+
+The image has no mutable default and must be an explicit `name@sha256:` trust
+root. Before building cases the runner checks the exact release hash, complete
+ELF64 little-endian header, supported x86_64/aarch64 architecture, and matching
+container platform. It then forces `--entrypoint /opt/opencode` for a secret-free
+`--version` preflight. Probe commands force `--entrypoint /bin/sh`; Agent commands
+force `/opt/opencode`. Any preflight nonzero exit or implausible version blocks
+all scored cases.
+The expected release hash must come from a separately reviewed release manifest;
+hashing the downloaded binary and reusing that value does not establish identity.
 
 Repeat all seven cases. `prepare_isolated_bundle.py` is the evaluator-side
 boundary: it reads only each case's `fixture` and exact `question` from

@@ -66,3 +66,11 @@ Deterministic verification: 106/106 tests passed with one scored integration
 test explicitly skipped as BLOCKED by the inaccessible Docker daemon;
 `py_compile`, official Skill validation (`Skill is valid!`), fixture
 immutability, and `git diff --check` passed.
+
+## Superseded Security Details
+
+Fix B round 2 supersedes this report's simple ELF-magic and raw-string
+redaction guarantees. The current protocol requires a pinned image digest,
+expected release hash, full ELF64/architecture validation, forced entrypoints,
+secret-free version preflight, strict mount paths, and recursive multi-encoding
+secret redaction. See the round-2 report.

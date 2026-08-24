@@ -832,7 +832,7 @@ python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
 
 runner 有两个明确模式：`smoke` 可使用本机或源码构建，仅验证发现、provider 和执行链，永不计分；
 `scored` 必须同时具备可工作的 Docker 或 Podman 文件系统沙箱，以及外部 Linux release
-`OPENCODE_BIN`（ELF）。macOS binary、本仓库 source build、仅切换 cwd 均会被拒绝为评分输入。
+`OPENCODE_BIN`（ELF64）。macOS binary、本仓库 source build、仅切换 cwd 均会被拒绝为评分输入。
 
 Smoke 示例：
 
@@ -848,16 +848,40 @@ case workspace；secret 值不写入命令或 audit：
 
 ```bash
 export OPENCODE_BIN=/absolute/path/to/opencode-linux-x64
+export OPENCODE_SHA256='<trusted SHA-256 from the reviewed release SHA256SUMS>'
+# 必须使用镜像仓库给出的不可变 digest；没有 mutable 默认镜像。
+export ROOTCAUSE_CONTAINER_IMAGE='registry.example/python@sha256:<64hex-digest>'
 python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
   --mode scored --container-runtime docker \
+  --container-image "$ROOTCAUSE_CONTAINER_IMAGE" \
+  --opencode-sha256 "$OPENCODE_SHA256" \
   --batch-root "$FORWARD_ROOT/scored"
 ```
 
+`--container-image` 必须符合 `name@sha256:<64 个小写十六进制字符>`；tag-only、leading dash、
+控制字符和可变默认值都会被拒绝。runner 会计算 `OPENCODE_BIN` 的实际摘要并与
+`--opencode-sha256` 精确比对，然后验证完整 ELF64 little-endian header，只接受 Linux
+`x86_64` 或 `aarch64`，并自动选择匹配的 `linux/amd64` 或 `linux/arm64` 平台。
+`OPENCODE_SHA256` 必须来自已评审的 release manifest/`SHA256SUMS` 等独立可信来源；不要对
+当前下载文件现算摘要后直接把它当成“期望值”，那只能检查传输一致性，不能建立 release 身份。
+
+创建 case 前，runner 在不传入任何 provider secret 的环境中执行容器预检：固定
+`--entrypoint /opt/opencode` 并运行 `--version`，要求进程自行以 `0` 退出且产生可信版本文本。
+预检审计只保存 release SHA-256、架构、平台、镜像 digest 和版本，不保存 binary 路径或 secret。
+canary/probe 强制 `--entrypoint /bin/sh`，正式 Agent 强制 `--entrypoint /opt/opencode`，不采用
+镜像自身的 mutable entrypoint。
+
 Scored 容器只 bind mount 当前 opaque workspace 到 `/workspace`、Linux binary 到
 `/opt/opencode`，不会 mount workspace 的父目录、兄弟 case、repo、batch、audit 或 evaluator 数据。
+两个 mount source 必须是绝对且已经严格解析的真实目录/文件；包含逗号、换行、控制字符、
+symlink 或非规范路径都会在构造容器命令前被拒绝。
 runner 先执行 canary 探针，确认这些路径在容器内不可见；容器只接收白名单 provider 环境变量名。
-命令审计不包含变量值，stdout/stderr 中意外回显的 URL、API key 或 provider 配置也会在写盘前
-事后脱敏，不改变传给 OpenCode 的原始环境。`results.jsonl` 留在宿主机 batch 目录且不在任何
+`OPENCODE_CONFIG_CONTENT` 会被递归解析；`apiKey`、`token`、`password`、`secret`、
+`authorization`、`credential` 等规范化敏感键下的叶子值，与 API key/provider secret 环境变量
+一起形成脱敏材料。原文、JSON escaped、URL percent/plus encoded、slash escaped 等常见序列化
+形式都会从 stdout、stderr、error 和最终 audit 中移除；scored 模式遇到不可解析 JSON 会 fail
+closed。该处理只作用于宿主机审计投影，不改变传给 OpenCode 的原始环境。
+`results.jsonl` 留在宿主机 batch 目录且不在任何
 mount 中。Agent 退出后，只有评估器在容器外读取
 `pressure/cases.json`、fixture-to-opaque 映射和 `pressure/rubric.json`。本地 cwd 隔离只是 smoke，
 不构成 scored filesystem isolation。

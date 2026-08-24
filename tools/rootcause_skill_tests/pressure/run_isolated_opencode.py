@@ -2,14 +2,18 @@
 """Run root-cause pressure cases in explicit smoke or sandboxed scored mode."""
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +32,6 @@ CASE_NAMES = (
 )
 DEFAULT_TIMEOUT_SECONDS = 3600.0
 DEFAULT_SIGNAL_GRACE_SECONDS = 3.0
-DEFAULT_CONTAINER_IMAGE = "python:3.12-slim-bookworm"
 SANITIZED_PROVIDER_ENV = (
     "MODEL",
     "URL",
@@ -46,6 +49,31 @@ SENSITIVE_PROVIDER_ENV = (
     "OPENAI_API_KEY",
     "DEEPSEEK_API_KEY",
 )
+SENSITIVE_CONFIG_KEYS = (
+    "apikey",
+    "token",
+    "password",
+    "secret",
+    "authorization",
+    "credential",
+    "credentials",
+    "accesskey",
+    "privatekey",
+    "clientsecret",
+    "bearer",
+    "auth",
+)
+PINNED_IMAGE_PATTERN = re.compile(
+    r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}\Z"
+)
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+VERSION_PATTERN = re.compile(
+    r"(?i)(?:(?:observable-)?opencode[^\r\n]{0,80})?\bv?\d+\.\d+(?:\.\d+)?\b"
+)
+ELF_ARCHITECTURES = {
+    62: ("x86_64", "linux/amd64"),
+    183: ("aarch64", "linux/arm64"),
+}
 CONTAINER_CLIENT_ENV = (
     "PATH",
     "HOME",
@@ -92,7 +120,14 @@ def parse_args(argv=None):
         choices=("docker", "podman"),
         help="required filesystem sandbox for scored mode",
     )
-    parser.add_argument("--container-image", default=DEFAULT_CONTAINER_IMAGE)
+    parser.add_argument(
+        "--container-image",
+        help="digest-pinned image reference name@sha256:<64 lowercase hex>",
+    )
+    parser.add_argument(
+        "--opencode-sha256",
+        help="expected lowercase SHA-256 for the external Linux release binary",
+    )
     parser.add_argument("--case", action="append", choices=CASE_NAMES)
     parser.add_argument("--timeout-seconds", type=positive_float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument(
@@ -120,14 +155,51 @@ def resolve_executable(value):
     return resolved
 
 
-def validate_linux_release_binary(path):
+def file_sha256(path):
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
-        magic = stream.read(4)
-    if magic != b"\x7fELF":
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_linux_release_binary(path, expected_sha256):
+    if not expected_sha256 or not SHA256_PATTERN.fullmatch(expected_sha256):
+        raise ValueError("Scored mode requires --opencode-sha256 as 64 lowercase hex characters")
+    actual_sha256 = file_sha256(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError("OpenCode release SHA-256 does not match --opencode-sha256")
+    with path.open("rb") as stream:
+        header = stream.read(64)
+    if len(header) < 64 or header[:4] != b"\x7fELF":
+        raise ValueError("Scored OPENCODE_BIN must have a complete ELF64 header")
+    if header[4] != 2 or header[5] != 1 or header[6] != 1:
+        raise ValueError("Scored OPENCODE_BIN must be ELF64 little-endian version 1")
+    if header[7] not in (0, 3):
+        raise ValueError("Scored OPENCODE_BIN must declare the System V or Linux ELF ABI")
+    elf_type, machine, elf_version = struct.unpack_from("<HHI", header, 16)
+    if elf_type not in (2, 3) or elf_version != 1:
+        raise ValueError("Scored OPENCODE_BIN must be an executable Linux ELF64 release")
+    architecture = ELF_ARCHITECTURES.get(machine)
+    if architecture is None:
+        raise ValueError("Scored OPENCODE_BIN architecture must be x86_64 or aarch64")
+    return {
+        "sha256": actual_sha256,
+        "architecture": architecture[0],
+        "platform": architecture[1],
+    }
+
+
+def validate_container_image(value):
+    if not value:
+        raise ValueError("Scored mode requires --container-image pinned by digest")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("Container image contains a control character")
+    if value.startswith("-") or not PINNED_IMAGE_PATTERN.fullmatch(value):
         raise ValueError(
-            "Scored mode requires an external Linux release OPENCODE_BIN (ELF), "
-            "not a source build or host-native executable"
+            "Container image must be an explicit name@sha256:<64 lowercase hex> reference"
         )
+    return value
 
 
 def resolve_container_runtime(value):
@@ -158,15 +230,107 @@ def provider_environment(source=None):
     return {key: source[key] for key in SANITIZED_PROVIDER_ENV if key in source}
 
 
-def redact_provider_values(value, provider_env):
-    redacted = text_output(value)
-    secrets = (
-        (name, provider_env.get(name))
-        for name in SENSITIVE_PROVIDER_ENV
-        if provider_env.get(name)
+def normalized_secret_key(value):
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def sensitive_config_key(value):
+    normalized = normalized_secret_key(value)
+    return any(
+        normalized == marker or normalized.endswith(marker) or marker in normalized
+        for marker in SENSITIVE_CONFIG_KEYS
     )
-    for name, secret in sorted(secrets, key=lambda item: len(item[1]), reverse=True):
-        redacted = redacted.replace(secret, f"<redacted:{name}>")
+
+
+def collect_sensitive_config_values(value, path="config", inherited_sensitive=False):
+    collected = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            child_path = f"{path}.{key_text}"
+            collected.extend(
+                collect_sensitive_config_values(
+                    child,
+                    child_path,
+                    inherited_sensitive or sensitive_config_key(key_text),
+                )
+            )
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            collected.extend(
+                collect_sensitive_config_values(
+                    child,
+                    f"{path}[{index}]",
+                    inherited_sensitive,
+                )
+            )
+    elif inherited_sensitive and isinstance(value, (str, int, float, bool)):
+        collected.append((path, str(value)))
+    return collected
+
+
+def secret_variants(value):
+    if not isinstance(value, str) or not value:
+        return set()
+    serialized = {
+        value,
+        json.dumps(value, ensure_ascii=False),
+        json.dumps(value, ensure_ascii=True),
+        json.dumps(value, ensure_ascii=False)[1:-1],
+        json.dumps(value, ensure_ascii=True)[1:-1],
+        value.replace("\\", "\\\\").replace('"', '\\"'),
+        value.replace("/", "\\/"),
+        repr(value),
+    }
+    serialized.update(item.replace("/", "\\/") for item in tuple(serialized))
+    variants = set(serialized)
+    for item in serialized:
+        variants.update(
+            {
+                urllib.parse.quote(item, safe=""),
+                urllib.parse.quote_plus(item, safe=""),
+                urllib.parse.quote(item, safe="").lower(),
+                urllib.parse.quote_plus(item, safe="").lower(),
+            }
+        )
+    return {variant for variant in variants if variant}
+
+
+def build_redaction_materials(provider_env, scored=False):
+    materials = {}
+
+    def add(label, secret):
+        for variant in secret_variants(secret):
+            previous = materials.get(variant)
+            if previous is None or len(label) < len(previous):
+                materials[variant] = label
+
+    for name in SENSITIVE_PROVIDER_ENV:
+        if provider_env.get(name):
+            add(name, provider_env[name])
+
+    config = provider_env.get("OPENCODE_CONFIG_CONTENT")
+    if config:
+        add("OPENCODE_CONFIG_CONTENT", config)
+        try:
+            parsed = json.loads(config)
+        except json.JSONDecodeError as error:
+            if scored:
+                raise ValueError(
+                    "OPENCODE_CONFIG_CONTENT must be valid JSON in scored mode"
+                ) from error
+        else:
+            for path, secret in collect_sensitive_config_values(parsed):
+                add(path, secret)
+    return materials
+
+
+def redact_sensitive_values(value, materials):
+    redacted = text_output(value)
+    for variant, label in sorted(
+        materials.items(), key=lambda item: len(item[0]), reverse=True
+    ):
+        redacted = redacted.replace(variant, f"<redacted:{label}>")
     return redacted
 
 
@@ -175,8 +339,39 @@ def subprocess_environment(provider_env):
     return {key: value for key, value in os.environ.items() if key in names} | provider_env
 
 
-def mount_argument(source, destination):
-    return f"type=bind,src={source.resolve()},dst={destination},readonly"
+def validate_mount_source(source, expected_kind):
+    raw = os.fspath(source)
+    if not raw or any(
+        character == "," or ord(character) < 32 or ord(character) == 127
+        for character in raw
+    ):
+        raise ValueError("Mount source contains a comma or control character")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise ValueError("Mount source must be an absolute canonical path")
+    resolved = candidate.resolve(strict=True)
+    if candidate != resolved or candidate.is_symlink():
+        raise ValueError("Mount source must be a strict resolved path without symlinks")
+    if expected_kind == "directory" and not resolved.is_dir():
+        raise ValueError("Workspace mount source must be a directory")
+    if expected_kind == "file" and not resolved.is_file():
+        raise ValueError("Binary mount source must be a regular file")
+    if expected_kind not in ("directory", "file"):
+        raise ValueError(f"Unsupported mount source kind: {expected_kind}")
+    return resolved
+
+
+def mount_argument(source, destination, expected_kind):
+    if destination not in ("/workspace", "/opt/opencode"):
+        raise ValueError("Container mount destination is not allowed")
+    resolved = validate_mount_source(source, expected_kind)
+    return f"type=bind,src={resolved},dst={destination},readonly"
+
+
+def validate_platform(value):
+    if value not in {item[1] for item in ELF_ARCHITECTURES.values()}:
+        raise ValueError("Container platform must match the validated Linux ELF architecture")
+    return value
 
 
 def build_scored_container_command(
@@ -186,20 +381,27 @@ def build_scored_container_command(
     opencode_bin,
     prompt,
     provider_env,
+    platform,
 ):
+    image = validate_container_image(image)
+    platform = validate_platform(platform)
     command = [
         str(runtime),
         "run",
         "--rm",
         "--read-only",
+        "--platform",
+        platform,
         "--workdir",
         "/workspace",
         "--mount",
-        mount_argument(workspace, "/workspace"),
+        mount_argument(workspace, "/workspace", "directory"),
         "--mount",
-        mount_argument(opencode_bin, "/opt/opencode"),
+        mount_argument(opencode_bin, "/opt/opencode", "file"),
         "--tmpfs",
         "/tmp:rw,nosuid,nodev,size=512m",
+        "--entrypoint",
+        "/opt/opencode",
     ]
     for value in (
         "HOME=/tmp/home",
@@ -217,7 +419,6 @@ def build_scored_container_command(
     command.extend(
         (
             image,
-            "/opt/opencode",
             "run",
             "--print-logs",
             "--log-level",
@@ -230,7 +431,11 @@ def build_scored_container_command(
     return command
 
 
-def build_scored_probe_command(runtime, image, workspace, opencode_bin, canary_path):
+def build_scored_probe_command(
+    runtime, image, workspace, opencode_bin, canary_path, platform
+):
+    image = validate_container_image(image)
+    platform = validate_platform(platform)
     script = (
         "test -f /workspace/trace.json; "
         "test ! -e /workspace/../evaluator; "
@@ -243,18 +448,77 @@ def build_scored_probe_command(runtime, image, workspace, opencode_bin, canary_p
         "run",
         "--rm",
         "--read-only",
+        "--platform",
+        platform,
         "--workdir",
         "/workspace",
         "--mount",
-        mount_argument(workspace, "/workspace"),
+        mount_argument(workspace, "/workspace", "directory"),
         "--mount",
-        mount_argument(opencode_bin, "/opt/opencode"),
+        mount_argument(opencode_bin, "/opt/opencode", "file"),
+        "--entrypoint",
+        "/bin/sh",
         image,
-        "sh",
         "-eu",
         "-c",
         script,
     ]
+
+
+def build_scored_preflight_command(runtime, image, opencode_bin, platform):
+    image = validate_container_image(image)
+    platform = validate_platform(platform)
+    return [
+        str(runtime),
+        "run",
+        "--rm",
+        "--read-only",
+        "--platform",
+        platform,
+        "--mount",
+        mount_argument(opencode_bin, "/opt/opencode", "file"),
+        "--entrypoint",
+        "/opt/opencode",
+        image,
+        "--version",
+    ]
+
+
+def container_client_environment():
+    return {key: os.environ[key] for key in CONTAINER_CLIENT_ENV if key in os.environ}
+
+
+def run_scored_preflight(runtime, image, opencode_bin, release):
+    if validate_linux_release_binary(opencode_bin, release["sha256"]) != release:
+        raise ValueError("OpenCode release identity changed before container preflight")
+    command = build_scored_preflight_command(
+        runtime, image, opencode_bin, release["platform"]
+    )
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+            env=container_client_environment(),
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("OpenCode container preflight did not self-exit within 30 seconds") from error
+    if result.returncode != 0:
+        raise ValueError("OpenCode container preflight must self-exit 0")
+    observed = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    match = VERSION_PATTERN.search(observed)
+    if match is None:
+        raise ValueError("OpenCode container preflight did not emit plausible version output")
+    return {
+        "release_sha256": release["sha256"],
+        "release_architecture": release["architecture"],
+        "platform": release["platform"],
+        "container_image": image,
+        "version": match.group(0).strip(),
+        "raw_returncode": result.returncode,
+    }
 
 
 def container_mounts(command):
@@ -287,7 +551,16 @@ def prepare_workspace(fixture, workspace, opaque_case_id, agent_trace_path):
     return json.loads(result.stdout)
 
 
-def case_context(batch_root, fixture, args, executable, container_runtime=None):
+def case_context(
+    batch_root,
+    fixture,
+    args,
+    executable,
+    provider_env,
+    redaction_materials,
+    release=None,
+    container_runtime=None,
+):
     opaque_case_id = f"case-{uuid.uuid4().hex}"
     workspace = batch_root / "workspaces" / opaque_case_id
     runtime_root = batch_root / "smoke-runtime" / opaque_case_id
@@ -295,8 +568,9 @@ def case_context(batch_root, fixture, args, executable, container_runtime=None):
     provenance = prepare_workspace(fixture, workspace, opaque_case_id, agent_trace_path)
     prompt_path = workspace / "prompt-opencode.md"
     prompt = prompt_path.read_text(encoding="utf-8")
-    provider_env = provider_environment()
     if args.mode == "scored":
+        if validate_linux_release_binary(executable, release["sha256"]) != release:
+            raise ValueError("OpenCode release identity changed before scored case")
         argv = build_scored_container_command(
             container_runtime,
             args.container_image,
@@ -304,6 +578,7 @@ def case_context(batch_root, fixture, args, executable, container_runtime=None):
             executable,
             prompt,
             provider_env,
+            release["platform"],
         )
         host_cwd = batch_root
         environment = subprocess_environment(provider_env)
@@ -345,6 +620,7 @@ def case_context(batch_root, fixture, args, executable, container_runtime=None):
         "host_cwd": host_cwd,
         "environment": environment,
         "provider_environment": provider_env,
+        "redaction_materials": redaction_materials,
         "provider_environment_names": sorted(provider_env),
         "derived_provenance": provenance,
     }
@@ -462,8 +738,27 @@ def run_process(context, args):
     return stdout, stderr, raw_returncode, timed_out, wrapper_error, audit
 
 
-def run_case(batch_root, fixture, args, executable, container_runtime=None):
-    context = case_context(batch_root, fixture, args, executable, container_runtime)
+def run_case(
+    batch_root,
+    fixture,
+    args,
+    executable,
+    provider_env,
+    redaction_materials,
+    release=None,
+    preflight=None,
+    container_runtime=None,
+):
+    context = case_context(
+        batch_root,
+        fixture,
+        args,
+        executable,
+        provider_env,
+        redaction_materials,
+        release,
+        container_runtime,
+    )
     probe = None
     if args.mode == "scored":
         canary = batch_root / "evaluator-canary"
@@ -474,11 +769,12 @@ def run_case(batch_root, fixture, args, executable, container_runtime=None):
             context["workspace"],
             executable,
             canary,
+            release["platform"],
         )
         probe_result = subprocess.run(
             probe_command,
             cwd=batch_root,
-            env=context["environment"],
+            env=container_client_environment(),
             text=True,
             capture_output=True,
             timeout=30,
@@ -487,8 +783,12 @@ def run_case(batch_root, fixture, args, executable, container_runtime=None):
         probe = {
             "command_argv": probe_command,
             "raw_returncode": probe_result.returncode,
-            "stdout": redact_provider_values(probe_result.stdout, context["provider_environment"]),
-            "stderr": redact_provider_values(probe_result.stderr, context["provider_environment"]),
+            "stdout": redact_sensitive_values(
+                probe_result.stdout, context["redaction_materials"]
+            ),
+            "stderr": redact_sensitive_values(
+                probe_result.stderr, context["redaction_materials"]
+            ),
             "asserted_unavailable": ["workspace_parent", "evaluator", "audit", "host_canary"],
         }
         if probe_result.returncode != 0:
@@ -520,8 +820,11 @@ def run_case(batch_root, fixture, args, executable, container_runtime=None):
         "provider_environment_names": context["provider_environment_names"],
         "derived_provenance": context["derived_provenance"],
         "container_probe": probe,
-        "stdout": redact_provider_values(stdout, context["provider_environment"]),
-        "stderr": redact_provider_values(stderr, context["provider_environment"]),
+        "release": release,
+        "container_image": args.container_image if args.mode == "scored" else None,
+        "preflight_version": preflight["version"] if preflight else None,
+        "stdout": redact_sensitive_values(stdout, context["redaction_materials"]),
+        "stderr": redact_sensitive_values(stderr, context["redaction_materials"]),
         "raw_returncode": raw_returncode,
         "timed_out": timed_out,
         "signal_attempted": audit["signal_attempted"],
@@ -555,8 +858,9 @@ def wrapper_failure_record(batch_root, fixture, args, error):
     }
 
 
-def write_result(stream, result):
+def write_result(stream, result, redaction_materials):
     line = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    line = redact_sensitive_values(line, redaction_materials)
     stream.write(line + "\n")
     stream.flush()
     os.fsync(stream.fileno())
@@ -566,10 +870,18 @@ def write_result(stream, result):
 def main(argv=None):
     args = parse_args(argv)
     try:
+        provider_env = provider_environment()
+        redaction_materials = build_redaction_materials(
+            provider_env, scored=args.mode == "scored"
+        )
         executable = resolve_executable(args.opencode_bin)
         container_runtime = None
+        release = None
         if args.mode == "scored":
-            validate_linux_release_binary(executable)
+            args.container_image = validate_container_image(args.container_image)
+            release = validate_linux_release_binary(
+                executable, args.opencode_sha256
+            )
             container_runtime = resolve_container_runtime(args.container_runtime)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"error: {error}", file=sys.stderr)
@@ -577,18 +889,41 @@ def main(argv=None):
 
     batch_root = args.batch_root.resolve(strict=False)
     batch_root.mkdir(parents=True, exist_ok=False)
+    preflight = None
+    if args.mode == "scored":
+        try:
+            preflight = run_scored_preflight(
+                container_runtime, args.container_image, executable, release
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+        (batch_root / "preflight.json").write_text(
+            json.dumps(preflight, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     selected_names = set(args.case or [])
     selected_cases = [case for case in CASE_NAMES if not selected_names or case in selected_names]
     results_path = batch_root / "results.jsonl"
     with results_path.open("x", encoding="utf-8") as stream:
         for fixture in selected_cases:
             try:
-                result = run_case(batch_root, fixture, args, executable, container_runtime)
+                result = run_case(
+                    batch_root,
+                    fixture,
+                    args,
+                    executable,
+                    provider_env,
+                    redaction_materials,
+                    release,
+                    preflight,
+                    container_runtime,
+                )
             except Exception as error:
                 result = wrapper_failure_record(batch_root, fixture, args, error)
-                write_result(stream, result)
+                write_result(stream, result, redaction_materials)
                 continue
-            write_result(stream, result)
+            write_result(stream, result, redaction_materials)
     return 0
 
 
