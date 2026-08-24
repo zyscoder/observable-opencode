@@ -22,13 +22,34 @@ def relative_artifact_path(value):
     return path
 
 
+def fixture_file(source, relative):
+    root = source.resolve(strict=True)
+    if source.is_symlink():
+        raise ValueError(f"Selected fixture must not be a symlink: {source}")
+
+    candidate = root
+    for part in relative.parts:
+        candidate /= part
+        if candidate.is_symlink():
+            raise ValueError(f"Fixture path must not traverse a symlink: {relative}")
+
+    resolved = candidate.resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"Fixture path escapes the selected case: {relative}") from error
+    if not resolved.is_file():
+        raise ValueError(f"Referenced file is missing: {candidate}")
+    return resolved
+
+
 def prepare(case, destination):
     prompt_path = PROMPTS.get(case)
     if prompt_path is None:
         raise ValueError(f"No RED baseline prompt is defined for case: {case}")
 
     source = FIXTURES / case
-    trace_source = source / "trace.json"
+    trace_source = fixture_file(source, Path("trace.json"))
     trace = json.loads(trace_source.read_text(encoding="utf-8"))
     destination.mkdir(parents=True, exist_ok=False)
     trace_destination = destination / "trace.json"
@@ -36,9 +57,7 @@ def prepare(case, destination):
 
     for artifact in trace["artifacts"]:
         relative = relative_artifact_path(artifact["path"])
-        artifact_source = source / relative
-        if not artifact_source.is_file():
-            raise ValueError(f"Referenced Artifact is missing: {artifact_source}")
+        artifact_source = fixture_file(source, relative)
         artifact_destination = destination / relative
         artifact_destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(artifact_source, artifact_destination)

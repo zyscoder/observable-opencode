@@ -1,5 +1,7 @@
 import hashlib
+import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +19,24 @@ def payload_hash(value):
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def source_hash(node):
+    return payload_hash(
+        {
+            "inputRefs": node["input_refs"],
+            "outputRefs": node["output_refs"],
+            "sourceRefs": node["source_refs"],
+            "sourceLocations": node["source_locations"],
+            "artifactRefs": node["artifact_refs"],
+        }
+    )
+
+
+def assert_node_integrity(test, node):
+    test.assertEqual(node["integrity"]["payload_hash"], payload_hash(node["payload"]))
+    if "source_hash" in node["integrity"]:
+        test.assertEqual(node["integrity"]["source_hash"], source_hash(node))
 
 
 def assert_typed_refs(test, refs, label):
@@ -69,7 +89,7 @@ class FixtureContractTests(unittest.TestCase):
                         self.assertEqual(node["scope"]["run_id"], trace["manifest"]["run_id"])
                         self.assertEqual(node["scope"]["case_id"], trace["manifest"]["case_id"])
                         self.assertEqual(node["payload"], node["data"])
-                        self.assertEqual(node["integrity"]["payload_hash"], payload_hash(node["payload"]))
+                        assert_node_integrity(self, node)
                         for field in ("input_refs", "output_refs", "source_refs"):
                             assert_typed_refs(self, node[field], f"{node['node_id']}.{field}")
                         self.assertIsInstance(node["source_locations"], list)
@@ -93,6 +113,13 @@ class FixtureContractTests(unittest.TestCase):
                         assert_typed_refs(self, [edge["from"], edge["to"]], f"{edge['edge_id']}.endpoints")
                         assert_typed_refs(self, edge["evidence_refs"], f"{edge['edge_id']}.evidence_refs")
                         self.assertIsInstance(edge["eligible_for_attribution"], bool)
+
+    def test_source_hash_validation_rejects_a_mutated_canonical_node(self):
+        trace = json.loads((FIXTURES / "known-root" / "trace.json").read_text(encoding="utf-8"))
+        node = trace["nodes"][0]
+        node["integrity"]["source_hash"] = "not-the-deterministic-source-hash"
+        with self.assertRaises(AssertionError):
+            assert_node_integrity(self, node)
 
     def test_temporal_advisory_edges_are_recorded_in_time_order_and_ineligible(self):
         trace = json.loads((FIXTURES / "known-root" / "trace.json").read_text(encoding="utf-8"))
@@ -123,6 +150,28 @@ class FixtureContractTests(unittest.TestCase):
             self.assertFalse(any(path.name == "cases.json" for path in destination.rglob("*")))
             self.assertNotIn(str(ROOT), (destination / "prompt.md").read_text(encoding="utf-8"))
             self.assertIn(str(destination / "trace.json"), (destination / "prompt.md").read_text(encoding="utf-8"))
+
+    def test_isolated_bundle_rejects_a_fixture_local_artifact_symlink_escape(self):
+        spec = importlib.util.spec_from_file_location("prepare_isolated_bundle", RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture_root = root / "fixtures"
+            source = fixture_root / "known-root"
+            shutil.copytree(FIXTURES / "known-root", source)
+            evaluator_data = root / "evaluator" / "cases.json"
+            evaluator_data.parent.mkdir()
+            evaluator_data.write_text('{"expected":"must not escape"}', encoding="utf-8")
+            artifact = source / "artifacts" / "sha256" / "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"
+            artifact.unlink()
+            artifact.symlink_to(evaluator_data)
+            module.FIXTURES = fixture_root
+
+            with self.assertRaises(ValueError):
+                module.prepare("known-root", root / "bundle")
 
 
 if __name__ == "__main__":
