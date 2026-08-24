@@ -1,16 +1,23 @@
-# Root-Cause Analysis Skill RED Baseline
+# Root-Cause Analysis Skill Historical RED Baseline
+
+This report preserves the pre-Skill authentication attempts made before the
+canonical Skill and seven-case isolation builder existed. It is historical
+evidence, not a command recipe for the current tree. The current
+`prepare_isolated_bundle.py` intentionally includes the canonical Skill and is
+used for scored post-Skill runs; it cannot reproduce a Skill-absent RED run.
 
 ## Baseline Setup
 
 - Date: 2026-08-24
-- Working directory for provider runs: a freshly created isolated bundle under `/private/tmp/rootcause-skill-red.XXXXXX`
+- Working directory for provider runs: the then-current two-case bundle under `/private/tmp/rootcause-skill-red.XXXXXX`
 - Skill state: `.claude/skills/rootcause-analysis` was absent.
 - Invocation mode: `claude --bare --disable-slash-commands -p --permission-mode plan --allowedTools "Read,Bash(python3 *)"`.
 - Prompt source: the bundle-local `prompt.md` rendered with its bundle-local `trace.json` path. Claude Code 2.1.138 treats `--allowedTools` as variadic and consumes a trailing positional prompt, so the prompt is supplied on stdin.
 
-## Isolated Pressure-Run Procedure
+## Historical Pressure-Run Procedure
 
-Prepare one case without reading or copying `pressure/cases.json`:
+The original attempt used the command below. Do not rerun it against the current
+builder to claim a RED baseline because the current builder copies the Skill:
 
 ```bash
 BUNDLE_ROOT=$(mktemp -d /private/tmp/rootcause-skill-red.XXXXXX)
@@ -23,10 +30,11 @@ claude --bare --disable-slash-commands -p \
   --allowedTools "Read,Bash(python3 *)" < prompt.md
 ```
 
-Repeat with `--case ambiguous`. The bundle contains only `prompt.md`, the
-selected `trace.json`, and Artifacts declared by that trace. It has no copy or
-reference to evaluator-only cases, so the Agent receives no traversable path
-to `pressure/cases.json` from the pressure-run working directory.
+The historical command was repeated with `--case ambiguous`. At that time the
+bundle contained only `prompt.md`, the selected `trace.json`, and declared
+Artifacts. The current scored protocol instead builds all seven cases with the
+canonical Skill and runtime-specific prompts while preserving evaluator-data
+isolation.
 
 ## Forward-Test Result
 
@@ -49,6 +57,8 @@ Neither command ran for five minutes or required timeout termination.
 
 ## Follow-Up
 
-Authenticate Claude Code and rerun the same two isolated bundle prompts with
-the Skill still absent. Record the unmodified raw model responses and evaluate
-them outside the Agent context against `tools/rootcause_skill_tests/pressure/rubric.json`.
+For current validation, build all seven post-Skill workspaces with
+`prepare_isolated_bundle.py`, execute Claude/OpenCode with each workspace as
+cwd, capture outputs outside that workspace, and let only the evaluator read
+`tools/rootcause_skill_tests/pressure/cases.json` and `rubric.json`. Do not
+reinterpret a current run as the historical RED baseline.

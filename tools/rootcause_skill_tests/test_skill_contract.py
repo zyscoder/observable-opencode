@@ -19,6 +19,13 @@ RAW_FORWARD_REPORT_PATH = (
     / "reports"
     / "2026-08-24-rootcause-analysis-skill-raw-attempts.md"
 )
+FORWARD_RUNNER_PATH = (
+    REPO_ROOT
+    / "tools"
+    / "rootcause_skill_tests"
+    / "pressure"
+    / "run_isolated_opencode.py"
+)
 DESIGN_PATH = (
     REPO_ROOT
     / "docs"
@@ -182,8 +189,30 @@ class SkillContractTests(unittest.TestCase):
         for name, text in (
             ("README", readme),
             ("OpenAI agent metadata", self.openai_agent_text),
+            ("implementation plan", self.plan_text),
         ):
             self.assertNotIn("$rootcause-analysis", text, name)
+
+    def test_scored_forward_wrapper_uses_isolated_bundle_and_external_binary(self):
+        self.assertTrue(FORWARD_RUNNER_PATH.is_file())
+        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
+        for phrase in (
+            "prepare_isolated_bundle.py",
+            '"OPENCODE_BIN"',
+            '"prompt-opencode.md"',
+            'cwd=context["workspace"]',
+        ):
+            self.assertIn(phrase, wrapper)
+        self.assertNotIn('"packages/opencode/src/index.ts"', wrapper)
+        self.assertNotIn('cwd=REPO', wrapper)
+        self.assertIn('"PWD": str(workspace)', wrapper)
+        for variable in ("OLDPWD", "INIT_CWD", "GIT_DIR", "GIT_WORK_TREE"):
+            self.assertIn(f'env.pop("{variable}", None)', wrapper)
+        self.assertIn(
+            "tools/rootcause_skill_tests/pressure/run_isolated_opencode.py",
+            self.raw_forward_report_text,
+        )
+        self.assertIn("unscored", self.raw_forward_report_text)
 
     def test_readme_artifact_example_uses_discoverable_fixture_id(self):
         self.assertIn("artifact_refs", self.readme_text)
@@ -205,14 +234,8 @@ class SkillContractTests(unittest.TestCase):
         }
         self.assertIn("build-requirement", artifact_ids)
 
-    def test_embedded_forward_wrapper_has_unique_or_explicit_batch_root(self):
-        match = re.search(
-            r"## Deterministic OpenCode Wrapper.*?```python\n(.*?)\n```",
-            self.raw_forward_report_text,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(match)
-        wrapper = match.group(1)
+    def test_forward_wrapper_has_unique_or_explicit_batch_root(self):
+        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
         compile(wrapper, str(RAW_FORWARD_REPORT_PATH), "exec")
         self.assertIn('"--batch-root"', wrapper)
         self.assertIn("ROOTCAUSE_FORWARD_BATCH_ROOT", wrapper)
@@ -220,12 +243,8 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("os.getpid", wrapper)
         self.assertIn("exist_ok=False", wrapper)
 
-    def test_embedded_forward_wrapper_audits_safe_signal_delivery_and_cleanup(self):
-        wrapper = re.search(
-            r"## Deterministic OpenCode Wrapper.*?```python\n(.*?)\n```",
-            self.raw_forward_report_text,
-            re.DOTALL,
-        ).group(1)
+    def test_forward_wrapper_audits_safe_signal_delivery_and_cleanup(self):
+        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
         for phrase in (
             "process.poll()",
             "except ProcessLookupError",
@@ -239,16 +258,12 @@ class SkillContractTests(unittest.TestCase):
             self.assertIn(phrase, wrapper)
         self.assertIn('"raw_returncode": raw_returncode', wrapper)
 
-    def test_embedded_forward_wrapper_records_case_errors_and_continues(self):
-        wrapper = re.search(
-            r"## Deterministic OpenCode Wrapper.*?```python\n(.*?)\n```",
-            self.raw_forward_report_text,
-            re.DOTALL,
-        ).group(1)
+    def test_forward_wrapper_records_case_errors_and_continues(self):
+        wrapper = FORWARD_RUNNER_PATH.read_text(encoding="utf-8")
         self.assertIn('"wrapper_error"', wrapper)
         self.assertRegex(
             wrapper,
-            re.compile(r"for fixture, question in selected_cases:.*?try:.*?run_case", re.DOTALL),
+            re.compile(r"for fixture in selected_cases:.*?try:.*?run_case", re.DOTALL),
         )
         self.assertRegex(
             wrapper,

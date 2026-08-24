@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tools" / "rootcause_skill_tests" / "fixtures"
 PRESSURE = ROOT / "tools" / "rootcause_skill_tests" / "pressure"
 RUNNER = PRESSURE / "prepare_isolated_bundle.py"
+FORWARD_RUNNER = PRESSURE / "run_isolated_opencode.py"
+CASES_PATH = PRESSURE / "cases.json"
+SKILL_ROOT = ROOT / ".claude" / "skills" / "rootcause-analysis"
 
 
 def payload_hash(value):
@@ -131,25 +134,153 @@ class FixtureContractTests(unittest.TestCase):
         self.assertEqual(edge["derivation_method"], "recorded_time_order")
         self.assertLess(times[edge["from"]["ref_id"]], times[edge["to"]["ref_id"]])
 
-    def test_isolated_bundle_excludes_evaluator_data_and_keeps_referenced_artifact(self):
+    def test_isolated_bundles_cover_all_cases_without_evaluator_data(self):
         self.assertTrue(RUNNER.is_file(), "pressure bundle preparation script is required")
+        case_specs = json.loads(CASES_PATH.read_text(encoding="utf-8"))["cases"]
+        self.assertEqual(len(case_specs), 7)
+        canonical_skill_files = {
+            Path(".claude/skills/rootcause-analysis") / path.relative_to(SKILL_ROOT)
+            for path in SKILL_ROOT.rglob("*")
+            if path.is_file()
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            for case_spec in case_specs:
+                case = case_spec["fixture"]
+                with self.subTest(case=case):
+                    destination = Path(directory) / case
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(RUNNER),
+                            "--case",
+                            case,
+                            "--destination",
+                            str(destination),
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+                    trace = json.loads((FIXTURES / case / "trace.json").read_text(encoding="utf-8"))
+                    artifact_files = {Path(item["path"]) for item in trace["artifacts"]}
+                    expected_files = {
+                        Path("trace.json"),
+                        Path("prompt-claude.md"),
+                        Path("prompt-opencode.md"),
+                    } | canonical_skill_files | artifact_files
+                    actual_files = {
+                        path.relative_to(destination)
+                        for path in destination.rglob("*")
+                        if path.is_file()
+                    }
+                    self.assertEqual(actual_files, expected_files)
+
+                    for path in destination.rglob("*"):
+                        self.assertFalse(path.is_symlink(), path)
+                        path.resolve(strict=True).relative_to(destination.resolve(strict=True))
+
+                    self.assertEqual(
+                        (destination / "trace.json").read_bytes(),
+                        (FIXTURES / case / "trace.json").read_bytes(),
+                    )
+                    for relative in canonical_skill_files:
+                        source = ROOT / relative
+                        self.assertEqual((destination / relative).read_bytes(), source.read_bytes())
+
+                    for prompt_name in ("prompt-claude.md", "prompt-opencode.md"):
+                        prompt = (destination / prompt_name).read_text(encoding="utf-8")
+                        self.assertIn(case_spec["question"], prompt)
+                        self.assertIn(str(destination / "trace.json"), prompt)
+                        self.assertNotIn(str(ROOT), prompt)
+                        for hidden_key in case_spec["expected"]:
+                            self.assertNotIn(hidden_key, prompt)
+                        self.assertNotIn(json.dumps(case_spec["expected"], ensure_ascii=False), prompt)
+
+                    names = {path.name for path in destination.rglob("*")}
+                    self.assertNotIn("cases.json", names)
+                    self.assertNotIn("rubric.json", names)
+                    self.assertNotIn(".git", names)
+                    self.assertNotIn("reports", names)
+
+    def test_isolated_bundle_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "known-root"
+            command = [
+                sys.executable,
+                str(RUNNER),
+                "--case",
+                "known-root",
+                "--destination",
+                str(destination),
+            ]
+            first = subprocess.run(command, text=True, capture_output=True, check=False)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            before = {
+                path.relative_to(destination): path.read_bytes()
+                for path in destination.rglob("*")
+                if path.is_file()
+            }
+            second = subprocess.run(command, text=True, capture_output=True, check=False)
+            self.assertNotEqual(second.returncode, 0)
+            after = {
+                path.relative_to(destination): path.read_bytes()
+                for path in destination.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
+
+    def test_isolated_bundle_rejects_artifact_hash_mismatch(self):
+        spec = importlib.util.spec_from_file_location("prepare_isolated_bundle_hash", RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture_root = root / "fixtures"
+            source = fixture_root / "known-root"
+            shutil.copytree(FIXTURES / "known-root", source)
+            artifact = next(path for path in (source / "artifacts").rglob("*") if path.is_file())
+            artifact.write_text("tampered", encoding="utf-8")
+            module.FIXTURES = fixture_root
+
+            with self.assertRaisesRegex(ValueError, "digest"):
+                module.prepare("known-root", root / "bundle")
+
+    def test_forward_runner_uses_bundle_as_agent_cwd(self):
+        executable = shutil.which("echo")
+        self.assertIsNotNone(executable)
+        with tempfile.TemporaryDirectory() as directory:
+            batch_root = Path(directory) / "fresh-batch"
             result = subprocess.run(
-                [sys.executable, str(RUNNER), "--case", "known-root", "--destination", str(destination)],
+                [
+                    sys.executable,
+                    str(FORWARD_RUNNER),
+                    "--batch-root",
+                    str(batch_root),
+                    "--case",
+                    "known-root",
+                    "--opencode-bin",
+                    executable,
+                    "--timeout-seconds",
+                    "2",
+                ],
                 text=True,
                 capture_output=True,
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertTrue((destination / "prompt.md").is_file())
-            self.assertTrue((destination / "trace.json").is_file())
-            self.assertTrue(
-                (destination / "artifacts" / "sha256" / "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1").is_file()
-            )
-            self.assertFalse(any(path.name == "cases.json" for path in destination.rglob("*")))
-            self.assertNotIn(str(ROOT), (destination / "prompt.md").read_text(encoding="utf-8"))
-            self.assertIn(str(destination / "trace.json"), (destination / "prompt.md").read_text(encoding="utf-8"))
+            record = json.loads(result.stdout)
+            workspace = batch_root.resolve() / "known-root" / "workspace"
+            self.assertEqual(record["cwd"], str(workspace))
+            self.assertEqual(record["trace_path"], str(workspace / "trace.json"))
+            self.assertEqual(record["command_argv"][0], executable)
+            self.assertEqual(record["raw_returncode"], 0)
+            self.assertFalse(record["timed_out"])
+            self.assertIsNone(record["wrapper_error"])
+            self.assertNotIn(str(ROOT), record["prompt"])
 
     def test_isolated_bundle_rejects_a_fixture_local_artifact_symlink_escape(self):
         spec = importlib.util.spec_from_file_location("prepare_isolated_bundle", RUNNER)

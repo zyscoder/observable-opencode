@@ -20,6 +20,7 @@
 - Retrieval limits bound one query response, not semantic analysis depth or root-candidate count.
 - Every report conclusion and recommendation cites resolvable Trace evidence.
 - Recommendations are proposals only; the Skill never applies or validates a repair.
+- Scored forward runs execute from a no-overwrite isolated workspace. Only the evaluator may read `pressure/cases.json`, hidden expected outcomes, or `pressure/rubric.json`; none may enter the Agent workspace or prompt.
 
 ## File Map
 
@@ -51,6 +52,8 @@
 - `tools/rootcause_skill_tests/pressure/baseline-ambiguous.md`: prompt that tests resistance to invented roots.
 - `tools/rootcause_skill_tests/pressure/cases.json`: questions and hidden expected outcomes for all forward-test fixtures.
 - `tools/rootcause_skill_tests/pressure/rubric.json`: machine-readable forward-test rubric.
+- `tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py`: evaluator-side builder for one selected Trace, its verified Artifacts, the canonical Skill, and runtime-specific prompts.
+- `tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`: external-binary OpenCode runner whose Agent cwd is the selected isolated workspace.
 - `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-baseline.md`: observed pre-Skill behavior.
 - `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md`: post-Skill comparison and remaining limitations.
 - `README.md`: invocation, inputs, outputs, and analysis-only boundary.
@@ -199,7 +202,7 @@ python3 /Users/zys/.codex/skills/.system/skill-creator/scripts/init_skill.py \
   --resources scripts,references \
   --interface 'display_name=Root Cause Analysis' \
   --interface 'short_description=Analyze semantic traces and explain causal defect chains' \
-  --interface 'default_prompt=Use $rootcause-analysis to analyze this finalized trace against my defect question.'
+  --interface 'default_prompt=Analyze this finalized semantic trace against my defect question with the rootcause-analysis workflow.'
 ```
 
 The pressure baseline in Task 1 must complete before this command, so the new
@@ -641,6 +644,8 @@ git commit -m "feat(skill): define evidence-linked root cause reports"
 **Files:**
 - Modify: `README.md`
 - Create: `docs/superpowers/reports/2026-08-24-rootcause-analysis-skill-results.md`
+- Modify: `tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py`
+- Create: `tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`
 - Modify: `.claude/skills/rootcause-analysis/SKILL.md` only if forward testing exposes a transferable reasoning gap.
 - Modify: `.claude/skills/rootcause-analysis/references/*.md` only if forward testing exposes a transferable reasoning gap.
 
@@ -650,10 +655,17 @@ git commit -m "feat(skill): define evidence-linked root cause reports"
 
 - [ ] **Step 1: Add README usage without reviving the old attribution CLI**
 
-Document this invocation shape:
+Document both runtime-specific invocation shapes:
 
 ```text
-Use $rootcause-analysis.
+/rootcause-analysis
+Trace: /absolute/path/to/case/trace.json
+Question: 为什么用户要求通过构建 Skill 使用 Yocto，但实际只进行了 GCC 局部编译？
+Output prefix: /absolute/path/to/output/yocto-analysis
+```
+
+```text
+开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。
 Trace: /absolute/path/to/case/trace.json
 Question: 为什么用户要求通过构建 Skill 使用 Yocto，但实际只进行了 GCC 局部编译？
 Output prefix: /absolute/path/to/output/yocto-analysis
@@ -678,24 +690,44 @@ uv run --with pyyaml \
 git diff --check
 ```
 
-- [ ] **Step 3: Run GREEN forward tests with the Skill explicitly invoked**
+- [ ] **Step 3: Build isolated workspaces and run GREEN forward tests**
 
-Run Claude from the repository so project Skill discovery is active:
+The evaluator builds each workspace before launching an Agent. The workspace
+contains only the selected finalized Trace and verified Artifacts, the
+canonical Skill, and runtime-specific prompts. It contains no `cases.json`,
+rubric, hidden expected outcome, sibling fixture, report, Git history, or
+symlink back to the repository.
 
 ```bash
-OUTPUT_ROOT="$PWD/.superpowers/sdd/2026-08-24-rootcause-analysis-skill/forward-tests"
-mkdir -p "$OUTPUT_ROOT"
-claude --bare -p \
+FORWARD_ROOT=$(mktemp -d /tmp/rootcause-forward.XXXXXX)
+BUNDLE="$FORWARD_ROOT/known-root"
+python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+  --case known-root --destination "$BUNDLE"
+
+(cd "$BUNDLE" && claude --bare -p \
   --permission-mode plan \
-  --allowedTools "Read,Bash(python3 *)" \
-  "Use \$rootcause-analysis. Trace: $PWD/tools/rootcause_skill_tests/fixtures/known-root/trace.json. Question: 为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？Output prefix: $OUTPUT_ROOT/known-root/analysis. 只分析并给建议，不得修改任何文件或配置。"
+  --allowedTools "Read,Bash(python3 *)" < prompt-claude.md) \
+  > "$FORWARD_ROOT/known-root.claude.stdout" \
+  2> "$FORWARD_ROOT/known-root.claude.stderr"
 ```
 
-Repeat with `ambiguous`, `skill-omission`, `context-contamination`,
-`control-flow-change`, `tool-failure-misreported`, and `wrong-answer`. Load the
-question for each case from `pressure/cases.json`, but never include its hidden
-expected outcome in the Agent prompt. Run the same scenarios through an
-available OpenCode build when its executable is present.
+For OpenCode, use a standalone executable and the isolated runner. Provider
+configuration may be supplied through inherited runtime environment variables,
+but the executable runs with the bundle as cwd and isolated HOME/XDG roots:
+
+```bash
+export OPENCODE_BIN=/absolute/path/to/opencode
+python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
+  --batch-root "$FORWARD_ROOT/opencode-run"
+```
+
+Repeat all seven cases. `prepare_isolated_bundle.py` is the evaluator-side
+boundary: it reads only each case's `fixture` and exact `question` from
+`pressure/cases.json` and never copies `expected` data. After Agent execution,
+the evaluator alone reads `cases.json` and `rubric.json` to score captured
+outputs outside the Agent workspace. Running the Bun source entry point from
+the repository is permitted only as a Skill-discovery/provider smoke test; it
+is not an isolated scored forward run.
 
 - [ ] **Step 4: Evaluate results against the rubric**
 

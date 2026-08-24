@@ -796,6 +796,48 @@ python3 "$TRACE_QUERY" artifact --trace "$TRACE" --id build-requirement --max-ch
 Trace，不修改 Agent、Harness、Skill、MCP、Tool、Prompt、模型配置、代码、构建环境、Trace 或
 原 Session，也不会把结论反馈给原 Agent。报告中的优化项仅是建议，必须由独立任务评审和实施。
 
+### 隔离 Forward Test
+
+对 Skill 做效果评分时，不能直接从本仓库启动 Agent 并把仓库内 fixture 路径交给它，否则 Agent
+可能读取 `cases.json`、隐藏期望、rubric、其他 fixture 或 Git 历史，评分不具备隔离性。先由评估器
+构造单 case workspace：
+
+```bash
+export FORWARD_ROOT=$(mktemp -d /tmp/rootcause-forward.XXXXXX)
+python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+  --case known-root \
+  --destination "$FORWARD_ROOT/known-root"
+```
+
+每个 workspace 只包含该 case 的 finalize `trace.json`、Trace 声明且摘要校验通过的 Artifacts、
+规范 `.claude/skills/rootcause-analysis`，以及 `prompt-claude.md`、`prompt-opencode.md`。builder
+拒绝覆盖已有目录、symlink 越界、节点完整性错误和 Artifact 摘要不一致。它不会复制
+`cases.json`、`rubric.json`、隐藏 `expected`、其他 fixture、reports 或 Git 历史。
+
+Claude Code 必须从隔离 workspace 运行，运行结果保存到 workspace 之外：
+
+```bash
+(cd "$FORWARD_ROOT/known-root" && claude --bare -p \
+  --permission-mode plan \
+  --allowedTools "Read,Bash(python3 *)" < prompt-claude.md) \
+  > "$FORWARD_ROOT/known-root.claude.stdout" \
+  2> "$FORWARD_ROOT/known-root.claude.stderr"
+```
+
+OpenCode 评分使用独立可执行文件；`OPENCODE_BIN` 可以指向 release binary。模型和 provider
+配置通过正常环境变量或 `OPENCODE_CONFIG_CONTENT` 提供，不写入 case workspace：
+
+```bash
+export OPENCODE_BIN=/absolute/path/to/opencode
+python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
+  --batch-root "$FORWARD_ROOT/opencode-run"
+```
+
+runner 为每个 case 创建独立 workspace、HOME 和 XDG 目录，并以 workspace 作为 Agent cwd。
+`results.jsonl` 只记录运行事实，初始状态为 `unscored_pending_evaluator`。Agent 退出后，只有评估器
+在 workspace 外读取 `pressure/cases.json` 和 `pressure/rubric.json`，将实际输出与隐藏期望进行
+比较。仓库内 Bun source-build 仅可用于 Skill discovery/provider smoke test，不能作为隔离评分结果。
+
 ## 使用离线归因 CLI
 
 归因模块目前随源码仓库发布，并未安装为系统级命令。它不要求当前目录位于

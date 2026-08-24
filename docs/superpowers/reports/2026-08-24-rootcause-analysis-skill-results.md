@@ -4,28 +4,32 @@ Date: 2026-08-24
 
 Branch: `codex/trace-stability-integration`
 
-Scope: Task 6 usage documentation and forward-test validation
+Scope: Task 6 usage documentation, pressure-test isolation, and forward-test validation
 
 ## Executive Result
 
-The deterministic Skill, fixture, query, and report contracts pass. The current
-OpenCode source build discovers the canonical project Skill from
-`.claude/skills/rootcause-analysis/SKILL.md`. No model-generated forward report
+The deterministic Skill, fixture, query, report, and isolation contracts pass.
+The current OpenCode source build discovers the canonical project Skill from
+`.claude/skills/rootcause-analysis/SKILL.md`, but repository source-build runs
+are discovery/provider smoke tests only. No model-generated forward report
 could be evaluated in this environment because Claude is not authenticated and
-OpenCode has no configured provider. These are explicit environment blockers;
+the historical OpenCode source runs had no configured provider. Those attempts
+also predated scored workspace isolation, so they remain explicitly unscored;
 no forward result or rubric score was fabricated.
 
 ## Deterministic Validation
 
 | Check | Result |
 | --- | --- |
-| Root-cause Skill fixture, query, and contract suite | PASS, 84/84 |
+| Root-cause Skill fixture, query, and contract suite | PASS, 100/100 |
 | `trace_query.py` bytecode compilation | PASS |
 | Official `quick_validate.py` Skill validation | PASS, `Skill is valid!` |
 | Skill canonical-location discovery in current OpenCode source build | PASS |
 | Repository whitespace validation | PASS |
 | Fixture immutability check | PASS |
 | Documented `build-requirement` Artifact query | PASS, integrity verified |
+| Seven isolated Agent workspace builds and file-tree audits | PASS |
+| External-binary OpenCode wrapper synthetic cwd check | PASS |
 
 Commands:
 
@@ -34,7 +38,9 @@ python3 -m unittest discover -s tools/rootcause_skill_tests -p 'test_*.py' -v
 
 PYTHONPYCACHEPREFIX=/tmp/observable-opencode-pycache \
 python3 -m py_compile \
-  .claude/skills/rootcause-analysis/scripts/trace_query.py
+  .claude/skills/rootcause-analysis/scripts/trace_query.py \
+  tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+  tools/rootcause_skill_tests/pressure/run_isolated_opencode.py
 
 UV_CACHE_DIR=/tmp/observable-opencode-uv-cache \
 uv run --with pyyaml \
@@ -79,13 +85,32 @@ canonical project file:
 .claude/skills/rootcause-analysis/SKILL.md
 ```
 
-The source build therefore satisfies the Skill-discovery part of the forward
-test. A first run against the default user data directory failed during a
+The source build therefore satisfies only the Skill-discovery smoke check, not
+the scored isolation gate. A first run against the default user data directory failed during a
 database WAL checkpoint because the sandbox could not write that external
 directory. Isolated XDG directories under `/tmp` removed this unrelated startup
 restriction.
 
 ## Forward-Test Protocol
+
+The current scored protocol first uses
+`tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py` to build one
+no-overwrite workspace per case. Each workspace contains exactly the selected
+finalized Trace and verified Artifacts, the canonical Skill, and two
+runtime-specific prompts. It contains no evaluator cases, expected outcomes,
+rubric, sibling fixture, report, Git history, repository path in either prompt,
+or symlink/path escape. Claude runs with the workspace as cwd. OpenCode runs
+through `run_isolated_opencode.py` with an external `OPENCODE_BIN`, the workspace
+as cwd, and isolated HOME/XDG state. Captured output stays outside the Agent
+workspace.
+
+Only the evaluator reads `pressure/cases.json` and `pressure/rubric.json` after
+execution. The builder extracts the exact `question` but never copies the
+`expected` object. Outputs remain `unscored_pending_evaluator` until this
+outside-workspace scoring step completes.
+
+The attempts below are preserved historical smoke evidence. They did not use
+the current isolated scored protocol and therefore remain unscored.
 
 Prompts contained only:
 
@@ -118,8 +143,8 @@ fixture would not exercise a different Skill path.
 
 ### OpenCode
 
-All seven cases were individually submitted through the current source build
-in the preserved round-2 run.
+All seven cases were individually submitted through the repository source build
+in the preserved round-2 smoke run.
 Every prompt instructed the Agent to invoke the `skill` tool with name
 `rootcause-analysis` before analysis. Remote `models.dev` refresh and the file
 watcher were disabled only to keep the provider preflight bounded:
@@ -152,18 +177,19 @@ the signal was delivered. Those records therefore establish neither signal
 delivery nor termination cause and must not be reported as an OpenCode self-exit
 code.
 
-The hardened wrapper now accepts `--batch-root` or
+The current isolated wrapper accepts `--batch-root` or
 `ROOTCAUSE_FORWARD_BATCH_ROOT`, otherwise creates a unique timestamp/PID/UUID
-root, and refuses to overwrite existing directories. It records signal
-attempts separately from successful operating-system signal calls,
-post-signal state, bounded final cleanup, and per-case `wrapper_error` while
-continuing the remaining cases. A fresh `known-root` spot check exercised this
-schema with a one-second timeout. Its observed post-signal return code is
-reported only as post-signal state; no signal is asserted as the cause.
+root, and refuses to overwrite existing directories. It requires
+`--opencode-bin` or `OPENCODE_BIN`, builds each isolated workspace before
+launch, records signal attempts separately from successful operating-system
+signal calls, records post-signal state and bounded final cleanup, and
+continues after per-case `wrapper_error`. The earlier one-second `known-root`
+spot check exercised only the historical source-build wrapper and is not a
+scored Agent result.
 
 ## Case Matrix
 
-| Fixture | Claude | OpenCode | Rubric evaluation |
+| Fixture | Historical Claude smoke | Historical OpenCode source smoke | Rubric evaluation |
 | --- | --- | --- | --- |
 | `known-root` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
 | `ambiguous` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
@@ -181,6 +207,7 @@ restraint, remain **not evaluated** rather than passed or failed.
 ## Observed Guarantees
 
 - The seven canonical fixtures remained unchanged.
+- All seven isolated workspace file trees were audited against exact allowlists; no hidden evaluator data or repository symlink was present.
 - No forward-test output was written into a fixture, Trace bundle, or analyzed
   project.
 - No Trace capture, OpenCode runtime, existing Python attribution module, or
@@ -190,8 +217,9 @@ restraint, remain **not evaluated** rather than passed or failed.
 
 ## Remaining Validation
 
-After authenticating Claude or configuring an OpenCode provider, rerun the
-same seven prompts and score the actual JSON and Markdown against
+After authenticating Claude or configuring a standalone OpenCode binary and
+provider, build all seven isolated workspaces, run from those workspaces, and
+let only the external evaluator score the captured JSON and Markdown against
 `tools/rootcause_skill_tests/pressure/rubric.json`. The key acceptance checks
 remain:
 

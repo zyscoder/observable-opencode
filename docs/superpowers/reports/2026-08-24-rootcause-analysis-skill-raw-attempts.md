@@ -2,7 +2,7 @@
 
 Date: 2026-08-24
 
-This appendix preserves the seven round-2 observations and embeds the hardened wrapper used for future reruns. Historical records are not rewritten: their stderr and timeout observations remain useful, but their legacy `termination_action` field did not independently distinguish a requested signal from a delivered signal. Therefore those records do not prove that SIGINT was delivered or caused process termination.
+This appendix preserves the seven round-2 observations and the round-3 wrapper source for historical audit. Neither historical run used an evaluator-clean Agent workspace, so both remain unscored smoke attempts. Historical records are not rewritten: their stderr and timeout observations remain useful, but their legacy `termination_action` field did not independently distinguish a requested signal from a delivered signal. Therefore those records do not prove that SIGINT was delivered or caused process termination.
 
 ## Claude Code Authentication Attempt
 
@@ -24,13 +24,42 @@ Observed result:
 {"raw_returncode":1,"stdout":"Not logged in · Please run /login\n","stderr":"","timed_out":false,"termination_signal":null,"termination_action":"none; process exited itself"}
 ```
 
-## Deterministic OpenCode Wrapper
+## Current Isolated OpenCode Wrapper
 
-The wrapper accepts `--batch-root` or `ROOTCAUSE_FORWARD_BATCH_ROOT`. Without either, it generates a unique path from UTC timestamp, PID, and UUID. Both batch and case directories use `exist_ok=False`, so reruns never overwrite evidence.
+The scored-run wrapper is maintained as executable source at
+`tools/rootcause_skill_tests/pressure/run_isolated_opencode.py`. It first calls
+`prepare_isolated_bundle.py` for the selected case, then launches a standalone
+OpenCode executable with that case's `workspace` as cwd. The Agent-visible
+workspace contains only the selected finalized Trace and verified Artifacts,
+the canonical `rootcause-analysis` Skill, and the OpenCode/Claude prompts. It
+contains no evaluator `cases.json`, hidden expected outcomes, rubric, sibling
+fixtures, reports, Git history, or symlink to the repository.
 
-Signal records distinguish `signal_attempted`, `signal_sent`, and `last_signal_sent`. `post_signal_returncode` is observational only and is never presented as proof that a requested signal caused termination. `final_cleanup` records the bounded final state. A case-level exception becomes `wrapper_error`; the loop writes that record and continues.
+Use `--opencode-bin` or `OPENCODE_BIN` to supply the standalone executable.
+The wrapper isolates HOME/XDG state, preserves the no-overwrite batch-root and
+safe-signal audit contracts, records per-case errors, and continues remaining
+cases. Captured outputs remain `unscored_pending_evaluator` until the evaluator,
+outside the Agent workspace, compares them with hidden cases and the rubric.
 
-Complete wrapper:
+```bash
+export OPENCODE_BIN=/absolute/path/to/opencode
+python3 tools/rootcause_skill_tests/pressure/run_isolated_opencode.py \
+  --batch-root /tmp/rootcause-forward-<unique>
+```
+
+Repository source-build commands may still verify Skill discovery or provider
+preflight, but they are smoke tests only and cannot claim scored isolation.
+
+## Historical Round-3 Embedded Wrapper (Unscored)
+
+The following source and spot check are preserved verbatim for round-3 audit.
+They ran the Bun source entry point with the repository as cwd and referenced
+repository fixtures directly. They are not the current wrapper and are not
+eligible for scoring.
+
+Its signal records distinguish `signal_attempted`, `signal_sent`, and `last_signal_sent`. `post_signal_returncode` is observational only and is never presented as proof that a requested signal caused termination. `final_cleanup` records the bounded final state. A case-level exception becomes `wrapper_error`; the loop writes that record and continues.
+
+Historical wrapper:
 
 ```python
 #!/usr/bin/env python3
@@ -398,13 +427,13 @@ if __name__ == "__main__":
     main()
 ```
 
-Example full-batch invocation with a unique default root:
+Historical full-batch invocation:
 
 ```bash
 python3 /tmp/rootcause-task6-fix-round3/run_forward.py
 ```
 
-Example explicit-root, single-case spot check:
+Historical explicit-root, single-case spot check:
 
 ```bash
 python3 /tmp/rootcause-task6-fix-round3/run_forward.py \
@@ -456,4 +485,4 @@ process was reaped and was not running at the end.
 
 ## Interpretation
 
-The historical seven-case run observed `error=no providers found cause=Error: no providers found` before model inference. It did not establish an OpenCode self-exit code or a signal-caused termination. The hardened wrapper preserves that distinction for future runs and continues after individual case failures.
+The historical seven-case source-build run observed `error=no providers found cause=Error: no providers found` before model inference. It did not establish an OpenCode self-exit code, a signal-caused termination, or a scored isolated result. The current tracked wrapper preserves the signal distinction, builds evaluator-clean workspaces, uses an external `OPENCODE_BIN`, and continues after individual case failures. Hidden outcomes and the rubric remain evaluator-only inputs after Agent execution.
