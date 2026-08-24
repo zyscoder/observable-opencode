@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import re
 import sys
 import unittest
@@ -20,9 +21,74 @@ REFERENCE_NAMES = {
     "backward-semantic-taint.md",
     "causal-analysis-method.md",
     "node-semantics.md",
+    "report-schema.md",
     "trace-structure.md",
 }
 LINK_PATTERN = re.compile(r"\[[^\]]+\]\((references/[^)#]+\.md)(?:#[^)]+)?\)")
+REQUIRED_TOP_LEVEL = {
+    "schema_version",
+    "question",
+    "trace_binding",
+    "verdict",
+    "root_causes",
+    "causal_chain",
+    "final_impact",
+    "rejected_hypotheses",
+    "evidence_gaps",
+    "recommendations",
+    "evidence_index",
+}
+REQUIRED_RECOMMENDATION = {
+    "recommendation_id",
+    "target",
+    "owner",
+    "priority",
+    "problem_addressed",
+    "proposed_change",
+    "rationale",
+    "expected_effect",
+    "risks",
+    "validation_suggestion",
+    "evidence_refs",
+}
+REQUIRED_OBJECT_KEYS = {
+    "question": {
+        "original", "expected_behavior", "actual_behavior", "discrepancy",
+        "stated_final_impact", "expectation_premise", "observation_premise",
+    },
+    "trace_binding": {
+        "trace_path", "trace_content_sha256", "causal_ir_version", "case_id",
+        "analyzed_at",
+    },
+    "verdict": {
+        "status", "summary", "confidence", "confidence_rationale", "evidence_refs",
+    },
+    "root_causes": {
+        "root_id", "status", "node_ref", "component", "owner", "semantic_defect",
+        "taint_state", "counterfactual", "evidence_refs",
+    },
+    "causal_chain": {
+        "step", "from_ref", "to_ref", "component", "semantic_event", "taint_state",
+        "taint_transition", "explanation", "node_refs", "edge_refs", "artifact_refs",
+        "evidence_refs",
+    },
+    "final_impact": {
+        "category", "status", "description", "direct_effect", "inferred_risks",
+        "unknowns", "evidence_refs",
+    },
+    "rejected_hypotheses": {
+        "hypothesis_id", "hypothesis", "disposition", "why_plausible",
+        "rejection_reason", "evidence_refs",
+    },
+    "evidence_gaps": {
+        "gap_id", "description", "why_it_matters", "needed_evidence",
+        "affected_claims", "related_refs", "evidence_refs",
+    },
+    "evidence_index": {
+        "evidence_id", "evidence_kind", "immutable_ref", "trace_ref",
+        "content_sha256", "excerpt", "interpretation",
+    },
+}
 
 
 def parse_frontmatter(text: str):
@@ -87,8 +153,7 @@ class SkillContractTests(unittest.TestCase):
         links = set(LINK_PATTERN.findall(self.skill_text))
         expected = {f"references/{name}" for name in REFERENCE_NAMES}
         self.assertEqual(links, expected)
-        self.assertEqual(self.skill_text.lower().count("read when"), 4)
-        self.assertNotIn("report-schema.md", self.skill_text)
+        self.assertEqual(self.skill_text.lower().count("read when"), 5)
 
     def test_skill_requires_plain_task_language(self):
         text = self.skill_text.lower()
@@ -229,6 +294,82 @@ class SkillContractTests(unittest.TestCase):
             "Every recommendation must cite its motivating evidence refs.",
             self.skill_text,
         )
+
+    def test_report_json_template_has_exact_top_level_and_recommendation_keys(self):
+        schema = self.references["report-schema.md"]
+        match = re.search(r"```json\n(.*?)\n```", schema, re.DOTALL)
+        self.assertIsNotNone(match)
+        template = json.loads(match.group(1))
+        self.assertEqual(set(template), REQUIRED_TOP_LEVEL)
+        self.assertEqual(template["schema_version"], "rootcause-analysis/v1")
+        self.assertEqual(set(template["recommendations"][0]), REQUIRED_RECOMMENDATION)
+        for key, required in REQUIRED_OBJECT_KEYS.items():
+            value = template[key]
+            example = value[0] if isinstance(value, list) else value
+            self.assertEqual(set(example), required, key)
+
+    def test_report_contract_declares_exact_field_types_and_nullable_fields(self):
+        schema = self.references["report-schema.md"]
+        section = schema.split("## Exact Field Types", 1)
+        self.assertEqual(len(section), 2)
+        types = section[1].split("##", 1)[0]
+        for field_type in (
+            "`string`",
+            "`string | null`",
+            "`number`",
+            "`array<string>`",
+            "`array<object>`",
+        ):
+            self.assertIn(field_type, types)
+        for object_name in REQUIRED_OBJECT_KEYS:
+            self.assertIn(f"`{object_name}`", types)
+
+    def test_report_contract_defines_exact_evidence_linkage_and_enumerations(self):
+        schema = self.references["report-schema.md"]
+        for values in (
+            "`supported | contradicted | unknown`",
+            "`confirmed | probable | inconclusive | no_defect`",
+            "`absent | inherited | transformed | amplified | introduced | blocked | unknown`",
+            "`functional | instruction_following | quality | safety | completeness`",
+            "`critical | high | medium | low`",
+        ):
+            self.assertIn(values, schema)
+        for claim in ("verdict", "root cause", "causal-chain step", "recommendation"):
+            self.assertRegex(
+                schema.lower(),
+                rf"every {re.escape(claim)}[^\n]*`evidence_refs`",
+            )
+        self.assertIn("must resolve through `evidence_index`", schema)
+
+    def test_markdown_contract_mirrors_json_and_ends_with_no_change_statement(self):
+        schema = self.references["report-schema.md"]
+        for heading in (
+            "## Conclusion",
+            "## Expectation Versus Actual Behavior",
+            "## Root Causes",
+            "## Defect Propagation",
+            "## Final Impact",
+            "## Rejected Hypotheses",
+            "## Evidence Gaps And Confidence",
+            "## Recommendations",
+            "## Evidence Index",
+        ):
+            self.assertIn(heading, schema)
+        self.assertIn("[E-001]", schema)
+        self.assertIn("mutually corroborate", schema.lower())
+        self.assertTrue(
+            schema.rstrip().endswith(
+                "No proposed change was applied. All recommendations require separate review and execution."
+            )
+        )
+
+    def test_skill_requires_v1_reports_with_evidence_mirrored_markdown(self):
+        text = self.skill_text
+        self.assertIn("`rootcause-analysis/v1`", text)
+        self.assertIn("evidence-mirrored Markdown", text)
+        self.assertIn("Every conclusion, causal step, root cause, and recommendation", text)
+        self.assertIn("resolve through `evidence_index`", text)
+        self.assertIn("no proposed change was applied", text.lower())
 
     def test_design_matches_search_node_and_artifact_runtime_contracts(self):
         design = self.design_text.lower()
