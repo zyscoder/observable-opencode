@@ -39,12 +39,14 @@ score. See the historical raw-attempt appendix; it is superseded and unscored.
 
 ## Deterministic Verification
 
-The strategic-scope run discovered and passed 102 tests with no skips. Python
+The scope-correction fix round 1 run discovered and passed 109 tests with no skips. Python
 compilation and the official Skill validator passed; the validator reported
 `Skill is valid!`. A fresh seven-bundle audit under
-`/tmp/rootcause-strategic-handoff-r4ig_ieq` found zero hidden-answer leaks, zero
+`/tmp/rootcause-scope-fix-r1-0jhkc8cs` found zero hidden-answer leaks, zero
 symlinks, opaque identity in all seven workspaces, and evaluator provenance only
-outside those workspaces. Fixtures remained unchanged and the diff checks passed.
+outside those workspaces. Every derived Trace passed authoritative validation and
+every copied Artifact matched its recorded `content_sha256`. Fixtures remained
+unchanged and the diff checks passed.
 
 The maintained verification protocol is:
 

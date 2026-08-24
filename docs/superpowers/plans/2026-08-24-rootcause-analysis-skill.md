@@ -699,20 +699,44 @@ symlink back to the repository.
 
 ```bash
 HANDOFF_ROOT=$(mktemp -d /tmp/rootcause-handoff.XXXXXX)
-OPAQUE_CASE_ID=$(python3 -c 'import uuid; print("case-" + uuid.uuid4().hex)')
-BUNDLE="$HANDOFF_ROOT/$OPAQUE_CASE_ID"
-python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
-  --case known-root --opaque-case-id "$OPAQUE_CASE_ID" \
-  --agent-trace-path /workspace/trace.json --destination "$BUNDLE" \
-  > "$HANDOFF_ROOT/evaluator-provenance.json"
+mkdir -p "$HANDOFF_ROOT/bundles" "$HANDOFF_ROOT/provenance"
+
+jq -r '.cases[].fixture' tools/rootcause_skill_tests/pressure/cases.json |
+while IFS= read -r CASE; do
+  OPAQUE_CASE_ID=$(python3 -c 'import uuid; print("case-" + uuid.uuid4().hex)')
+  python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+    --case "$CASE" \
+    --opaque-case-id "$OPAQUE_CASE_ID" \
+    --agent-trace-path /workspace/trace.json \
+    --destination "$HANDOFF_ROOT/bundles/$OPAQUE_CASE_ID" \
+    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json"
+done
 ```
 
-Repeat all seven cases. `prepare_isolated_bundle.py` is the sole evaluator-side
-boundary: it reads only each case's `fixture` and exact `question` from
-`pressure/cases.json` and never copies `expected` data. After Agent execution,
-the evaluator alone reads `cases.json` and `rubric.json` to score captured
-outputs outside the submitted bundle. Agent-visible identity is opaque; fixture
-mapping, derived provenance, and rubric stay evaluator-only.
+`prepare_isolated_bundle.py` is the sole evaluator-side boundary: it reads only
+each case's `fixture` and exact `question` from `pressure/cases.json` and never
+copies `expected` data. It delegates finalized source-Trace and sanitized
+derived-Trace acceptance to the authoritative `trace_query.py validate` command.
+Terminal but source-incomplete inputs remain acceptable when that validator
+accepts them, with exact lifecycle, source-completeness, segment, and diagnostic
+facts preserved in evaluator provenance.
+
+Before writing, the builder performs a collision preflight and rejects Artifact
+paths that collide with reserved bundle files, the canonical Skill tree, one
+another, or portable casefold/Unicode normalization. It builds into a temporary
+sibling, reopens every copied Artifact and verifies its declared
+`content_sha256`, then publishes atomically. Any validation or write failure
+triggers rollback of the temporary tree, destination, and new provenance so no
+partial handoff remains.
+
+`--provenance-output` is required, must be outside the bundle, and uses exclusive
+creation. Each opaque case therefore receives its own evaluator-only
+`${OPAQUE_CASE_ID}.provenance.json`; do not use shell redirection or a shared
+provenance filename. Existing bundle or provenance paths are rejected, which
+also prevents accidental opaque-ID reuse. After Agent execution, the evaluator
+alone reads the per-case provenance, `cases.json`, and `rubric.json` to score
+captured outputs outside the submitted bundle. Agent-visible identity is opaque;
+fixture mapping, derived provenance, and rubric stay evaluator-only.
 
 Submit each bundle to an existing trusted benchmark Harness or isolated
 execution service. This repository does not implement credential injection,

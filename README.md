@@ -805,14 +805,19 @@ Agent 可见目录、prompt 和派生 Trace 只使用每轮新生成的 opaque I
 映射、原始/派生摘要和隐藏 rubric 只保存在评估器侧：
 
 ```bash
-export FORWARD_ROOT=$(mktemp -d /tmp/rootcause-forward.XXXXXX)
-export OPAQUE_CASE_ID=$(python3 -c 'import uuid; print("case-" + uuid.uuid4().hex)')
-python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
-  --case known-root \
-  --opaque-case-id "$OPAQUE_CASE_ID" \
-  --agent-trace-path /workspace/trace.json \
-  --destination "$FORWARD_ROOT/$OPAQUE_CASE_ID" \
-  > "$FORWARD_ROOT/evaluator-provenance.json"
+export HANDOFF_ROOT=$(mktemp -d /tmp/rootcause-handoff.XXXXXX)
+mkdir -p "$HANDOFF_ROOT/bundles" "$HANDOFF_ROOT/provenance"
+
+jq -r '.cases[].fixture' tools/rootcause_skill_tests/pressure/cases.json |
+while IFS= read -r CASE; do
+  export OPAQUE_CASE_ID=$(python3 -c 'import uuid; print("case-" + uuid.uuid4().hex)')
+  python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+    --case "$CASE" \
+    --opaque-case-id "$OPAQUE_CASE_ID" \
+    --agent-trace-path /workspace/trace.json \
+    --destination "$HANDOFF_ROOT/bundles/$OPAQUE_CASE_ID" \
+    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json"
+done
 ```
 
 每个 workspace 只包含该 case 的 finalize 派生 `trace.json`、Trace 声明且摘要校验通过的 Artifacts、
@@ -822,6 +827,17 @@ python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
 每个 canonical node 必须声明有效 `source_hash`；`--agent-trace-path` 必须是无控制字符、无 `..`
 的绝对 POSIX 路径。派生 Trace 只替换 manifest/scope 的运行身份并重算节点完整性，任务事实与
 用户问题保持原样。
+
+builder 通过 `trace_query.py validate` 复用根因分析 Skill 的权威 finalized Trace 判定，并在匿名化后
+再次验证派生 Trace。终态但 source-incomplete 的 Trace 只要权威 validator 接受就可以交接；原始
+`lifecycle`、`source_completeness`、segment 和 diagnostics 会原样进入 evaluator provenance。
+Artifact 路径会在任何写入前检查保留文件、Skill 目录、重复路径以及 casefold/Unicode 规范化碰撞。
+完整临时构建后，builder 会重新打开每个 Artifact 并核验 `content_sha256`，然后才发布 bundle。
+
+`--provenance-output` 必填，必须位于 bundle 外，并以 exclusive-create 写入；每个 opaque case 使用
+独立的 `${OPAQUE_CASE_ID}.provenance.json`，不要通过 shell 重定向写共享文件。目标 bundle 或
+provenance 已存在时会直接拒绝，可同时阻止 opaque ID 重用。任何验证或写入失败都会回滚临时目录、
+bundle 和本次 provenance，不留下 partial handoff。
 
 把 opaque workspace 提交给组织现有的 **可信 benchmark Harness / 隔离执行服务**。该外部系统
 必须独立管理认证凭据、文件系统与网络隔离、运行时清理、镜像或执行环境证明、输出审计及超时终止；

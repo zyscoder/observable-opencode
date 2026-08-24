@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -16,6 +17,7 @@ PRESSURE = ROOT / "tools" / "rootcause_skill_tests" / "pressure"
 RUNNER = PRESSURE / "prepare_isolated_bundle.py"
 CASES_PATH = PRESSURE / "cases.json"
 SKILL_ROOT = ROOT / ".claude" / "skills" / "rootcause-analysis"
+TRACE_QUERY = SKILL_ROOT / "scripts" / "trace_query.py"
 
 
 def payload_hash(value):
@@ -54,6 +56,19 @@ def assert_typed_refs(test, refs, label):
 class FixtureContractTests(unittest.TestCase):
     def traces(self):
         return sorted(FIXTURES.glob("*/trace.json"))
+
+    def load_builder(self, name):
+        spec = importlib.util.spec_from_file_location(name, RUNNER)
+        module = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(module)
+        return module
+
+    def copied_fixture_root(self, module, root, case="known-root"):
+        fixture_root = root / "fixtures"
+        shutil.copytree(FIXTURES / case, fixture_root / case)
+        module.FIXTURES = fixture_root
+        return fixture_root / case
 
     def test_traces_use_full_canonical_node_and_edge_envelopes(self):
         for path in self.traces():
@@ -149,6 +164,7 @@ class FixtureContractTests(unittest.TestCase):
                 with self.subTest(case=case):
                     opaque_id = f"case-{uuid.uuid4().hex}"
                     destination = Path(directory) / opaque_id
+                    provenance_path = Path(directory) / f"{opaque_id}.provenance.json"
                     result = subprocess.run(
                         [
                             sys.executable,
@@ -161,17 +177,24 @@ class FixtureContractTests(unittest.TestCase):
                             opaque_id,
                             "--agent-trace-path",
                             "/workspace/trace.json",
+                            "--provenance-output",
+                            str(provenance_path),
                         ],
                         text=True,
                         capture_output=True,
                         check=False,
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "")
 
-                    provenance = json.loads(result.stdout)
+                    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
                     self.assertEqual(provenance["source_fixture"], case)
                     self.assertEqual(provenance["opaque_case_id"], opaque_id)
                     self.assertEqual(provenance["derivation"]["kind"], "sanitized_identity_projection")
+                    self.assertIn("source_completeness", provenance)
+                    self.assertIn("lifecycle", provenance)
+                    self.assertIn("diagnostics", provenance)
+                    self.assertFalse(provenance_path.is_relative_to(destination))
 
                     source_trace = json.loads((FIXTURES / case / "trace.json").read_text(encoding="utf-8"))
                     trace = json.loads((destination / "trace.json").read_text(encoding="utf-8"))
@@ -207,6 +230,18 @@ class FixtureContractTests(unittest.TestCase):
                         provenance["derived_trace_sha256"],
                     )
                     self.assertNotEqual(trace["manifest"], source_trace["manifest"])
+                    declared_artifacts = {
+                        item["artifact_id"]: item for item in provenance["artifacts"]
+                    }
+                    self.assertEqual(set(declared_artifacts), {
+                        item["artifact_id"] for item in trace["artifacts"]
+                    })
+                    for artifact in trace["artifacts"]:
+                        copied = destination / artifact["path"]
+                        self.assertEqual(
+                            declared_artifacts[artifact["artifact_id"]]["content_sha256"],
+                            hashlib.sha256(copied.read_bytes()).hexdigest(),
+                        )
                     for relative in canonical_skill_files:
                         source = ROOT / relative
                         self.assertEqual((destination / relative).read_bytes(), source.read_bytes())
@@ -261,6 +296,7 @@ class FixtureContractTests(unittest.TestCase):
     def test_isolated_bundle_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "case-0123456789abcdef0123456789abcdef"
+            provenance = Path(directory) / "case-0123456789abcdef0123456789abcdef.provenance.json"
             command = [
                 sys.executable,
                 str(RUNNER),
@@ -270,6 +306,8 @@ class FixtureContractTests(unittest.TestCase):
                 str(destination),
                 "--opaque-case-id",
                 "case-0123456789abcdef0123456789abcdef",
+                "--provenance-output",
+                str(provenance),
             ]
             first = subprocess.run(command, text=True, capture_output=True, check=False)
             self.assertEqual(first.returncode, 0, first.stderr)
@@ -286,6 +324,7 @@ class FixtureContractTests(unittest.TestCase):
                 if path.is_file()
             }
             self.assertEqual(after, before)
+            self.assertTrue(provenance.is_file())
 
     def test_isolated_bundle_rejects_artifact_hash_mismatch(self):
         spec = importlib.util.spec_from_file_location("prepare_isolated_bundle_hash", RUNNER)
@@ -308,6 +347,7 @@ class FixtureContractTests(unittest.TestCase):
                     root / "case-0123456789abcdef0123456789abcdef",
                     "case-0123456789abcdef0123456789abcdef",
                     "/workspace/trace.json",
+                    provenance_output=root / "hash-mismatch.provenance.json",
                 )
 
     def test_isolated_bundle_requires_every_node_source_hash(self):
@@ -333,6 +373,7 @@ class FixtureContractTests(unittest.TestCase):
                     root / "case-0123456789abcdef0123456789abcdef",
                     "case-0123456789abcdef0123456789abcdef",
                     "/workspace/trace.json",
+                    provenance_output=root / "source-hash.provenance.json",
                 )
 
     def test_isolated_bundle_rejects_unsafe_agent_trace_paths(self):
@@ -354,7 +395,246 @@ class FixtureContractTests(unittest.TestCase):
                             root / opaque_id,
                             opaque_id,
                             trace_path,
+                            provenance_output=root / f"{opaque_id}.provenance.json",
                         )
+
+    def test_artifact_paths_cannot_collide_with_bundle_or_each_other(self):
+        collision_sets = (
+            ("trace", ["trace.json"]),
+            ("claude-prompt", ["prompt-claude.md"]),
+            ("opencode-prompt", ["prompt-opencode.md"]),
+            ("skill-prefix", [".CLAUDE/skills/rootcause-analysis/injected.md"]),
+            ("duplicate", ["artifacts/same", "artifacts/same"]),
+            ("casefold", ["artifacts/Result", "artifacts/result"]),
+            ("unicode", ["artifacts/Café", "artifacts/Café"]),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            batch_root = Path(directory)
+            for index, (label, paths) in enumerate(collision_sets):
+                with self.subTest(label=label):
+                    root = batch_root / label
+                    root.mkdir()
+                    module = self.load_builder(f"prepare_collision_{index}")
+                    source = self.copied_fixture_root(module, root)
+                    trace_path = source / "trace.json"
+                    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+                    trace["artifacts"] = [
+                        {
+                            "artifact_id": f"artifact-{item_index}",
+                            "path": path,
+                            "hash": "sha256:" + "0" * 64,
+                        }
+                        for item_index, path in enumerate(paths)
+                    ]
+                    trace_path.write_text(json.dumps(trace), encoding="utf-8")
+                    opaque_id = f"case-{index:032x}"
+                    destination = root / opaque_id
+                    provenance = root / f"{opaque_id}.provenance.json"
+
+                    with self.assertRaisesRegex(ValueError, "collision|reserved"):
+                        module.prepare(
+                            "known-root",
+                            destination,
+                            opaque_id,
+                            "/workspace/trace.json",
+                            provenance_output=provenance,
+                        )
+                    self.assertFalse(destination.exists())
+                    self.assertFalse(provenance.exists())
+
+    def test_postwrite_artifact_hash_failure_rolls_back_bundle_and_provenance(self):
+        module = self.load_builder("prepare_postwrite_hash")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-10000000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            original_copy = module.shutil.copyfile
+
+            def corrupt_artifact(source, target):
+                result = original_copy(source, target)
+                if "artifacts" in Path(target).parts:
+                    Path(target).write_bytes(b"postwrite corruption")
+                return result
+
+            with mock.patch.object(module.shutil, "copyfile", side_effect=corrupt_artifact):
+                with self.assertRaisesRegex(ValueError, "content SHA-256"):
+                    module.prepare(
+                        "known-root",
+                        destination,
+                        opaque_id,
+                        "/workspace/trace.json",
+                        provenance_output=provenance,
+                    )
+
+            self.assertFalse(destination.exists())
+            self.assertFalse(provenance.exists())
+            self.assertEqual(list(root.glob(f".{opaque_id}.tmp-*")), [])
+
+    def test_authoritative_validator_rejects_invalid_source_without_partials(self):
+        invalid_cases = (
+            ("unsupported", lambda trace: trace.update({"trace_version": "7.0"})),
+            ("missing-envelope", lambda trace: trace.pop("journal")),
+            ("nonterminal", lambda trace: trace["manifest"].update({"status": "running"})),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            batch_root = Path(directory)
+            for index, (label, mutate) in enumerate(invalid_cases):
+                with self.subTest(label=label):
+                    root = batch_root / label
+                    root.mkdir()
+                    module = self.load_builder(f"prepare_invalid_{index}")
+                    source = self.copied_fixture_root(module, root)
+                    trace_path = source / "trace.json"
+                    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+                    mutate(trace)
+                    trace_path.write_text(json.dumps(trace), encoding="utf-8")
+                    opaque_id = f"case-{index + 20:032x}"
+                    destination = root / opaque_id
+                    provenance = root / f"{opaque_id}.provenance.json"
+
+                    with self.assertRaisesRegex(ValueError, "finalized Trace validation"):
+                        module.prepare(
+                            "known-root",
+                            destination,
+                            opaque_id,
+                            "/workspace/trace.json",
+                            provenance_output=provenance,
+                        )
+                    self.assertFalse(destination.exists())
+                    self.assertFalse(provenance.exists())
+
+    def test_source_incomplete_trace_is_accepted_with_exact_validator_facts(self):
+        module = self.load_builder("prepare_source_incomplete")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.copied_fixture_root(module, root)
+            trace_path = source / "trace.json"
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            trace["manifest"].update(
+                {
+                    "recovery_status": "incomplete_journal_replay",
+                    "historical_interruptions": True,
+                    "recovery": {"dropped_lines": 2},
+                }
+            )
+            trace["diagnostics"] = [{"code": "journal_replay_incomplete"}]
+            trace["metrics"]["trace_health"] = {"issues": [{"code": "missing_terminal"}]}
+            trace_path.write_text(json.dumps(trace), encoding="utf-8")
+            authoritative = subprocess.run(
+                [sys.executable, str(TRACE_QUERY), "validate", "--trace", str(trace_path)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(authoritative.returncode, 0, authoritative.stderr)
+            expected = json.loads(authoritative.stdout)
+            opaque_id = "case-20000000000000000000000000000000"
+            destination = root / opaque_id
+            provenance_path = root / f"{opaque_id}.provenance.json"
+
+            module.prepare(
+                "known-root",
+                destination,
+                opaque_id,
+                "/workspace/trace.json",
+                provenance_output=provenance_path,
+            )
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            self.assertEqual(provenance["source_completeness"], expected["recovery"])
+            self.assertEqual(provenance["lifecycle"], expected["lifecycle"])
+            self.assertEqual(provenance["segments"], expected["segments"])
+            self.assertEqual(provenance["diagnostics"], expected["diagnostics"])
+            self.assertFalse(provenance["source_completeness"]["source_complete"])
+
+    def test_sanitized_trace_is_authoritatively_revalidated_before_publish(self):
+        module = self.load_builder("prepare_derived_validation")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-30000000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            original_sanitize = module.sanitize_trace_identity
+
+            def invalidate_derived(trace, case_id):
+                derived = original_sanitize(trace, case_id)
+                derived["causal_ir_version"] = "2.0"
+                return derived
+
+            with mock.patch.object(module, "sanitize_trace_identity", side_effect=invalidate_derived):
+                with self.assertRaisesRegex(ValueError, "finalized Trace validation"):
+                    module.prepare(
+                        "known-root",
+                        destination,
+                        opaque_id,
+                        "/workspace/trace.json",
+                        provenance_output=provenance,
+                    )
+            self.assertFalse(destination.exists())
+            self.assertFalse(provenance.exists())
+
+    def test_provenance_is_required_external_and_no_overwrite(self):
+        module = self.load_builder("prepare_provenance_contract")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-40000000000000000000000000000000"
+
+            missing_cli = subprocess.run(
+                [
+                    sys.executable,
+                    str(RUNNER),
+                    "--case",
+                    "known-root",
+                    "--destination",
+                    str(root / "case-43000000000000000000000000000000"),
+                    "--opaque-case-id",
+                    "case-43000000000000000000000000000000",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(missing_cli.returncode, 2)
+            self.assertIn("--provenance-output", missing_cli.stderr)
+            self.assertFalse((root / "case-43000000000000000000000000000000").exists())
+
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                module.prepare(
+                    "known-root",
+                    root / opaque_id,
+                    opaque_id,
+                    "/workspace/trace.json",
+                    provenance_output=None,
+                )
+            self.assertFalse((root / opaque_id).exists())
+
+            inside_destination = root / "case-41000000000000000000000000000000"
+            with self.assertRaisesRegex(ValueError, "outside"):
+                module.prepare(
+                    "known-root",
+                    inside_destination,
+                    inside_destination.name,
+                    "/workspace/trace.json",
+                    provenance_output=inside_destination / "provenance.json",
+                )
+            self.assertFalse(inside_destination.exists())
+
+            destination = root / "case-42000000000000000000000000000000"
+            provenance = root / "existing.provenance.json"
+            provenance.write_text("sentinel", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "provenance"):
+                module.prepare(
+                    "known-root",
+                    destination,
+                    destination.name,
+                    "/workspace/trace.json",
+                    provenance_output=provenance,
+                )
+            self.assertFalse(destination.exists())
+            self.assertEqual(provenance.read_text(encoding="utf-8"), "sentinel")
 
     def test_pressure_helpers_only_prepare_isolated_bundles(self):
         helpers = sorted(PRESSURE.glob("*.py"))
@@ -400,6 +680,7 @@ class FixtureContractTests(unittest.TestCase):
                     root / "case-0123456789abcdef0123456789abcdef",
                     "case-0123456789abcdef0123456789abcdef",
                     "/workspace/trace.json",
+                    provenance_output=root / "symlink.provenance.json",
                 )
 
 

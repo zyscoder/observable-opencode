@@ -21,18 +21,30 @@ execution service that is independently operated and reviewed.
 `prepare_isolated_bundle.py` remains the sole evaluation helper. For each of the
 seven fixture cases it:
 
-1. validates the finalized source Trace and canonical node integrity;
+1. validates the finalized source Trace through the authoritative
+   `trace_query.py validate` contract and checks canonical node integrity;
 2. verifies every declared Artifact digest and containment boundary;
 3. creates a no-overwrite workspace with a fresh opaque case identity;
 4. sanitizes manifest and scope identities and recomputes derived integrity;
 5. includes the canonical `rootcause-analysis` Skill and runtime-specific prompts;
 6. preserves the exact user question while excluding hidden expected outcomes;
-7. emits fixture mapping, source digest, derived digest, and derivation provenance
-   to evaluator-side stdout rather than into the Agent-visible bundle.
+7. validates the sanitized derived Trace through the same authoritative contract;
+8. writes fixture mapping, source/derived digests, exact lifecycle and
+   source-completeness diagnostics, Artifact digests, and derivation provenance
+   to a required evaluator-side file outside the Agent-visible bundle.
 
 Every canonical node must provide a valid source hash. The Harness-visible Trace
 path embedded in prompts must be an absolute POSIX path without control characters
 or parent traversal.
+
+Artifact paths are collision-checked before any write against reserved bundle
+files, the canonical Skill prefix, duplicates, and portable casefold/Unicode
+normalization. Construction occurs in a temporary sibling; every Artifact is
+reopened and checked against its declared `content_sha256` before atomic publish.
+Failure removes the temporary tree, destination, and newly created provenance,
+so no partial handoff remains. The required `--provenance-output` is exclusively
+created outside the bundle, one unique file per opaque case, and is never produced
+through shell redirection or a shared filename.
 
 The bundle contains no case catalog, rubric, sibling fixture, report, Git history,
 semantic fixture identity, or symlink back to the repository.
@@ -65,13 +77,13 @@ outside this repository and must not be inferred from these checks.
 
 ## Verified Result
 
-- 102 deterministic tests passed with no skips.
+- 109 deterministic tests passed with no skips in scope-correction fix round 1.
 - `trace_query.py` and `prepare_isolated_bundle.py` compiled successfully.
 - The official Skill validator reported `Skill is valid!`.
 - Seven fresh bundles were built under
-  `/tmp/rootcause-strategic-handoff-r4ig_ieq` with opaque identities, zero
-  hidden-answer leaks, zero symlinks, and evaluator provenance outside every
-  Agent workspace.
+  `/tmp/rootcause-scope-fix-r1-0jhkc8cs` with opaque identities, zero hidden-answer
+  leaks, zero symlinks, evaluator provenance outside every Agent workspace,
+  authoritative derived-Trace validation, and verified post-copy Artifact hashes.
 - The canonical fixtures were unchanged and repository diff checks passed.
 
 No Agent was launched and no scored result is claimed by this verification.
