@@ -362,8 +362,13 @@ class SkillContractTests(unittest.TestCase):
             "source_data_complete",
             "historical_interruptions",
             "interrupted_unfinalized",
-            "one traversal relation per source-target pair",
-            "recorded edge takes precedence",
+            "every semantically distinct eligible formal edge",
+            "relation, derivation method, evidence provenance, and evidence tier",
+            "suppresses synthesized `record_source`",
+            "remaining_frontier_edge_refs",
+            "recorded recovery status is reported separately",
+            "does not by itself make `source_complete` false",
+            "dropped lines, a poisoned journal, historical interruptions, or running or interrupted segments",
         ):
             self.assertIn(phrase, structure)
 

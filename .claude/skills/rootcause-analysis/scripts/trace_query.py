@@ -22,6 +22,7 @@ FINALIZE_HINT = "Run observable-trace finalize and pass its logical trace.json o
 SUPPORTED_TRACE_VERSIONS = ("6.0",)
 SUPPORTED_CAUSAL_IR_VERSIONS = ("1.0",)
 TERMINAL_STATUSES = ("success", "error", "cancelled")
+INCOMPLETE_RECOVERY_STATUSES = ("incomplete_journal_replay", "incomplete_segment_history")
 SAFE_DESCRIPTOR_SUPPORT = (
     hasattr(os, "O_DIRECTORY")
     and hasattr(os, "O_NOFOLLOW")
@@ -197,36 +198,60 @@ def _finalization_facts(trace: Mapping[str, object]) -> Tuple[Mapping[str, objec
             lifecycle[field] = value
 
     segment_summary = _mapping(manifest.get("segment_summary"))
+    recorded_segments = manifest.get("segments")
+    recorded_segments = recorded_segments if isinstance(recorded_segments, list) else []
+    segment_statuses = Counter(
+        _string(_mapping(segment).get("status")) for segment in recorded_segments
+    )
     segments = {
-        field: _count(segment_summary.get(field))
-        for field in (
-            "count",
-            "completed",
-            "failed",
-            "cancelled",
-            "interrupted_unfinalized",
-            "running",
-        )
+        "count": max(_count(segment_summary.get("count")), len(recorded_segments)),
+        **{
+            field: max(_count(segment_summary.get(field)), segment_statuses[field])
+            for field in (
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted_unfinalized",
+                "running",
+            )
+        },
     }
     recorded_recovery = _mapping(manifest.get("recovery"))
-    recovery_status = _string(manifest.get("recovery_status")) or "complete"
+    recorded_status = _string(manifest.get("recovery_status")) or None
+    source_recovery_status = _string(manifest.get("source_recovery_status")) or None
+    session_recovery_status = _string(_mapping(manifest.get("session_recovery")).get("status")) or None
     historical_interruptions = manifest.get("historical_interruptions") is True
     dropped_lines = _count(recorded_recovery.get("dropped_lines"))
     journal_poisoned = journal.get("poisoned") is True
+    recovery_segments = recorded_recovery.get("segments")
+    recovery_segments = recovery_segments if isinstance(recovery_segments, list) else []
+    unclosed_recovery_segments = sum(
+        _string(_mapping(segment).get("status")) in ("interrupted_unfinalized", "running")
+        for segment in recovery_segments
+    )
+    explicitly_incomplete_status = any(
+        status in INCOMPLETE_RECOVERY_STATUSES
+        for status in (recorded_status, source_recovery_status, session_recovery_status)
+    )
     source_complete = not (
-        recovery_status != "complete"
+        explicitly_incomplete_status
         or historical_interruptions
         or dropped_lines
         or journal_poisoned
         or segments["interrupted_unfinalized"]
         or segments["running"]
+        or unclosed_recovery_segments
     )
     recovery = {
-        "status": recovery_status,
+        "status": "complete" if source_complete else "incomplete",
+        "recorded_status": recorded_status,
+        "source_recovery_status": source_recovery_status,
+        "session_recovery_status": session_recovery_status,
         "source_complete": source_complete,
         "historical_interruptions": historical_interruptions,
         "dropped_lines": dropped_lines,
         "journal_poisoned": journal_poisoned,
+        "unclosed_recovery_segments": unclosed_recovery_segments,
     }
 
     trace_health = metrics.get("trace_health")
@@ -391,7 +416,7 @@ class TraceIndex:
             )
 
         known_refs = {node.ref for node in nodes}
-        traversal_candidates = [
+        formal_candidates = [
             edge
             for edge in edges
             if edge.eligible_for_attribution
@@ -400,12 +425,35 @@ class TraceIndex:
             and edge.source in known_refs
             and edge.target in known_refs
         ]
+        traversal_edges = []
+        formal_identities = set()
+        formal_pairs = set()
+        for edge in formal_candidates:
+            identity = (
+                edge.source,
+                edge.target,
+                edge.relation,
+                edge.derivation_method,
+                edge.evidence_refs,
+                edge.evidence_tier,
+            )
+            if identity in formal_identities:
+                continue
+            formal_identities.add(identity)
+            formal_pairs.add((edge.source, edge.target))
+            traversal_edges.append(edge)
+
+        synthesized_pairs = set()
         for node in nodes:
             for source_ref in node.source_refs:
                 source = aliases.get(source_ref, source_ref)
                 if source == node.ref or source not in known_refs:
                     continue
-                traversal_candidates.append(
+                pair = (source, node.ref)
+                if pair in formal_pairs or pair in synthesized_pairs:
+                    continue
+                synthesized_pairs.add(pair)
+                traversal_edges.append(
                     EdgeView(
                         ref="edge:record_source:{0}:{1}".format(node.ref, source),
                         source=source,
@@ -417,15 +465,6 @@ class TraceIndex:
                         derivation_method="source_refs",
                     )
                 )
-
-        traversal_edges = []
-        traversal_relations = set()
-        for edge in traversal_candidates:
-            relation = (edge.source, edge.target)
-            if relation in traversal_relations:
-                continue
-            traversal_relations.add(relation)
-            traversal_edges.append(edge)
 
         lifecycle, recovery, segments, diagnostics = _finalization_facts(trace)
         return cls(
@@ -590,6 +629,7 @@ class TraceIndex:
         queue = deque([((canonical_start,), ())])
         paths = []
         remaining = []
+        remaining_edges = []
 
         while queue and len(paths) < limit:
             node_refs, path_edges = queue.popleft()
@@ -601,6 +641,7 @@ class TraceIndex:
                 paths.append(self._path_to_dict(node_refs, path_edges))
                 if candidates:
                     remaining.append(current_ref)
+                    remaining_edges.extend(edge.ref for edge in candidates)
                 continue
             if not candidates:
                 paths.append(self._path_to_dict(node_refs, path_edges))
@@ -608,10 +649,14 @@ class TraceIndex:
             for edge in candidates:
                 if len(queue) >= limit:
                     remaining.append(edge.source)
+                    remaining_edges.append(edge.ref)
                     continue
                 queue.append((node_refs + (edge.source,), path_edges + (edge,)))
 
-        remaining.extend(node_refs[-1] for node_refs, _ in queue)
+        for node_refs, path_edges in queue:
+            remaining.append(node_refs[-1])
+            if path_edges:
+                remaining_edges.append(path_edges[-1].ref)
         return {
             "start_ref": canonical_start,
             "paths": paths,
@@ -619,6 +664,7 @@ class TraceIndex:
             "max_depth": max_depth,
             "truncated": bool(remaining),
             "remaining_frontier_refs": self._unique_refs(remaining),
+            "remaining_frontier_edge_refs": self._unique_refs(remaining_edges),
         }
 
     def artifact(self, artifact_id: str, max_chars: int) -> Mapping[str, object]:

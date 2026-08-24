@@ -160,7 +160,9 @@ class TraceQueryTests(unittest.TestCase):
                 {
                     "status": "error",
                     "recovery_status": "incomplete_journal_replay",
+                    "source_recovery_status": "producer_recovered",
                     "historical_interruptions": True,
+                    "session_recovery": {"status": "incomplete_segment_history"},
                     "recovery": {"dropped_lines": 2, "segments": [{"status": "interrupted_unfinalized"}]},
                     "segment_summary": {
                         "count": 3,
@@ -180,11 +182,15 @@ class TraceQueryTests(unittest.TestCase):
             summary = self.query_json("summary", "--trace", str(trace))
 
         expected_recovery = {
-            "status": "incomplete_journal_replay",
+            "status": "incomplete",
+            "recorded_status": "incomplete_journal_replay",
+            "source_recovery_status": "producer_recovered",
+            "session_recovery_status": "incomplete_segment_history",
             "source_complete": False,
             "historical_interruptions": True,
             "dropped_lines": 2,
             "journal_poisoned": True,
+            "unclosed_recovery_segments": 1,
         }
         expected_segments = {
             "count": 3,
@@ -205,6 +211,41 @@ class TraceQueryTests(unittest.TestCase):
             self.assertEqual(response["recovery"], expected_recovery)
             self.assertEqual(response["segments"], expected_segments)
             self.assertEqual(response["diagnostics"], expected_diagnostics)
+
+    def test_recovered_producer_status_does_not_imply_incomplete_source(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["manifest"]["recovery_status"] = "producer_recovered"
+            self.write_trace(trace, payload)
+            response = self.query_json("validate", "--trace", str(trace))
+
+        self.assertEqual(response["recovery"]["status"], "complete")
+        self.assertEqual(response["recovery"]["recorded_status"], "producer_recovered")
+        self.assertTrue(response["recovery"]["source_complete"])
+
+    def test_explicit_data_loss_and_unclosed_segments_mark_source_incomplete(self):
+        cases = (
+            ("incomplete status", lambda payload: payload["manifest"].update({"recovery_status": "incomplete_journal_replay"})),
+            ("dropped lines", lambda payload: payload["manifest"].update({"recovery": {"dropped_lines": 1}})),
+            ("poisoned journal", lambda payload: payload["journal"].update({"poisoned": True})),
+            ("running segment", lambda payload: payload["manifest"].update({"segments": [{"status": "running"}]})),
+            (
+                "interrupted recovery segment",
+                lambda payload: payload["manifest"].update(
+                    {"recovery": {"dropped_lines": 0, "segments": [{"status": "interrupted_unfinalized"}]}}
+                ),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                with self.copied_known_root() as (trace, _):
+                    payload = json.loads(trace.read_text(encoding="utf-8"))
+                    mutate(payload)
+                    self.write_trace(trace, payload)
+                    response = self.query_json("validate", "--trace", str(trace))
+
+                self.assertEqual(response["recovery"]["status"], "incomplete")
+                self.assertFalse(response["recovery"]["source_complete"])
 
     def test_validate_rejects_html_and_segment_journal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -471,6 +512,118 @@ class TraceQueryTests(unittest.TestCase):
         self.assertEqual(payload["edges"][0]["relation"], "context_influences_decision")
         self.assertEqual(payload["edges"][0]["evidence_refs"], ["node:ctx_1"])
         self.assertNotEqual(payload["edges"][0]["relation"], "record_source")
+
+    def test_traversal_preserves_distinct_formal_edge_semantics_for_same_pair(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["edges"].append(
+                self.edge(
+                    "edge_req_ctx_artifact",
+                    "req_1",
+                    "ctx_1",
+                    original_relation="artifact_confirms_context",
+                    normalized_relation="derived_from",
+                    derivation_method="artifact_match",
+                    evidence_tier="content_matched",
+                    evidence_refs=[{"ref_type": "artifact", "ref_id": ARTIFACT_ID}],
+                )
+            )
+            self.write_trace(trace, payload)
+            neighbors = self.query_json(
+                "neighbors",
+                "--trace",
+                str(trace),
+                "--ref",
+                "node:ctx_1",
+                "--direction",
+                "upstream",
+            )
+            paths = self.query_json("paths", "--trace", str(trace), "--start", "node:final_1")
+
+        self.assertEqual(
+            [edge["ref"] for edge in neighbors["edges"]],
+            ["edge:edge_req_ctx", "edge:edge_req_ctx_artifact"],
+        )
+        self.assertEqual(len(paths["paths"]), 2)
+        self.assertEqual(paths["paths"][0]["node_refs"], paths["paths"][1]["node_refs"])
+        self.assertNotEqual(paths["paths"][0]["edge_refs"], paths["paths"][1]["edge_refs"])
+        alternate = paths["paths"][1]["edges"][-1]
+        self.assertEqual(alternate["relation"], "artifact_confirms_context")
+        self.assertEqual(alternate["derivation_method"], "artifact_match")
+        self.assertEqual(alternate["evidence_refs"], ["artifact:" + ARTIFACT_ID])
+
+    def test_traversal_deduplicates_exact_synthesized_source_projections(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["nodes"].extend(
+                [
+                    {"node_id": "synth_root"},
+                    {
+                        "node_id": "synth_child",
+                        "source_refs": ["node:synth_root", {"ref_type": "node", "ref_id": "synth_root"}],
+                    },
+                ]
+            )
+            self.write_trace(trace, payload)
+            response = self.query_json(
+                "neighbors",
+                "--trace",
+                str(trace),
+                "--ref",
+                "node:synth_child",
+                "--direction",
+                "upstream",
+            )
+
+        self.assertEqual(len(response["edges"]), 1)
+        self.assertEqual(response["edges"][0]["relation"], "record_source")
+
+    def test_compatibility_formal_edge_suppresses_source_ref_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace.json"
+            self.write_trace(trace, self.compatibility_only_payload())
+            response = self.query_json(
+                "neighbors",
+                "--trace",
+                str(trace),
+                "--ref",
+                "record:dec_1",
+                "--direction",
+                "upstream",
+            )
+
+        self.assertEqual(len(response["edges"]), 1)
+        self.assertEqual(response["edges"][0]["ref"], "edge:edge_ctx_dec")
+        self.assertNotEqual(response["edges"][0]["relation"], "record_source")
+
+    def test_path_limit_reports_unexplored_distinct_edge_frontier(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["edges"].append(
+                self.edge(
+                    "edge_req_ctx_alternative",
+                    "req_1",
+                    "ctx_1",
+                    original_relation="alternative_support",
+                    derivation_method="independent_observation",
+                    evidence_refs=[{"ref_type": "node", "ref_id": "req_1"}],
+                )
+            )
+            self.write_trace(trace, payload)
+            response = self.query_json(
+                "paths",
+                "--trace",
+                str(trace),
+                "--start",
+                "node:final_1",
+                "--limit",
+                "1",
+            )
+
+        self.assertEqual(len(response["paths"]), 1)
+        self.assertTrue(response["truncated"])
+        self.assertEqual(response["remaining_frontier_refs"], ["node:req_1"])
+        self.assertEqual(response["remaining_frontier_edge_refs"], ["edge:edge_req_ctx_alternative"])
 
     def test_query_limit_marks_output_truncated_without_hiding_frontier(self):
         payload = self.query_json(
