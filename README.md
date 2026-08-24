@@ -707,6 +707,77 @@ test "$(jq -r '.generation' "$CASE_DIR/session.json")" = \
 即使 generation 一致，`manifest.status=cancelled` 或 `completeness=incomplete` 仍表示执行曾被
 取消或中断。此类 Trace 包含有效证据，但分析结论必须考虑缺少正常终态的影响。
 
+## 使用 Root Cause Analysis Skill
+
+`rootcause-analysis` 是面向 Claude Code、OpenCode 等 Agent 的灵活根因分析 Skill，规范文件位于
+仓库唯一的规范位置：`.claude/skills/rootcause-analysis/SKILL.md`。它让 Agent 根据用户提出的
+具体疑问读取已经 finalize 的语义 Trace，执行递归后向语义污点分析、多假设回溯和独立根因确认，
+最终同时给出结构化 JSON 与面向人的 Markdown 说明。
+
+在能够发现仓库级 `.claude/skills` 的 Agent 中，从本仓库根目录发起请求：
+
+```text
+Use $rootcause-analysis.
+Trace: /absolute/path/to/case/trace.json
+Question: 为什么用户明确要求通过构建 Skill 使用 Yocto，但实际只进行了 GCC 局部编译？
+```
+
+输入必须满足以下条件：
+
+- `Trace` 是绝对路径，并指向通过 `observable-trace finalize` 发布的 root `trace.json`；
+- `Question` 准确描述用户期望、实际行为和希望解释的差异，不能只写“为什么失败”；
+- 不要把 `records.jsonl`、单个 segment、`trace.html` 或尚未 finalize 的 partial Trace 作为输入。
+
+默认情况下，Skill 只在对话中返回 `rootcause-analysis/v1` JSON 和与其证据互证的 Markdown，
+**不会写任何文件**。如需保存报告，必须同时提供显式输出前缀和被分析项目根目录，例如：
+
+```text
+Use $rootcause-analysis.
+Trace: /data/evo-bench/traces/case-001/trace.json
+Question: 为什么用户要求使用构建 Skill 完成 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？
+Output prefix: /data/evo-bench/rootcause-results/case-001/analysis
+Analyzed project root: /workspace/product-repo
+```
+
+输出前缀必须位于 Trace bundle 和被分析项目之外。Skill 会生成
+`/data/evo-bench/rootcause-results/case-001/analysis.json` 与同名 `.md`；无法可靠确认目录边界时，
+它会停止写入并请求补充信息，而不是猜测路径。
+
+### 诊断 Trace 查询
+
+Skill 自带只读、标准库实现的查询工具，适合在 Agent 分析前检查 Trace，或人工复核报告引用：
+
+```bash
+export TRACE=/absolute/path/to/case/trace.json
+export TRACE_QUERY=.claude/skills/rootcause-analysis/scripts/trace_query.py
+
+python3 "$TRACE_QUERY" validate --trace "$TRACE"
+python3 "$TRACE_QUERY" summary --trace "$TRACE"
+python3 "$TRACE_QUERY" search --trace "$TRACE" --query "yocto" --limit 20 --offset 0
+python3 "$TRACE_QUERY" node --trace "$TRACE" --ref node:dec_1
+python3 "$TRACE_QUERY" neighbors --trace "$TRACE" --ref node:dec_1 --direction upstream
+python3 "$TRACE_QUERY" paths --trace "$TRACE" --start node:final_1 --max-depth 8 --limit 20
+python3 "$TRACE_QUERY" artifact --trace "$TRACE" --id artifact:prompt_1 --max-chars 12000
+```
+
+`search` 返回 `truncated` 和 `next_offset`；结果被截断时应继续翻页，不能把单页上限当成候选预算。
+`node` 会展示节点及全部已记录边，`neighbors`/`paths` 只沿允许用于因果推断的边遍历；Artifact
+读取会校验 Trace 声明的 SHA-256，不读取未经验证的外部内容。具体参数可用
+`python3 "$TRACE_QUERY" <command> --help` 查看。
+
+### 与 Python 归因模块的关系
+
+两者彼此独立，也不会互相调用：
+
+| 路径 | 适用场景 | 当前状态 |
+| --- | --- | --- |
+| `$rootcause-analysis` Agent Skill | 需要结合问题与语义数据流灵活探索、多假设回溯，并给出可读解释 | 推荐；当前主要使用路径 |
+| `tools/trace_attribution` Python 模块 | 需要固定 CLI/API、checkpoint 和批处理自动化 | 保留但暂停迭代 |
+
+无论使用哪条路径，分析都必须保持被动、只读、事后执行。`rootcause-analysis` 只读取 finalize 后的
+Trace，不修改 Agent、Harness、Skill、MCP、Tool、Prompt、模型配置、代码、构建环境、Trace 或
+原 Session，也不会把结论反馈给原 Agent。报告中的优化项仅是建议，必须由独立任务评审和实施。
+
 ## 使用离线归因 CLI
 
 归因模块目前随源码仓库发布，并未安装为系统级命令。它不要求当前目录位于
