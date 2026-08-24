@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import json
 import shutil
 import subprocess
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -58,6 +60,28 @@ class TraceQueryTests(unittest.TestCase):
             case_directory = Path(directory) / "known-root"
             shutil.copytree(KNOWN_ROOT.parent, case_directory)
             yield case_directory / "trace.json", case_directory
+
+    def trace_query_module(self):
+        module_name = "rootcause_trace_query_test_module"
+        spec = importlib.util.spec_from_file_location(module_name, SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def write_trace(self, trace, payload):
+        trace.write_text(json.dumps(payload), encoding="utf-8")
+
+    @staticmethod
+    def edge(edge_id, source, target, **fields):
+        edge = {
+            "edge_id": edge_id,
+            "from": {"ref_type": "node", "ref_id": source},
+            "to": {"ref_type": "node", "ref_id": target},
+            "eligible_for_attribution": True,
+        }
+        edge.update(fields)
+        return edge
 
     def test_validate_accepts_finalized_causal_ir(self):
         result = self.run_query("validate", "--trace", str(KNOWN_ROOT))
@@ -347,6 +371,182 @@ class TraceQueryTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 3)
         self.assertIn("missing", result.stderr.lower())
+
+    def test_artifact_accepts_content_hash_prefixed_or_bare(self):
+        for prefix in ("sha256:", ""):
+            with self.subTest(prefix=prefix), self.copied_known_root() as (trace, _):
+                payload = json.loads(trace.read_text(encoding="utf-8"))
+                digest = payload["artifacts"][0].pop("hash").split(":", 1)[1]
+                payload["artifacts"][0]["content_hash"] = "{0}{1}".format(prefix, digest)
+                self.write_trace(trace, payload)
+                result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["integrity"], "verified")
+
+    def test_artifact_rejects_conflicting_hash_declarations(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["artifacts"][0]["content_hash"] = "0" * 64
+            self.write_trace(trace, payload)
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("conflicting", result.stderr.lower())
+
+    def test_artifact_accepts_matching_hash_and_content_hash_declarations(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["artifacts"][0]["content_hash"] = payload["artifacts"][0]["hash"].split(":", 1)[1]
+            self.write_trace(trace, payload)
+            result = self.run_query("artifact", "--trace", str(trace), "--id", ARTIFACT_ID)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["content_sha256"], payload["artifacts"][0]["content_hash"])
+
+    def test_artifact_max_chars_truncates_verified_content(self):
+        payload = self.query_json(
+            "artifact", "--trace", str(KNOWN_ROOT), "--id", ARTIFACT_ID, "--max-chars", "12"
+        )
+        self.assertEqual(payload["content"], "Use the buil")
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(payload["integrity"], "verified")
+
+    def test_artifact_rejects_replacement_with_symlink_after_index_load(self):
+        with self.copied_known_root() as (trace, case_directory):
+            module = self.trace_query_module()
+            index = module.TraceIndex.load(trace)
+            artifact = case_directory / "artifacts" / "sha256" / (
+                "3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"
+            )
+            outside = case_directory.parent / "replacement.txt"
+            outside.write_bytes(artifact.read_bytes())
+            original_open = module.os.open
+            replaced = False
+
+            def replace_before_open(path, flags, mode=0o777, *, dir_fd=None):
+                nonlocal replaced
+                if path == artifact.name and dir_fd is not None and artifact.exists():
+                    artifact.unlink()
+                    artifact.symlink_to(outside)
+                    replaced = True
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(module.os, "open", side_effect=replace_before_open):
+                with self.assertRaises(module.ArtifactIntegrityError):
+                    index.artifact(ARTIFACT_ID, 20000)
+            self.assertTrue(replaced)
+
+    def test_neighbors_traverse_downstream_eligible_edges(self):
+        payload = self.query_json(
+            "neighbors",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--ref",
+            "node:ctx_1",
+            "--direction",
+            "downstream",
+        )
+        self.assertEqual(payload["ref"], "node:ctx_1")
+        self.assertEqual(payload["edges"][0]["source"], "node:ctx_1")
+        self.assertEqual(payload["edges"][0]["target"], "node:dec_1")
+
+    def test_compatibility_paths_traverse_declared_edges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace.json"
+            self.write_trace(trace, self.compatibility_only_payload())
+            payload = self.query_json("paths", "--trace", str(trace), "--start", "record:final_1")
+
+        self.assertIn(
+            ["record:final_1", "record:tool_1", "record:dec_1", "record:ctx_1", "record:req_1"],
+            [item["node_refs"] for item in payload["paths"]],
+        )
+
+    def test_traversal_resolves_legacy_aliases(self):
+        payload = self.query_json(
+            "neighbors",
+            "--trace",
+            str(KNOWN_ROOT),
+            "--ref",
+            "record:decision_legacy",
+            "--direction",
+            "upstream",
+        )
+        self.assertEqual(payload["ref"], "node:dec_1")
+        self.assertEqual(payload["edges"][0]["source"], "node:ctx_1")
+
+    def test_traversal_excludes_eligible_temporal_advisory_edges(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            edge = next(item for item in payload["edges"] if item["edge_id"] == "edge_unrelated_final")
+            edge["eligible_for_attribution"] = True
+            self.write_trace(trace, payload)
+            response = self.query_json("paths", "--trace", str(trace), "--start", "node:final_1")
+
+        self.assertNotIn("node:unrelated_1", json.dumps(response))
+
+    def test_traversal_excludes_unresolved_and_self_edges(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            payload["edges"].extend(
+                [
+                    self.edge("edge_self", "final_1", "final_1", normalized_relation="loop"),
+                    self.edge("edge_missing", "missing_1", "final_1", normalized_relation="unknown"),
+                ]
+            )
+            self.write_trace(trace, payload)
+            response = self.query_json("paths", "--trace", str(trace), "--start", "node:final_1")
+
+        serialized = json.dumps(response)
+        self.assertNotIn("edge:edge_self", serialized)
+        self.assertNotIn("edge:edge_missing", serialized)
+        self.assertNotIn("node:missing_1", serialized)
+
+    def test_neighbors_use_branching_breadth_first_order_and_frontier(self):
+        with self.copied_known_root() as (trace, _):
+            payload = json.loads(trace.read_text(encoding="utf-8"))
+            for node in payload["nodes"]:
+                node["source_refs"] = []
+            payload["nodes"].extend(
+                [
+                    {"node_id": "branch_a"},
+                    {"node_id": "branch_b"},
+                    {"node_id": "branch_a_root"},
+                    {"node_id": "branch_b_root"},
+                ]
+            )
+            payload["edges"].extend(
+                [
+                    self.edge("edge_branch_a_final", "branch_a", "final_1", normalized_relation="branch_a"),
+                    self.edge("edge_branch_b_final", "branch_b", "final_1", normalized_relation="branch_b"),
+                    self.edge("edge_branch_a_root", "branch_a_root", "branch_a", normalized_relation="parent"),
+                    self.edge("edge_branch_b_root", "branch_b_root", "branch_b", normalized_relation="parent"),
+                ]
+            )
+            self.write_trace(trace, payload)
+            response = self.query_json(
+                "neighbors",
+                "--trace",
+                str(trace),
+                "--ref",
+                "node:final_1",
+                "--direction",
+                "upstream",
+                "--depth",
+                "2",
+                "--limit",
+                "4",
+            )
+
+        self.assertEqual(
+            [edge["ref"] for edge in response["edges"]],
+            ["edge:edge_tool_final", "edge:edge_branch_a_final", "edge:edge_branch_b_final", "edge:edge_dec_tool"],
+        )
+        self.assertTrue(response["truncated"])
+        self.assertEqual(
+            response["remaining_frontier_refs"],
+            ["node:dec_1", "node:branch_a_root", "node:branch_a", "node:branch_b"],
+        )
 
 
 if __name__ == "__main__":

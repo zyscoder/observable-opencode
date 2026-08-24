@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
+import os
+import stat
 import sys
 from collections import Counter, deque
 from collections.abc import Mapping as MappingABC
@@ -16,6 +19,13 @@ from typing import Mapping, Optional, Sequence, Tuple
 
 
 FINALIZE_HINT = "Run observable-trace finalize and pass its logical trace.json output."
+SAFE_DESCRIPTOR_SUPPORT = (
+    hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+    and os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.stat in os.supports_follow_symlinks
+)
 
 
 class TraceInputError(ValueError):
@@ -153,6 +163,12 @@ class TraceIndex:
         self._nodes_by_ref = {node.ref: node for node in self.nodes}
         self._aliases = dict(aliases)
         self._case_directory = case_directory
+        try:
+            self._case_directory_identity = self._file_identity(
+                os.stat(str(case_directory), follow_symlinks=False)
+            )
+        except (OSError, TypeError):
+            self._case_directory_identity = None
         self._upstream_edges = {}
         self._downstream_edges = {}
         for edge in self._traversal_edges:
@@ -467,17 +483,10 @@ class TraceIndex:
         if artifact is None:
             raise KeyError(artifact_id)
         relative_path = _string(artifact.get("path"))
-        digest = self._sha256_digest(_string(artifact.get("hash")))
+        digest = self._artifact_digest(artifact, artifact_id)
         if not relative_path:
             raise ArtifactIntegrityError("Artifact {0} has no declared path".format(artifact_id))
-        if not digest:
-            raise ArtifactIntegrityError("Artifact {0} has an invalid SHA-256 digest".format(artifact_id))
-
-        artifact_path = self._artifact_path(relative_path, artifact_id)
-        try:
-            content_bytes = artifact_path.read_bytes()
-        except OSError as error:
-            raise ArtifactIntegrityError("Artifact {0} is missing".format(artifact_id)) from error
+        content_bytes = self._read_artifact_bytes(relative_path, artifact_id)
         observed_digest = hashlib.sha256(content_bytes).hexdigest()
         if observed_digest != digest:
             raise ArtifactIntegrityError("Artifact {0} hash mismatch".format(artifact_id))
@@ -546,25 +555,120 @@ class TraceIndex:
             return ""
         return value.casefold()
 
-    def _artifact_path(self, declared_path: str, artifact_id: str) -> Path:
-        relative_path = Path(declared_path)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            raise ArtifactIntegrityError("Artifact {0} path escapes the Trace case directory".format(artifact_id))
-        candidate = self._case_directory / relative_path
-        current = self._case_directory
-        for part in relative_path.parts:
-            current = current / part
-            if current.is_symlink():
-                raise ArtifactIntegrityError("Artifact {0} path contains a symlink".format(artifact_id))
-        if not candidate.exists() or not candidate.is_file():
-            raise ArtifactIntegrityError("Artifact {0} is missing".format(artifact_id))
-        try:
-            candidate.resolve().relative_to(self._case_directory)
-        except ValueError as error:
+    def _artifact_digest(self, artifact: Mapping[str, object], artifact_id: str) -> str:
+        """Use content_hash when declared, requiring both declarations to agree."""
+        hash_digest = self._declared_digest(artifact, "hash", artifact_id)
+        content_digest = self._declared_digest(artifact, "content_hash", artifact_id)
+        if hash_digest and content_digest and hash_digest != content_digest:
             raise ArtifactIntegrityError(
-                "Artifact {0} path escapes the Trace case directory".format(artifact_id)
+                "Artifact {0} has conflicting SHA-256 declarations".format(artifact_id)
+            )
+        digest = content_digest or hash_digest
+        if not digest:
+            raise ArtifactIntegrityError("Artifact {0} has an invalid SHA-256 digest".format(artifact_id))
+        return digest
+
+    def _declared_digest(self, artifact: Mapping[str, object], key: str, artifact_id: str) -> str:
+        if key not in artifact:
+            return ""
+        digest = self._sha256_digest(_string(artifact.get(key)))
+        if not digest:
+            raise ArtifactIntegrityError(
+                "Artifact {0} has an invalid {1} SHA-256 digest".format(artifact_id, key)
+            )
+        return digest
+
+    @staticmethod
+    def _file_identity(file_stat: os.stat_result) -> Tuple[int, int]:
+        return file_stat.st_dev, file_stat.st_ino
+
+    @staticmethod
+    def _descriptor_support_available() -> bool:
+        return SAFE_DESCRIPTOR_SUPPORT
+
+    @classmethod
+    def _same_file(cls, first: os.stat_result, second: os.stat_result) -> bool:
+        return cls._file_identity(first) == cls._file_identity(second)
+
+    def _read_artifact_bytes(self, declared_path: str, artifact_id: str) -> bytes:
+        """Read one regular Artifact through no-follow descriptors rooted at the case directory."""
+        if not self._descriptor_support_available() or self._case_directory_identity is None:
+            raise ArtifactIntegrityError(
+                "Artifact {0} cannot be safely opened on this platform".format(artifact_id)
+            )
+        relative_path = Path(declared_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts or not relative_path.parts:
+            raise ArtifactIntegrityError("Artifact {0} path escapes the Trace case directory".format(artifact_id))
+
+        directory_fd = None
+        artifact_fd = None
+        try:
+            expected_root = os.stat(str(self._case_directory), follow_symlinks=False)
+            directory_fd = os.open(
+                str(self._case_directory), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            opened_root = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(opened_root.st_mode)
+                or self._file_identity(expected_root) != self._case_directory_identity
+                or not self._same_file(expected_root, opened_root)
+            ):
+                raise ArtifactIntegrityError(
+                    "Artifact {0} Trace case directory changed during access".format(artifact_id)
+                )
+
+            for component in relative_path.parts[:-1]:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+                opened_directory = os.fstat(next_fd)
+                named_directory = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(opened_directory.st_mode) or not self._same_file(
+                    named_directory, opened_directory
+                ):
+                    os.close(next_fd)
+                    raise ArtifactIntegrityError(
+                        "Artifact {0} path cannot be safely opened".format(artifact_id)
+                    )
+                os.close(directory_fd)
+                directory_fd = next_fd
+
+            artifact_fd = os.open(
+                relative_path.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd
+            )
+            opened_artifact = os.fstat(artifact_fd)
+            named_artifact = os.stat(
+                relative_path.parts[-1], dir_fd=directory_fd, follow_symlinks=False
+            )
+            if not stat.S_ISREG(opened_artifact.st_mode) or not self._same_file(
+                named_artifact, opened_artifact
+            ):
+                raise ArtifactIntegrityError("Artifact {0} path cannot be safely opened".format(artifact_id))
+            chunks = []
+            while True:
+                chunk = os.read(artifact_fd, 65536)
+                if not chunk:
+                    return b"".join(chunks)
+                chunks.append(chunk)
+        except ArtifactIntegrityError:
+            raise
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ArtifactIntegrityError(
+                    "Artifact {0} path contains a symlink".format(artifact_id)
+                ) from error
+            if error.errno in (errno.ENOENT, errno.ENOTDIR):
+                raise ArtifactIntegrityError("Artifact {0} is missing".format(artifact_id)) from error
+            raise ArtifactIntegrityError(
+                "Artifact {0} path cannot be safely opened".format(artifact_id)
             ) from error
-        return candidate
+        finally:
+            if artifact_fd is not None:
+                os.close(artifact_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
 
 
 def _node_to_dict(node: NodeView) -> Mapping[str, object]:
