@@ -99,7 +99,8 @@ Prompts contained only:
 The hidden `expected` objects in `pressure/cases.json` were reserved for the
 evaluator and were never included in an Agent prompt.
 
-The exact expanded commands, separated stdout/stderr, and exit status are in
+The exact expanded commands, separated stdout/stderr, timing, raw self-exit
+return code, timeout state, and termination action are in
 [the raw attempt appendix](2026-08-24-rootcause-analysis-skill-raw-attempts.md).
 
 ### Claude Code
@@ -134,26 +135,31 @@ bun run --conditions=browser packages/opencode/src/index.ts run \
   '开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: <fixture>/trace.json. Question: <question>. ...'
 ```
 
-Every command returned exit status `1`, empty stdout, and stderr beginning with:
+Every command produced empty stdout and stderr beginning with:
 
 ```text
 error=no providers found cause=Error: no providers found
 ```
 
-The captured stacks place the failure in `Provider.defaultModel`, before the
-Agent could invoke the Skill, execute a Trace query, or produce a model result.
+The captured stacks place the observed error in `Provider.defaultModel`, before
+the Agent could invoke the Skill, execute a Trace query, or produce a model
+result. None of the seven processes exited by itself within the documented
+8-second timeout. Each record therefore has `timed_out=true` and
+`raw_returncode=null`; the deterministic wrapper sent SIGINT to the child
+process group and reaped it within the 3-second grace period. This termination
+behavior must not be reported as an OpenCode self-exit code.
 
 ## Case Matrix
 
 | Fixture | Claude | OpenCode | Rubric evaluation |
 | --- | --- | --- | --- |
-| `known-root` | Blocked: not logged in | Blocked: no providers found | Not evaluated |
-| `ambiguous` | Blocked: not logged in | Blocked: no providers found | Not evaluated |
-| `skill-omission` | Blocked: not logged in | Blocked: no providers found | Not evaluated |
-| `context-contamination` | Blocked: not logged in | Blocked: no providers found | Not evaluated |
-| `control-flow-change` | Blocked: not logged in | Blocked: no providers found | Not evaluated |
-| `tool-failure-misreported` | Blocked: not logged in | Blocked: no providers found | Not evaluated |
-| `wrong-answer` | Blocked: not logged in | Blocked: no providers found | Not evaluated |
+| `known-root` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
+| `ambiguous` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
+| `skill-omission` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
+| `context-contamination` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
+| `control-flow-change` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
+| `tool-failure-misreported` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
+| `wrong-answer` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
 
 No raw Agent outcome exists to compare with the RED baseline. Consequently the
 11 pressure-rubric items, including introduction-versus-propagation accuracy,
