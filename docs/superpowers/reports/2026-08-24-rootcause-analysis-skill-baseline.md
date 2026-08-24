@@ -3,10 +3,30 @@
 ## Baseline Setup
 
 - Date: 2026-08-24
-- Working directory for provider runs: `/private/tmp/rootcause-skill-red.48YcZn`
+- Working directory for provider runs: a freshly created isolated bundle under `/private/tmp/rootcause-skill-red.XXXXXX`
 - Skill state: `.claude/skills/rootcause-analysis` was absent.
 - Invocation mode: `claude --bare --disable-slash-commands -p --permission-mode plan --allowedTools "Read,Bash(python3 *)"`.
-- Prompt source: the rendered baseline prompt with the absolute finalized Trace path. Claude Code 2.1.138 treats `--allowedTools` as variadic and consumes a trailing positional prompt, so the brief's positional-prompt form failed locally before provider access with: `Error: Input must be provided either through stdin or as a prompt argument when using --print`. The equivalent prompt was therefore supplied on stdin without changing its content, isolation, permissions, or disabled-Skill configuration.
+- Prompt source: the bundle-local `prompt.md` rendered with its bundle-local `trace.json` path. Claude Code 2.1.138 treats `--allowedTools` as variadic and consumes a trailing positional prompt, so the prompt is supplied on stdin.
+
+## Isolated Pressure-Run Procedure
+
+Prepare one case without reading or copying `pressure/cases.json`:
+
+```bash
+BUNDLE_ROOT=$(mktemp -d /private/tmp/rootcause-skill-red.XXXXXX)
+BUNDLE="$BUNDLE_ROOT/known-root"
+python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+  --case known-root --destination "$BUNDLE"
+cd "$BUNDLE"
+claude --bare --disable-slash-commands -p \
+  --permission-mode plan \
+  --allowedTools "Read,Bash(python3 *)" < prompt.md
+```
+
+Repeat with `--case ambiguous`. The bundle contains only `prompt.md`, the
+selected `trace.json`, and Artifacts declared by that trace. It has no copy or
+reference to evaluator-only cases, so the Agent receives no traversable path
+to `pressure/cases.json` from the pressure-run working directory.
 
 ## Forward-Test Result
 
@@ -29,4 +49,6 @@ Neither command ran for five minutes or required timeout termination.
 
 ## Follow-Up
 
-Authenticate Claude Code and rerun the same two rendered prompts from a temporary directory with the Skill still absent. Record the unmodified raw model responses and evaluate them against `tools/rootcause_skill_tests/pressure/rubric.json`.
+Authenticate Claude Code and rerun the same two isolated bundle prompts with
+the Skill still absent. Record the unmodified raw model responses and evaluate
+them outside the Agent context against `tools/rootcause_skill_tests/pressure/rubric.json`.

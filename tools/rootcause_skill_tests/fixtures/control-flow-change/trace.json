@@ -1,17 +1,384 @@
 {
-  "trace_version": "6.0", "causal_ir_version": "1.0", "manifest": {"run_id": "rootcause-control-flow-change", "case_id": "control-flow-change", "status": "success"},
+  "trace_version": "6.0",
+  "causal_ir_version": "1.0",
+  "manifest": {
+    "run_id": "rootcause-control-flow-change",
+    "case_id": "control-flow-change",
+    "status": "success"
+  },
   "nodes": [
-    {"node_id": "req_1", "kind": "task.obligation", "component": "prompt", "timestamp": "2026-08-24T00:04:00.000Z", "time_ms": 240, "status": "success", "title": "User requests logging with no control-flow change", "data": {"text": "Add logging without changing control flow."}},
-    {"node_id": "edit_1", "kind": "change", "component": "tool", "timestamp": "2026-08-24T00:04:01.000Z", "time_ms": 241, "status": "success", "title": "Edit adds logging and an early return", "source_refs": ["node:req_1"], "data": {"diff": "+ log.info('start');\n+ if (!enabled) return;\n  process();", "change_semantics": "Introduces an early return before process()."}},
-    {"node_id": "review_1", "kind": "verification", "component": "llm", "timestamp": "2026-08-24T00:04:02.000Z", "time_ms": 242, "status": "success", "title": "Review approves edit without detecting control-flow mutation", "source_refs": ["node:edit_1"], "data": {"result": "looks good", "checked_invariant": false}},
-    {"node_id": "final_1", "kind": "response.output", "component": "result", "timestamp": "2026-08-24T00:04:03.000Z", "time_ms": 243, "status": "success", "title": "Agent reports logging-only change complete", "source_refs": ["node:review_1"], "data": {"text": "Added the requested logging without changing behavior."}}
+    {
+      "node_id": "req_1",
+      "kind": "task.obligation",
+      "component": "prompt",
+      "timestamp": "2026-08-24T00:04:00.000Z",
+      "time_ms": 240,
+      "status": "success",
+      "title": "User requests logging with no control-flow change",
+      "data": {
+        "text": "Add logging without changing control flow."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 1,
+        "timestamp": "2026-08-24T00:04:00.000Z",
+        "time_ms": 240
+      },
+      "scope": {
+        "run_id": "rootcause-control-flow-change",
+        "case_id": "control-flow-change"
+      },
+      "payload": {
+        "text": "Add logging without changing control flow."
+      },
+      "input_refs": [],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "edit_1"
+        }
+      ],
+      "source_refs": [],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "2bec79e8d114105370218d833a048c93f167ed7b2dea238653720550bb897fb3",
+        "source_hash": "bf123f42ee8c3ac40eb80bf965fee05e03723d3d7d171318e4362434a92a450b"
+      }
+    },
+    {
+      "node_id": "edit_1",
+      "kind": "change",
+      "component": "tool",
+      "timestamp": "2026-08-24T00:04:01.000Z",
+      "time_ms": 241,
+      "status": "success",
+      "title": "Edit adds logging and an early return",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ],
+      "data": {
+        "diff": "+ log.info('start');\n+ if (!enabled) return;\n  process();",
+        "change_semantics": "Introduces an early return before process()."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 2,
+        "timestamp": "2026-08-24T00:04:01.000Z",
+        "time_ms": 241
+      },
+      "scope": {
+        "run_id": "rootcause-control-flow-change",
+        "case_id": "control-flow-change"
+      },
+      "payload": {
+        "diff": "+ log.info('start');\n+ if (!enabled) return;\n  process();",
+        "change_semantics": "Introduces an early return before process()."
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "review_1"
+        }
+      ],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "2a745dbe473975efed2ecae0df75dbfa8ad72beeb40e4d09e3c446f31506a513",
+        "source_hash": "b539ebc6a7f9a61ebebf77cc7b492ab4cb5bcf91a79ebb0fcfec6a90923076e5"
+      }
+    },
+    {
+      "node_id": "review_1",
+      "kind": "verification",
+      "component": "llm",
+      "timestamp": "2026-08-24T00:04:02.000Z",
+      "time_ms": 242,
+      "status": "success",
+      "title": "Review approves edit without detecting control-flow mutation",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "edit_1"
+        }
+      ],
+      "data": {
+        "result": "looks good",
+        "checked_invariant": false
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 3,
+        "timestamp": "2026-08-24T00:04:02.000Z",
+        "time_ms": 242
+      },
+      "scope": {
+        "run_id": "rootcause-control-flow-change",
+        "case_id": "control-flow-change"
+      },
+      "payload": {
+        "result": "looks good",
+        "checked_invariant": false
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "edit_1"
+        }
+      ],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "final_1"
+        }
+      ],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "209b4bcace45536d219e279db5761a7df4dc2bacf65360f6a8e13f43ccd3ad64",
+        "source_hash": "8e6efb5f455905923234aa2577fce610be2dd5e486dde725c6a8f8abec5490e2"
+      }
+    },
+    {
+      "node_id": "final_1",
+      "kind": "response.output",
+      "component": "result",
+      "timestamp": "2026-08-24T00:04:03.000Z",
+      "time_ms": 243,
+      "status": "success",
+      "title": "Agent reports logging-only change complete",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "review_1"
+        }
+      ],
+      "data": {
+        "text": "Added the requested logging without changing behavior."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 4,
+        "timestamp": "2026-08-24T00:04:03.000Z",
+        "time_ms": 243
+      },
+      "scope": {
+        "run_id": "rootcause-control-flow-change",
+        "case_id": "control-flow-change"
+      },
+      "payload": {
+        "text": "Added the requested logging without changing behavior."
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "review_1"
+        }
+      ],
+      "output_refs": [],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "c38e4ec9dd51c134555e18d7528db12f8f9a5dd1524dd347e3a40c51ece88864",
+        "source_hash": "3106462f163badfbf0340267fb6ca276c25299d0312dc5045b5217f05b3bdafa"
+      }
+    }
   ],
   "edges": [
-    {"edge_id": "edge_req_edit", "from": {"ref_type": "node", "ref_id": "req_1"}, "to": {"ref_type": "node", "ref_id": "edit_1"}, "original_relation": "modified_by", "normalized_relation": "modified_by", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "req_1"}]},
-    {"edge_id": "edge_edit_review", "from": {"ref_type": "node", "ref_id": "edit_1"}, "to": {"ref_type": "node", "ref_id": "review_1"}, "original_relation": "verified_by", "normalized_relation": "verified_by", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "edit_1"}]},
-    {"edge_id": "edge_review_final", "from": {"ref_type": "node", "ref_id": "review_1"}, "to": {"ref_type": "node", "ref_id": "final_1"}, "original_relation": "produced", "normalized_relation": "produced", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "review_1"}]}
-  ], "artifacts": [],
-  "records": [{"record_id": "req_1", "component": "prompt", "event_type": "task.obligation", "timestamp": "2026-08-24T00:04:00.000Z", "time_ms": 240, "status": "success", "data": {"text": "Add logging without changing control flow."}}, {"record_id": "edit_1", "component": "tool", "event_type": "change", "timestamp": "2026-08-24T00:04:01.000Z", "time_ms": 241, "status": "success", "data": {"diff": "+ log.info('start');\n+ if (!enabled) return;\n  process();", "change_semantics": "Introduces an early return before process()."}}, {"record_id": "review_1", "component": "llm", "event_type": "verification", "timestamp": "2026-08-24T00:04:02.000Z", "time_ms": 242, "status": "success", "data": {"result": "looks good", "checked_invariant": false}}, {"record_id": "final_1", "component": "result", "event_type": "response.output", "timestamp": "2026-08-24T00:04:03.000Z", "time_ms": 243, "status": "success", "data": {"text": "Added the requested logging without changing behavior."}}],
-  "dataflow_edges": [{"edge_id": "edge_req_edit", "from": {"type": "node", "id": "req_1"}, "to": {"type": "node", "id": "edit_1"}, "relation": "modified_by", "eligible_for_attribution": true}, {"edge_id": "edge_edit_review", "from": {"type": "node", "id": "edit_1"}, "to": {"type": "node", "id": "review_1"}, "relation": "verified_by", "eligible_for_attribution": true}, {"edge_id": "edge_review_final", "from": {"type": "node", "id": "review_1"}, "to": {"type": "node", "id": "final_1"}, "relation": "produced", "eligible_for_attribution": true}],
-  "journal": {"schema_version": "1.0", "format": "causal-ir-jsonl", "path": "records.jsonl", "summary_scope": "entries_before_lifecycle_entry", "entry_count": 0, "last_sequence": 0, "poisoned": false}, "metrics": {"records": 4, "dataflow_edges": 3, "artifacts": 0}, "diagnostics": [], "compatibility": {"projection": "fixture"}
+    {
+      "edge_id": "edge_req_edit",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "req_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "edit_1"
+      },
+      "original_relation": "modified_by",
+      "normalized_relation": "modified_by",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ]
+    },
+    {
+      "edge_id": "edge_edit_review",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "edit_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "review_1"
+      },
+      "original_relation": "verified_by",
+      "normalized_relation": "verified_by",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "edit_1"
+        }
+      ]
+    },
+    {
+      "edge_id": "edge_review_final",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "review_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "final_1"
+      },
+      "original_relation": "produced",
+      "normalized_relation": "produced",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "review_1"
+        }
+      ]
+    }
+  ],
+  "artifacts": [],
+  "records": [
+    {
+      "record_id": "req_1",
+      "component": "prompt",
+      "event_type": "task.obligation",
+      "timestamp": "2026-08-24T00:04:00.000Z",
+      "time_ms": 240,
+      "status": "success",
+      "data": {
+        "text": "Add logging without changing control flow."
+      }
+    },
+    {
+      "record_id": "edit_1",
+      "component": "tool",
+      "event_type": "change",
+      "timestamp": "2026-08-24T00:04:01.000Z",
+      "time_ms": 241,
+      "status": "success",
+      "data": {
+        "diff": "+ log.info('start');\n+ if (!enabled) return;\n  process();",
+        "change_semantics": "Introduces an early return before process()."
+      }
+    },
+    {
+      "record_id": "review_1",
+      "component": "llm",
+      "event_type": "verification",
+      "timestamp": "2026-08-24T00:04:02.000Z",
+      "time_ms": 242,
+      "status": "success",
+      "data": {
+        "result": "looks good",
+        "checked_invariant": false
+      }
+    },
+    {
+      "record_id": "final_1",
+      "component": "result",
+      "event_type": "response.output",
+      "timestamp": "2026-08-24T00:04:03.000Z",
+      "time_ms": 243,
+      "status": "success",
+      "data": {
+        "text": "Added the requested logging without changing behavior."
+      }
+    }
+  ],
+  "dataflow_edges": [
+    {
+      "edge_id": "edge_req_edit",
+      "from": {
+        "type": "node",
+        "id": "req_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "edit_1"
+      },
+      "relation": "modified_by",
+      "eligible_for_attribution": true
+    },
+    {
+      "edge_id": "edge_edit_review",
+      "from": {
+        "type": "node",
+        "id": "edit_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "review_1"
+      },
+      "relation": "verified_by",
+      "eligible_for_attribution": true
+    },
+    {
+      "edge_id": "edge_review_final",
+      "from": {
+        "type": "node",
+        "id": "review_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "final_1"
+      },
+      "relation": "produced",
+      "eligible_for_attribution": true
+    }
+  ],
+  "journal": {
+    "schema_version": "1.0",
+    "format": "causal-ir-jsonl",
+    "path": "records.jsonl",
+    "summary_scope": "entries_before_lifecycle_entry",
+    "entry_count": 0,
+    "last_sequence": 0,
+    "poisoned": false
+  },
+  "metrics": {
+    "records": 4,
+    "dataflow_edges": 3,
+    "artifacts": 0
+  },
+  "diagnostics": [],
+  "compatibility": {
+    "projection": "fixture"
+  }
 }

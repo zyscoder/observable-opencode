@@ -1,17 +1,384 @@
 {
-  "trace_version": "6.0", "causal_ir_version": "1.0", "manifest": {"run_id": "rootcause-tool-failure-misreported", "case_id": "tool-failure-misreported", "status": "success"},
+  "trace_version": "6.0",
+  "causal_ir_version": "1.0",
+  "manifest": {
+    "run_id": "rootcause-tool-failure-misreported",
+    "case_id": "tool-failure-misreported",
+    "status": "success"
+  },
   "nodes": [
-    {"node_id": "req_1", "kind": "task.obligation", "component": "prompt", "timestamp": "2026-08-24T00:05:00.000Z", "time_ms": 300, "status": "success", "title": "User requires tests to pass", "data": {"text": "Run the test suite and report the result."}},
-    {"node_id": "tool_1", "kind": "tool.result", "component": "tool", "timestamp": "2026-08-24T00:05:01.000Z", "time_ms": 301, "status": "error", "title": "Test command fails with diagnostic output", "source_refs": ["node:req_1"], "data": {"command": "npm test", "exit_code": 1, "stderr": "AssertionError: expected 2 to equal 3"}},
-    {"node_id": "dec_1", "kind": "decision", "component": "llm", "timestamp": "2026-08-24T00:05:02.000Z", "time_ms": 302, "status": "success", "title": "Model interprets failed test as successful verification", "source_refs": ["node:tool_1"], "data": {"decision": "Treat the command as verification success despite exit code 1."}},
-    {"node_id": "final_1", "kind": "response.output", "component": "result", "timestamp": "2026-08-24T00:05:03.000Z", "time_ms": 303, "status": "success", "title": "Agent claims tests passed", "source_refs": ["node:dec_1"], "data": {"text": "Verification succeeded and all tests passed."}}
+    {
+      "node_id": "req_1",
+      "kind": "task.obligation",
+      "component": "prompt",
+      "timestamp": "2026-08-24T00:05:00.000Z",
+      "time_ms": 300,
+      "status": "success",
+      "title": "User requires tests to pass",
+      "data": {
+        "text": "Run the test suite and report the result."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 1,
+        "timestamp": "2026-08-24T00:05:00.000Z",
+        "time_ms": 300
+      },
+      "scope": {
+        "run_id": "rootcause-tool-failure-misreported",
+        "case_id": "tool-failure-misreported"
+      },
+      "payload": {
+        "text": "Run the test suite and report the result."
+      },
+      "input_refs": [],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ],
+      "source_refs": [],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "63dee97fb8b69b6b476f90958e87687533419d1fc46792741e12e1225c0a95c2",
+        "source_hash": "4f2b19d8463fe8a0fc65165743f66248322dfbab184af21ee15a04f3056d8849"
+      }
+    },
+    {
+      "node_id": "tool_1",
+      "kind": "tool.result",
+      "component": "tool",
+      "timestamp": "2026-08-24T00:05:01.000Z",
+      "time_ms": 301,
+      "status": "error",
+      "title": "Test command fails with diagnostic output",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ],
+      "data": {
+        "command": "npm test",
+        "exit_code": 1,
+        "stderr": "AssertionError: expected 2 to equal 3"
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 2,
+        "timestamp": "2026-08-24T00:05:01.000Z",
+        "time_ms": 301
+      },
+      "scope": {
+        "run_id": "rootcause-tool-failure-misreported",
+        "case_id": "tool-failure-misreported"
+      },
+      "payload": {
+        "command": "npm test",
+        "exit_code": 1,
+        "stderr": "AssertionError: expected 2 to equal 3"
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "3dd5995065bea523b9860dd373c8809f472483588971d595881e897c51e5389d",
+        "source_hash": "85cc9417d5c77637272a6665d220b020f79e1fc704eb55c8a23847ac66f0b5d9"
+      }
+    },
+    {
+      "node_id": "dec_1",
+      "kind": "decision",
+      "component": "llm",
+      "timestamp": "2026-08-24T00:05:02.000Z",
+      "time_ms": 302,
+      "status": "success",
+      "title": "Model interprets failed test as successful verification",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ],
+      "data": {
+        "decision": "Treat the command as verification success despite exit code 1."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 3,
+        "timestamp": "2026-08-24T00:05:02.000Z",
+        "time_ms": 302
+      },
+      "scope": {
+        "run_id": "rootcause-tool-failure-misreported",
+        "case_id": "tool-failure-misreported"
+      },
+      "payload": {
+        "decision": "Treat the command as verification success despite exit code 1."
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "final_1"
+        }
+      ],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "bc3db7afd75d0f18242e01a3994d6740fdd8adbc0159f4a6c8e14c215fdc05db",
+        "source_hash": "086af481098049489f530c3f9372e80b114ea0a734f6864360e3c37b2726d7bb"
+      }
+    },
+    {
+      "node_id": "final_1",
+      "kind": "response.output",
+      "component": "result",
+      "timestamp": "2026-08-24T00:05:03.000Z",
+      "time_ms": 303,
+      "status": "success",
+      "title": "Agent claims tests passed",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ],
+      "data": {
+        "text": "Verification succeeded and all tests passed."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 4,
+        "timestamp": "2026-08-24T00:05:03.000Z",
+        "time_ms": 303
+      },
+      "scope": {
+        "run_id": "rootcause-tool-failure-misreported",
+        "case_id": "tool-failure-misreported"
+      },
+      "payload": {
+        "text": "Verification succeeded and all tests passed."
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ],
+      "output_refs": [],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "581752b5e009800bbaa842709b19ddf46c673c63cd66a244e8d46f374e99a9f6",
+        "source_hash": "b205d41b355e9e3c05aaebbff704467af22081ca38414948fdda8511c5aff5d9"
+      }
+    }
   ],
   "edges": [
-    {"edge_id": "edge_req_tool", "from": {"ref_type": "node", "ref_id": "req_1"}, "to": {"ref_type": "node", "ref_id": "tool_1"}, "original_relation": "called", "normalized_relation": "called", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "req_1"}]},
-    {"edge_id": "edge_tool_dec", "from": {"ref_type": "node", "ref_id": "tool_1"}, "to": {"ref_type": "node", "ref_id": "dec_1"}, "original_relation": "motivated_by_evidence", "normalized_relation": "motivated_by_evidence", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "tool_1"}]},
-    {"edge_id": "edge_dec_final", "from": {"ref_type": "node", "ref_id": "dec_1"}, "to": {"ref_type": "node", "ref_id": "final_1"}, "original_relation": "produced", "normalized_relation": "produced", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "dec_1"}]}
-  ], "artifacts": [],
-  "records": [{"record_id": "req_1", "component": "prompt", "event_type": "task.obligation", "timestamp": "2026-08-24T00:05:00.000Z", "time_ms": 300, "status": "success", "data": {"text": "Run the test suite and report the result."}}, {"record_id": "tool_1", "component": "tool", "event_type": "tool.result", "timestamp": "2026-08-24T00:05:01.000Z", "time_ms": 301, "status": "error", "data": {"command": "npm test", "exit_code": 1, "stderr": "AssertionError: expected 2 to equal 3"}}, {"record_id": "dec_1", "component": "llm", "event_type": "decision", "timestamp": "2026-08-24T00:05:02.000Z", "time_ms": 302, "status": "success", "data": {"decision": "Treat the command as verification success despite exit code 1."}}, {"record_id": "final_1", "component": "result", "event_type": "response.output", "timestamp": "2026-08-24T00:05:03.000Z", "time_ms": 303, "status": "success", "data": {"text": "Verification succeeded and all tests passed."}}],
-  "dataflow_edges": [{"edge_id": "edge_req_tool", "from": {"type": "node", "id": "req_1"}, "to": {"type": "node", "id": "tool_1"}, "relation": "called", "eligible_for_attribution": true}, {"edge_id": "edge_tool_dec", "from": {"type": "node", "id": "tool_1"}, "to": {"type": "node", "id": "dec_1"}, "relation": "motivated_by_evidence", "eligible_for_attribution": true}, {"edge_id": "edge_dec_final", "from": {"type": "node", "id": "dec_1"}, "to": {"type": "node", "id": "final_1"}, "relation": "produced", "eligible_for_attribution": true}],
-  "journal": {"schema_version": "1.0", "format": "causal-ir-jsonl", "path": "records.jsonl", "summary_scope": "entries_before_lifecycle_entry", "entry_count": 0, "last_sequence": 0, "poisoned": false}, "metrics": {"records": 4, "dataflow_edges": 3, "artifacts": 0}, "diagnostics": [], "compatibility": {"projection": "fixture"}
+    {
+      "edge_id": "edge_req_tool",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "req_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "tool_1"
+      },
+      "original_relation": "called",
+      "normalized_relation": "called",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ]
+    },
+    {
+      "edge_id": "edge_tool_dec",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "tool_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "dec_1"
+      },
+      "original_relation": "motivated_by_evidence",
+      "normalized_relation": "motivated_by_evidence",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ]
+    },
+    {
+      "edge_id": "edge_dec_final",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "dec_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "final_1"
+      },
+      "original_relation": "produced",
+      "normalized_relation": "produced",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ]
+    }
+  ],
+  "artifacts": [],
+  "records": [
+    {
+      "record_id": "req_1",
+      "component": "prompt",
+      "event_type": "task.obligation",
+      "timestamp": "2026-08-24T00:05:00.000Z",
+      "time_ms": 300,
+      "status": "success",
+      "data": {
+        "text": "Run the test suite and report the result."
+      }
+    },
+    {
+      "record_id": "tool_1",
+      "component": "tool",
+      "event_type": "tool.result",
+      "timestamp": "2026-08-24T00:05:01.000Z",
+      "time_ms": 301,
+      "status": "error",
+      "data": {
+        "command": "npm test",
+        "exit_code": 1,
+        "stderr": "AssertionError: expected 2 to equal 3"
+      }
+    },
+    {
+      "record_id": "dec_1",
+      "component": "llm",
+      "event_type": "decision",
+      "timestamp": "2026-08-24T00:05:02.000Z",
+      "time_ms": 302,
+      "status": "success",
+      "data": {
+        "decision": "Treat the command as verification success despite exit code 1."
+      }
+    },
+    {
+      "record_id": "final_1",
+      "component": "result",
+      "event_type": "response.output",
+      "timestamp": "2026-08-24T00:05:03.000Z",
+      "time_ms": 303,
+      "status": "success",
+      "data": {
+        "text": "Verification succeeded and all tests passed."
+      }
+    }
+  ],
+  "dataflow_edges": [
+    {
+      "edge_id": "edge_req_tool",
+      "from": {
+        "type": "node",
+        "id": "req_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "tool_1"
+      },
+      "relation": "called",
+      "eligible_for_attribution": true
+    },
+    {
+      "edge_id": "edge_tool_dec",
+      "from": {
+        "type": "node",
+        "id": "tool_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "dec_1"
+      },
+      "relation": "motivated_by_evidence",
+      "eligible_for_attribution": true
+    },
+    {
+      "edge_id": "edge_dec_final",
+      "from": {
+        "type": "node",
+        "id": "dec_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "final_1"
+      },
+      "relation": "produced",
+      "eligible_for_attribution": true
+    }
+  ],
+  "journal": {
+    "schema_version": "1.0",
+    "format": "causal-ir-jsonl",
+    "path": "records.jsonl",
+    "summary_scope": "entries_before_lifecycle_entry",
+    "entry_count": 0,
+    "last_sequence": 0,
+    "poisoned": false
+  },
+  "metrics": {
+    "records": 4,
+    "dataflow_edges": 3,
+    "artifacts": 0
+  },
+  "diagnostics": [],
+  "compatibility": {
+    "projection": "fixture"
+  }
 }

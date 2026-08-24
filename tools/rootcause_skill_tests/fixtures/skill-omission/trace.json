@@ -1,29 +1,488 @@
 {
   "trace_version": "6.0",
   "causal_ir_version": "1.0",
-  "manifest": {"run_id": "rootcause-skill-omission", "case_id": "skill-omission", "status": "success"},
+  "manifest": {
+    "run_id": "rootcause-skill-omission",
+    "case_id": "skill-omission",
+    "status": "success"
+  },
   "nodes": [
-    {"node_id": "req_1", "kind": "task.obligation", "component": "prompt", "timestamp": "2026-08-24T00:02:00.000Z", "time_ms": 120, "status": "success", "title": "User requires the security-review Skill", "data": {"text": "Use the security-review Skill before reporting the audit result."}},
-    {"node_id": "catalog_1", "kind": "skill.catalog.exposed", "component": "skill", "timestamp": "2026-08-24T00:02:01.000Z", "time_ms": 121, "status": "success", "title": "Skill catalog exposes security-review", "source_refs": ["node:req_1"], "data": {"skills": ["security-review", "build"]}},
-    {"node_id": "dec_1", "kind": "decision", "component": "llm", "timestamp": "2026-08-24T00:02:02.000Z", "time_ms": 122, "status": "success", "title": "Model chooses a direct shell check without loading the expected Skill", "source_refs": ["node:catalog_1"], "data": {"decision": "Run a local command and answer without loading security-review."}},
-    {"node_id": "tool_1", "kind": "tool.result", "component": "tool", "timestamp": "2026-08-24T00:02:03.000Z", "time_ms": 123, "status": "success", "title": "Unrelated git status command succeeds", "source_refs": ["node:dec_1"], "data": {"command": "git status --short", "exit_code": 0}},
-    {"node_id": "final_1", "kind": "response.output", "component": "result", "timestamp": "2026-08-24T00:02:04.000Z", "time_ms": 124, "status": "success", "title": "Agent reports the audit complete", "source_refs": ["node:tool_1"], "data": {"text": "The audit is complete."}}
+    {
+      "node_id": "req_1",
+      "kind": "task.obligation",
+      "component": "prompt",
+      "timestamp": "2026-08-24T00:02:00.000Z",
+      "time_ms": 120,
+      "status": "success",
+      "title": "User requires the security-review Skill",
+      "data": {
+        "text": "Use the security-review Skill before reporting the audit result."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 1,
+        "timestamp": "2026-08-24T00:02:00.000Z",
+        "time_ms": 120
+      },
+      "scope": {
+        "run_id": "rootcause-skill-omission",
+        "case_id": "skill-omission"
+      },
+      "payload": {
+        "text": "Use the security-review Skill before reporting the audit result."
+      },
+      "input_refs": [],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "catalog_1"
+        }
+      ],
+      "source_refs": [],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "60ef8052882f32f770dfad4c5d64251fd403623892d6356516892dfe3d43fb9b",
+        "source_hash": "6fafce20002645937ee7ba97d11e796e6a9d2fcf92b9873b0ed92b01e1702ef4"
+      }
+    },
+    {
+      "node_id": "catalog_1",
+      "kind": "skill.catalog.exposed",
+      "component": "skill",
+      "timestamp": "2026-08-24T00:02:01.000Z",
+      "time_ms": 121,
+      "status": "success",
+      "title": "Skill catalog exposes security-review",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ],
+      "data": {
+        "skills": [
+          "security-review",
+          "build"
+        ]
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 2,
+        "timestamp": "2026-08-24T00:02:01.000Z",
+        "time_ms": 121
+      },
+      "scope": {
+        "run_id": "rootcause-skill-omission",
+        "case_id": "skill-omission"
+      },
+      "payload": {
+        "skills": [
+          "security-review",
+          "build"
+        ]
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "b70ee7cf0d031595ebc9c516ca58537c18bf169b499f865b3e1d351782b6eac4",
+        "source_hash": "85cc9417d5c77637272a6665d220b020f79e1fc704eb55c8a23847ac66f0b5d9"
+      }
+    },
+    {
+      "node_id": "dec_1",
+      "kind": "decision",
+      "component": "llm",
+      "timestamp": "2026-08-24T00:02:02.000Z",
+      "time_ms": 122,
+      "status": "success",
+      "title": "Model chooses a direct shell check without loading the expected Skill",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "catalog_1"
+        }
+      ],
+      "data": {
+        "decision": "Run a local command and answer without loading security-review."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 3,
+        "timestamp": "2026-08-24T00:02:02.000Z",
+        "time_ms": 122
+      },
+      "scope": {
+        "run_id": "rootcause-skill-omission",
+        "case_id": "skill-omission"
+      },
+      "payload": {
+        "decision": "Run a local command and answer without loading security-review."
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "catalog_1"
+        }
+      ],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "2180768064b1174a2b81dad00e9d2642a366166e817f136bef5939c74f1774f5",
+        "source_hash": "89a10cf4e83d50703cb2888723ccee6b17d8bb68ffbf1b634a2e1bd7a178fd43"
+      }
+    },
+    {
+      "node_id": "tool_1",
+      "kind": "tool.result",
+      "component": "tool",
+      "timestamp": "2026-08-24T00:02:03.000Z",
+      "time_ms": 123,
+      "status": "success",
+      "title": "Unrelated git status command succeeds",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ],
+      "data": {
+        "command": "git status --short",
+        "exit_code": 0
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 4,
+        "timestamp": "2026-08-24T00:02:03.000Z",
+        "time_ms": 123
+      },
+      "scope": {
+        "run_id": "rootcause-skill-omission",
+        "case_id": "skill-omission"
+      },
+      "payload": {
+        "command": "git status --short",
+        "exit_code": 0
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ],
+      "output_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "final_1"
+        }
+      ],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "52749a2eda6102662950602c8df9739118e0bb4c5a14955aa445e7955643e61b",
+        "source_hash": "8627cd47aa0c6a88f3b584ec5565c47d6b54e87af7ad403693a5b5a0579cd296"
+      }
+    },
+    {
+      "node_id": "final_1",
+      "kind": "response.output",
+      "component": "result",
+      "timestamp": "2026-08-24T00:02:04.000Z",
+      "time_ms": 124,
+      "status": "success",
+      "title": "Agent reports the audit complete",
+      "source_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ],
+      "data": {
+        "text": "The audit is complete."
+      },
+      "schema_version": "1.0",
+      "origin": "observed",
+      "order": {
+        "sequence": 5,
+        "timestamp": "2026-08-24T00:02:04.000Z",
+        "time_ms": 124
+      },
+      "scope": {
+        "run_id": "rootcause-skill-omission",
+        "case_id": "skill-omission"
+      },
+      "payload": {
+        "text": "The audit is complete."
+      },
+      "input_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ],
+      "output_refs": [],
+      "source_locations": [],
+      "artifact_refs": [],
+      "aliases": [],
+      "derivation": null,
+      "integrity": {
+        "payload_hash": "cc13e2ddeaa568843d42e488645389815531f92e98f4c8d61899a0bfb3a67198",
+        "source_hash": "c6cbee9271884981d8f37a4b5849f08eb4f246ed0c185383ea31910e4f297273"
+      }
+    }
   ],
   "edges": [
-    {"edge_id": "edge_req_catalog", "from": {"ref_type": "node", "ref_id": "req_1"}, "to": {"ref_type": "node", "ref_id": "catalog_1"}, "original_relation": "used_as_context", "normalized_relation": "used_as_context", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "req_1"}]},
-    {"edge_id": "edge_catalog_dec", "from": {"ref_type": "node", "ref_id": "catalog_1"}, "to": {"ref_type": "node", "ref_id": "dec_1"}, "original_relation": "context_influences_decision", "normalized_relation": "derived_from", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "catalog_1"}]},
-    {"edge_id": "edge_dec_tool", "from": {"ref_type": "node", "ref_id": "dec_1"}, "to": {"ref_type": "node", "ref_id": "tool_1"}, "original_relation": "selected_by", "normalized_relation": "selected_by", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "dec_1"}]},
-    {"edge_id": "edge_tool_final", "from": {"ref_type": "node", "ref_id": "tool_1"}, "to": {"ref_type": "node", "ref_id": "final_1"}, "original_relation": "produced", "normalized_relation": "produced", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "tool_1"}]}
+    {
+      "edge_id": "edge_req_catalog",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "req_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "catalog_1"
+      },
+      "original_relation": "used_as_context",
+      "normalized_relation": "used_as_context",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "req_1"
+        }
+      ]
+    },
+    {
+      "edge_id": "edge_catalog_dec",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "catalog_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "dec_1"
+      },
+      "original_relation": "context_influences_decision",
+      "normalized_relation": "derived_from",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "catalog_1"
+        }
+      ]
+    },
+    {
+      "edge_id": "edge_dec_tool",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "dec_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "tool_1"
+      },
+      "original_relation": "selected_by",
+      "normalized_relation": "selected_by",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "dec_1"
+        }
+      ]
+    },
+    {
+      "edge_id": "edge_tool_final",
+      "from": {
+        "ref_type": "node",
+        "ref_id": "tool_1"
+      },
+      "to": {
+        "ref_type": "node",
+        "ref_id": "final_1"
+      },
+      "original_relation": "produced",
+      "normalized_relation": "produced",
+      "evidence_tier": "confirmed",
+      "eligible_for_attribution": true,
+      "derivation_method": "explicit_relation",
+      "evidence_refs": [
+        {
+          "ref_type": "node",
+          "ref_id": "tool_1"
+        }
+      ]
+    }
   ],
   "artifacts": [],
   "records": [
-    {"record_id": "req_1", "component": "prompt", "event_type": "task.obligation", "timestamp": "2026-08-24T00:02:00.000Z", "time_ms": 120, "status": "success", "data": {"text": "Use the security-review Skill before reporting the audit result."}},
-    {"record_id": "catalog_1", "component": "skill", "event_type": "skill.catalog.exposed", "timestamp": "2026-08-24T00:02:01.000Z", "time_ms": 121, "status": "success", "data": {"skills": ["security-review", "build"]}},
-    {"record_id": "dec_1", "component": "llm", "event_type": "decision", "timestamp": "2026-08-24T00:02:02.000Z", "time_ms": 122, "status": "success", "data": {"decision": "Run a local command and answer without loading security-review."}},
-    {"record_id": "tool_1", "component": "tool", "event_type": "tool.result", "timestamp": "2026-08-24T00:02:03.000Z", "time_ms": 123, "status": "success", "data": {"command": "git status --short", "exit_code": 0}},
-    {"record_id": "final_1", "component": "result", "event_type": "response.output", "timestamp": "2026-08-24T00:02:04.000Z", "time_ms": 124, "status": "success", "data": {"text": "The audit is complete."}}
+    {
+      "record_id": "req_1",
+      "component": "prompt",
+      "event_type": "task.obligation",
+      "timestamp": "2026-08-24T00:02:00.000Z",
+      "time_ms": 120,
+      "status": "success",
+      "data": {
+        "text": "Use the security-review Skill before reporting the audit result."
+      }
+    },
+    {
+      "record_id": "catalog_1",
+      "component": "skill",
+      "event_type": "skill.catalog.exposed",
+      "timestamp": "2026-08-24T00:02:01.000Z",
+      "time_ms": 121,
+      "status": "success",
+      "data": {
+        "skills": [
+          "security-review",
+          "build"
+        ]
+      }
+    },
+    {
+      "record_id": "dec_1",
+      "component": "llm",
+      "event_type": "decision",
+      "timestamp": "2026-08-24T00:02:02.000Z",
+      "time_ms": 122,
+      "status": "success",
+      "data": {
+        "decision": "Run a local command and answer without loading security-review."
+      }
+    },
+    {
+      "record_id": "tool_1",
+      "component": "tool",
+      "event_type": "tool.result",
+      "timestamp": "2026-08-24T00:02:03.000Z",
+      "time_ms": 123,
+      "status": "success",
+      "data": {
+        "command": "git status --short",
+        "exit_code": 0
+      }
+    },
+    {
+      "record_id": "final_1",
+      "component": "result",
+      "event_type": "response.output",
+      "timestamp": "2026-08-24T00:02:04.000Z",
+      "time_ms": 124,
+      "status": "success",
+      "data": {
+        "text": "The audit is complete."
+      }
+    }
   ],
-  "dataflow_edges": [{"edge_id": "edge_req_catalog", "from": {"type": "node", "id": "req_1"}, "to": {"type": "node", "id": "catalog_1"}, "relation": "used_as_context", "eligible_for_attribution": true}, {"edge_id": "edge_catalog_dec", "from": {"type": "node", "id": "catalog_1"}, "to": {"type": "node", "id": "dec_1"}, "relation": "derived_from", "eligible_for_attribution": true}, {"edge_id": "edge_dec_tool", "from": {"type": "node", "id": "dec_1"}, "to": {"type": "node", "id": "tool_1"}, "relation": "selected_by", "eligible_for_attribution": true}, {"edge_id": "edge_tool_final", "from": {"type": "node", "id": "tool_1"}, "to": {"type": "node", "id": "final_1"}, "relation": "produced", "eligible_for_attribution": true}],
-  "journal": {"schema_version": "1.0", "format": "causal-ir-jsonl", "path": "records.jsonl", "summary_scope": "entries_before_lifecycle_entry", "entry_count": 0, "last_sequence": 0, "poisoned": false},
-  "metrics": {"records": 5, "dataflow_edges": 4, "artifacts": 0}, "diagnostics": [], "compatibility": {"projection": "fixture"}
+  "dataflow_edges": [
+    {
+      "edge_id": "edge_req_catalog",
+      "from": {
+        "type": "node",
+        "id": "req_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "catalog_1"
+      },
+      "relation": "used_as_context",
+      "eligible_for_attribution": true
+    },
+    {
+      "edge_id": "edge_catalog_dec",
+      "from": {
+        "type": "node",
+        "id": "catalog_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "dec_1"
+      },
+      "relation": "derived_from",
+      "eligible_for_attribution": true
+    },
+    {
+      "edge_id": "edge_dec_tool",
+      "from": {
+        "type": "node",
+        "id": "dec_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "tool_1"
+      },
+      "relation": "selected_by",
+      "eligible_for_attribution": true
+    },
+    {
+      "edge_id": "edge_tool_final",
+      "from": {
+        "type": "node",
+        "id": "tool_1"
+      },
+      "to": {
+        "type": "node",
+        "id": "final_1"
+      },
+      "relation": "produced",
+      "eligible_for_attribution": true
+    }
+  ],
+  "journal": {
+    "schema_version": "1.0",
+    "format": "causal-ir-jsonl",
+    "path": "records.jsonl",
+    "summary_scope": "entries_before_lifecycle_entry",
+    "entry_count": 0,
+    "last_sequence": 0,
+    "poisoned": false
+  },
+  "metrics": {
+    "records": 5,
+    "dataflow_edges": 4,
+    "artifacts": 0
+  },
+  "diagnostics": [],
+  "compatibility": {
+    "projection": "fixture"
+  }
 }
