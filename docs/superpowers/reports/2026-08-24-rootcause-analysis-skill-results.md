@@ -15,7 +15,9 @@ handoff contains one finalized derived Trace, digest-verified declared Artifacts
 the canonical Skill, and runtime-specific prompts. It excludes evaluator expected
 outcomes, rubric, semantic fixture identity, sibling fixtures, reports, Git history,
 and repository symlinks. Source fixture mapping and source/derived digest
-provenance are emitted evaluator-side, outside the bundle.
+provenance are emitted evaluator-side, outside the bundle. An external READY
+marker is published last and binds both the provenance digest and deterministic
+bundle-tree digest.
 
 ## Execution Boundary
 
@@ -39,14 +41,15 @@ score. See the historical raw-attempt appendix; it is superseded and unscored.
 
 ## Deterministic Verification
 
-The scope-correction fix round 1 run discovered and passed 109 tests with no skips. Python
+Bundle handoff fix round 2 discovered and passed 121 tests with no skips. Python
 compilation and the official Skill validator passed; the validator reported
 `Skill is valid!`. A fresh seven-bundle audit under
-`/tmp/rootcause-scope-fix-r1-0jhkc8cs` found zero hidden-answer leaks, zero
+`/tmp/rootcause-handoff-r2-final-gnabzke7` found zero hidden-answer leaks, zero
 symlinks, opaque identity in all seven workspaces, and evaluator provenance only
-outside those workspaces. Every derived Trace passed authoritative validation and
-every copied Artifact matched its recorded `content_sha256`. Fixtures remained
-unchanged and the diff checks passed.
+outside those workspaces. All seven external READY markers verified their
+provenance and bundle-tree digests. Every derived Trace passed authoritative
+validation and every Artifact matched its recorded `content_sha256`. Fixtures
+remained unchanged and the diff checks passed.
 
 The maintained verification protocol is:
 
@@ -75,6 +78,8 @@ All seven cases must also be rebuilt with fresh opaque IDs and audited for:
 - no symlink or path escape;
 - exact allowlisted files only;
 - evaluator mapping and provenance stored outside every bundle.
+- external READY exists and its provenance and bundle-tree digests verify before
+  Harness consumption.
 
 ## Remaining External Validation
 

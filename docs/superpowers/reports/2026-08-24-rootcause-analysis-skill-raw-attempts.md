@@ -32,5 +32,7 @@ local setup. They do not measure Skill quality, filesystem isolation, execution
 safety, or scored behavior. No rubric result is inferred from them.
 
 Current evaluation begins by producing opaque bundles with
-`prepare_isolated_bundle.py`. A trusted benchmark Harness outside this repository
-must execute those bundles and independently manage its trust boundary.
+`prepare_isolated_bundle.py`. Only bundles with a verified external READY marker
+and matching provenance/bundle-tree digests may be submitted. A trusted benchmark
+Harness outside this repository must execute those bundles and independently
+manage its trust boundary.

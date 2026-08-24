@@ -806,7 +806,7 @@ Agent 可见目录、prompt 和派生 Trace 只使用每轮新生成的 opaque I
 
 ```bash
 export HANDOFF_ROOT=$(mktemp -d /tmp/rootcause-handoff.XXXXXX)
-mkdir -p "$HANDOFF_ROOT/bundles" "$HANDOFF_ROOT/provenance"
+mkdir -p "$HANDOFF_ROOT/bundles" "$HANDOFF_ROOT/provenance" "$HANDOFF_ROOT/ready"
 
 jq -r '.cases[].fixture' tools/rootcause_skill_tests/pressure/cases.json |
 while IFS= read -r CASE; do
@@ -816,12 +816,20 @@ while IFS= read -r CASE; do
     --opaque-case-id "$OPAQUE_CASE_ID" \
     --agent-trace-path /workspace/trace.json \
     --destination "$HANDOFF_ROOT/bundles/$OPAQUE_CASE_ID" \
-    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json"
+    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json" \
+    --ready-output "$HANDOFF_ROOT/ready/${OPAQUE_CASE_ID}.READY.json"
+
+  python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+    --verify-ready-handoff \
+    --destination "$HANDOFF_ROOT/bundles/$OPAQUE_CASE_ID" \
+    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json" \
+    --ready-output "$HANDOFF_ROOT/ready/${OPAQUE_CASE_ID}.READY.json"
 done
 ```
 
 每个 workspace 只包含该 case 的 finalize 派生 `trace.json`、Trace 声明且摘要校验通过的 Artifacts、
-规范 `.claude/skills/rootcause-analysis`，以及 `prompt-claude.md`、`prompt-opencode.md`。builder
+规范 `.claude/skills/rootcause-analysis`、`prompt-claude.md`、`prompt-opencode.md`，以及仅供发布所有权
+检查使用的 `.handoff-owner`。builder
 拒绝覆盖已有目录、symlink 越界、节点完整性错误和 Artifact 摘要不一致。它不会复制
 `cases.json`、`rubric.json`、隐藏 `expected`、fixture 语义标签、其他 fixture、reports 或 Git 历史。
 每个 canonical node 必须声明有效 `source_hash`；`--agent-trace-path` 必须是无控制字符、无 `..`
@@ -832,12 +840,24 @@ builder 通过 `trace_query.py validate` 复用根因分析 Skill 的权威 fina
 再次验证派生 Trace。终态但 source-incomplete 的 Trace 只要权威 validator 接受就可以交接；原始
 `lifecycle`、`source_completeness`、segment 和 diagnostics 会原样进入 evaluator provenance。
 Artifact 路径会在任何写入前检查保留文件、Skill 目录、重复路径以及 casefold/Unicode 规范化碰撞。
-完整临时构建后，builder 会重新打开每个 Artifact 并核验 `content_sha256`，然后才发布 bundle。
+路径策略还拒绝保留路径的祖先/后代、尾随点或空格、Windows 设备名、控制字符、冒号、反斜杠、
+`<>|?*` 和歧义组件。源 Trace 只读取一次；同一份字节用于 SHA-256、JSON 解析和私有快照上的
+权威验证。Artifact 同样只从源路径读取一次，并将经过摘要验证的同一份字节写入 bundle。
 
-`--provenance-output` 必填，必须位于 bundle 外，并以 exclusive-create 写入；每个 opaque case 使用
-独立的 `${OPAQUE_CASE_ID}.provenance.json`，不要通过 shell 重定向写共享文件。目标 bundle 或
-provenance 已存在时会直接拒绝，可同时阻止 opaque ID 重用。任何验证或写入失败都会回滚临时目录、
-bundle 和本次 provenance，不留下 partial handoff。
+builder 先用 `mkdir(exist_ok=False)` 原子占用最终 destination，并立即以 `O_EXCL` 写入唯一
+`.handoff-owner` 标记；随后直接写 bundle，但此时仍是 **unready / 不可消费** 状态。普通错误只在
+目录 inode 和 owner token 仍匹配时清理，绝不覆盖或删除不属于本次发布者的 destination。
+
+`--provenance-output` 和 `--ready-output` 都必填、都必须位于 bundle 外，并使用 no-replace 发布；
+每个 opaque case 分别使用 `${OPAQUE_CASE_ID}.provenance.json` 和
+`${OPAQUE_CASE_ID}.READY.json`，不要通过 shell 重定向写共享文件。provenance 发布后，builder
+计算其摘要和确定性的 bundle tree 摘要，最后才发布 READY。READY 中绑定 opaque ID 与这两个
+SHA-256；`.handoff-owner` 仅用于安全清理，不进入 tree digest。
+
+Harness **只有在 READY 存在且 `--verify-ready-handoff` 成功确认 provenance digest 与 bundle tree
+digest 都匹配时才能消费 bundle**。单独存在 destination 或 provenance 不代表发布完成。进程崩溃
+可能留下 unready destination、私有快照或 provenance；这些文件用于审计或人工清理，但没有有效
+READY 时一律不可提交。该协议不宣称 bundle、provenance 和 READY 三条路径构成跨文件系统原子事务。
 
 把 opaque workspace 提交给组织现有的 **可信 benchmark Harness / 隔离执行服务**。该外部系统
 必须独立管理认证凭据、文件系统与网络隔离、运行时清理、镜像或执行环境证明、输出审计及超时终止；

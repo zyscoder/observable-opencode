@@ -4,6 +4,11 @@ Date: 2026-08-25
 
 Branch: `codex/trace-stability-integration`
 
+> Superseded on 2026-08-25 by bundle handoff fix round 2. The round-1
+> transactional/no-partial claim below describes that implementation and is not
+> the current consumption contract. Current consumers require an external READY
+> marker whose provenance and bundle-tree digests both verify.
+
 ## Purpose
 
 This round hardens the repository-owned boundary: deterministic construction of
@@ -27,8 +32,9 @@ module.
   reopened and checked again after complete construction.
 - `--provenance-output` is required, external to the bundle, and exclusively
   created. Every opaque case uses a distinct evaluator-side provenance file.
-- Construction is transactional. Validation, collision, hash, or write failure
-  leaves no destination bundle, provenance file, or temporary partial handoff.
+- The round-1 implementation attempted transactional cleanup. Round 2 replaces
+  this guarantee with an explicit unready/non-consumable crash state and a READY
+  digest gate.
 
 ## Verification Result
 
@@ -47,6 +53,7 @@ casefold, Unicode-normalized, and file/directory collisions; postwrite Artifact
 corruption; unsupported Trace versions; missing envelope fields; nonterminal
 manifests; accepted terminal source-incomplete diagnostics; derived-Trace
 revalidation; missing or internal provenance paths; overwrite refusal; and
-transactional cleanup.
+the then-current cleanup behavior. Round-2 publication safety is covered by its
+separate report.
 
 No Provider-backed Agent execution was performed or scored in this repository.

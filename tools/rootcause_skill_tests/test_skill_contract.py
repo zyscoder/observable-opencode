@@ -222,7 +222,16 @@ class SkillContractTests(unittest.TestCase):
             self.assertNotRegex(text, r">\s*\"?\$[^\n]*provenance\.json", name)
             self.assertRegex(text, r"(?i)trace_query(?:\.py)?\s+validate|trace_query.*权威", name)
             self.assertRegex(text, r"(?i)collision|碰撞", name)
-            self.assertRegex(text, r"(?i)rollback|回滚|不留下.*partial", name)
+            self.assertRegex(text, r"(?i)unready|不可消费|未就绪", name)
+
+    def test_harness_docs_require_ready_marker_and_digest_verification(self):
+        for name, text in (("README", self.readme_text), ("plan", self.plan_text)):
+            self.assertIn("--ready-output", text, name)
+            self.assertIn("${OPAQUE_CASE_ID}.READY.json", text, name)
+            self.assertIn("--verify-ready-handoff", text, name)
+            self.assertRegex(text, r"(?i)READY.*(digest|摘要)|(?:digest|摘要).*READY", name)
+            self.assertRegex(text, r"(?i)only.*READY|只有.*READY|仅当.*READY", name)
+            self.assertNotRegex(text, r"(?i)full transaction atomicity|完整事务原子性", name)
 
     def test_no_active_or_historical_doc_references_the_retired_runner(self):
         retired_name = "run_" + "isolated_opencode.py"

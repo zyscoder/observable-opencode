@@ -25,7 +25,9 @@ No baseline behavior or rubric score was inferred or fabricated.
 ## Current Boundary
 
 Current validation uses `prepare_isolated_bundle.py` to emit opaque post-Skill
-handoffs. The repository does not execute or score them. A trusted benchmark
-Harness or isolated execution service must run each bundle, while only the
+handoffs. A handoff is consumable only after its external READY marker verifies
+both provenance and bundle-tree digests. The repository does not execute or
+score them. A trusted benchmark Harness or isolated execution service must run
+each bundle, while only the
 external evaluator reads fixture mappings, provenance, expected outcomes, and
 the rubric.

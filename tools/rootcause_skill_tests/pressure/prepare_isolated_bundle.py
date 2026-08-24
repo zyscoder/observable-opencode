@@ -4,11 +4,12 @@
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
-import tempfile
 import unicodedata
 import uuid
 from pathlib import Path, PurePosixPath
@@ -20,12 +21,24 @@ CASES_PATH = Path(__file__).with_name("cases.json")
 SKILL_ROOT = ROOT / ".claude" / "skills" / "rootcause-analysis"
 TRACE_QUERY = SKILL_ROOT / "scripts" / "trace_query.py"
 OPAQUE_CASE_PATTERN = re.compile(r"case-[0-9a-f]{32}\Z")
+OWNER_MARKER = ".handoff-owner"
+READY_SCHEMA_VERSION = "rootcause-handoff-ready/v1"
 RESERVED_ARTIFACT_PATHS = {
+    OWNER_MARKER,
     "trace.json",
     "prompt-claude.md",
     "prompt-opencode.md",
 }
 RESERVED_SKILL_PREFIX = ".claude/skills/rootcause-analysis"
+WINDOWS_DEVICE_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{index}" for index in range(1, 10)),
+    *(f"LPT{index}" for index in range(1, 10)),
+}
+PORTABLE_FORBIDDEN_CHARACTERS = set('<>:"\\|?*')
 
 
 def canonical_hash(value):
@@ -69,20 +82,44 @@ def case_questions():
 
 
 def relative_artifact_path(value):
-    if not isinstance(value, str) or not value or "\\" in value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+    ):
         raise ValueError(f"Artifact path must be a portable relative POSIX path: {value}")
-    if any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ValueError(f"Artifact path contains a control character: {value}")
+    if any(
+        ord(character) < 32
+        or ord(character) == 127
+        or character in PORTABLE_FORBIDDEN_CHARACTERS
+        for character in value
+    ):
+        raise ValueError(f"Artifact path contains a non-portable character: {value}")
+    if any(part in ("", ".", "..") for part in value.split("/")):
+        raise ValueError(f"Artifact path has an ambiguous component: {value}")
     posix_path = PurePosixPath(value)
     if posix_path.is_absolute() or ".." in posix_path.parts or not posix_path.parts:
         raise ValueError(f"Artifact path must stay within the selected fixture: {value}")
-    if any(part in ("", ".") for part in posix_path.parts):
-        raise ValueError(f"Artifact path must be canonical: {value}")
+    for part in posix_path.parts:
+        normalized = unicodedata.normalize("NFKC", part)
+        if part in ("", ".", "..") or normalized in ("", ".", ".."):
+            raise ValueError(f"Artifact path has an ambiguous component: {value}")
+        if part.endswith((".", " ")) or normalized.endswith((".", " ")):
+            raise ValueError(f"Artifact path has a non-portable trailing character: {value}")
+        device_stem = normalized.split(".", 1)[0].upper()
+        if device_stem in WINDOWS_DEVICE_NAMES:
+            raise ValueError(f"Artifact path uses a reserved portable device name: {value}")
     return Path(*posix_path.parts)
 
 
 def portable_path_key(path):
-    return unicodedata.normalize("NFKC", path.as_posix()).casefold()
+    return tuple(unicodedata.normalize("NFKC", part).casefold() for part in path.parts)
+
+
+def path_is_prefix(left, right):
+    return len(left) <= len(right) and right[: len(left)] == left
 
 
 def validate_artifact_paths(declarations):
@@ -95,7 +132,10 @@ def validate_artifact_paths(declarations):
             raise ValueError("Artifact declaration must be an object")
         relative = relative_artifact_path(declaration.get("path", ""))
         key = portable_path_key(relative)
-        if key in reserved_exact or key == reserved_prefix or key.startswith(reserved_prefix + "/"):
+        if any(
+            path_is_prefix(key, reserved) or path_is_prefix(reserved, key)
+            for reserved in (*reserved_exact, reserved_prefix)
+        ):
             raise ValueError(f"Artifact path is reserved by the bundle: {relative.as_posix()}")
         if key in seen:
             raise ValueError(
@@ -103,7 +143,7 @@ def validate_artifact_paths(declarations):
                 f"{seen[key].as_posix()} and {relative.as_posix()}"
             )
         for previous_key, previous in seen.items():
-            if key.startswith(previous_key + "/") or previous_key.startswith(key + "/"):
+            if path_is_prefix(key, previous_key) or path_is_prefix(previous_key, key):
                 raise ValueError(
                     "Artifact file/directory path collision: "
                     f"{previous.as_posix()} and {relative.as_posix()}"
@@ -145,8 +185,143 @@ def regular_file(source, relative, label):
     return resolved
 
 
-def fixture_file(source, relative):
-    return regular_file(source, relative, "Fixture")
+def read_regular_file_once(root, relative, label):
+    candidate = regular_file(root, relative, label)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(candidate, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} must be a regular file: {relative}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def fsync_directory(path):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_all(descriptor, payload):
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("Failed to write complete handoff file")
+        view = view[written:]
+
+
+def write_new_file(path, payload, mode=0o600):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, mode)
+    try:
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_no_replace(path, payload, publication_state):
+    temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
+    created = False
+    digest = hashlib.sha256(payload).hexdigest()
+    try:
+        write_new_file(temporary, payload)
+        created = True
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError as error:
+            raise ValueError(f"Handoff output already exists: {path}") from error
+        metadata = os.stat(path, follow_symlinks=False)
+        publication_state.update(
+            {"digest": digest, "identity": (metadata.st_dev, metadata.st_ino)}
+        )
+        fsync_directory(path.parent)
+    finally:
+        if created or temporary.exists():
+            temporary.unlink(missing_ok=True)
+    return digest
+
+
+def reserve_destination(destination, owner_token):
+    try:
+        os.mkdir(destination, 0o700)
+    except FileExistsError as error:
+        raise ValueError(f"Bundle destination already exists; cannot reserve: {destination}") from error
+    identity = os.stat(destination, follow_symlinks=False)
+    marker = destination / OWNER_MARKER
+    write_new_file(marker, (owner_token + "\n").encode("ascii"))
+    fsync_directory(destination)
+    return (identity.st_dev, identity.st_ino)
+
+
+def owned_destination_matches(destination, owner_token, identity):
+    try:
+        metadata = os.stat(destination, follow_symlinks=False)
+        if not stat.S_ISDIR(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != identity:
+            return False
+        marker = read_regular_file_once(destination, Path(OWNER_MARKER), "Owner marker")
+        return marker == (owner_token + "\n").encode("ascii")
+    except (OSError, ValueError):
+        return False
+
+
+def cleanup_owned_destination(destination, owner_token, identity):
+    if owned_destination_matches(destination, owner_token, identity):
+        shutil.rmtree(destination)
+        return True
+    return False
+
+
+def cleanup_published_file(path, publication_state):
+    expected_digest = publication_state.get("digest")
+    expected_identity = publication_state.get("identity")
+    if not expected_digest or not expected_identity:
+        return False
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            return False
+        payload = read_regular_file_once(path.parent, Path(path.name), "Published handoff file")
+    except (OSError, ValueError):
+        return False
+    if hashlib.sha256(payload).hexdigest() != expected_digest:
+        return False
+    path.unlink()
+    fsync_directory(path.parent)
+    return True
+
+
+def validate_snapshot(destination, label, payload):
+    snapshot = destination / f".{label}.snapshot-{uuid.uuid4().hex}.json"
+    write_new_file(snapshot, payload)
+    try:
+        return authoritative_trace_validation(snapshot)
+    finally:
+        snapshot.unlink(missing_ok=True)
+        fsync_directory(destination)
+
+
+def emit_phase(hook, phase, context):
+    if hook is not None:
+        hook(phase, context)
 
 
 def authoritative_trace_validation(path):
@@ -215,15 +390,6 @@ def declared_artifact_digest(declaration):
     return next(iter(declared))
 
 
-def verify_artifact(path, declaration, expected=None, postwrite=False):
-    expected = expected or declared_artifact_digest(declaration)
-    actual = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual != expected:
-        phase = "content SHA-256" if postwrite else "digest"
-        raise ValueError(f"Artifact {phase} mismatch: {declaration.get('artifact_id')}")
-    return actual
-
-
 def skill_files():
     root = SKILL_ROOT.resolve(strict=True)
     if SKILL_ROOT.is_symlink():
@@ -281,29 +447,133 @@ def trace_bytes(trace):
     return (json.dumps(trace, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
-def validate_output_paths(destination, provenance_output):
+def json_bytes(value):
+    return (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def bundle_tree_manifest(destination):
+    if not destination.is_dir() or destination.is_symlink():
+        raise ValueError(f"Bundle destination is not a regular directory: {destination}")
+    entries = []
+    for candidate in sorted(destination.rglob("*"), key=lambda path: path.as_posix()):
+        relative = candidate.relative_to(destination)
+        if candidate.is_symlink():
+            raise ValueError(f"Bundle tree contains a symlink: {relative.as_posix()}")
+        if candidate.is_dir():
+            continue
+        if not candidate.is_file():
+            raise ValueError(f"Bundle tree contains an unsupported entry: {relative.as_posix()}")
+        if relative == Path(OWNER_MARKER):
+            continue
+        content = read_regular_file_once(destination, relative, "Bundle tree file")
+        entries.append(
+            {
+                "path": relative.as_posix(),
+                "size": len(content),
+                "content_sha256": hashlib.sha256(content).hexdigest(),
+            }
+        )
+    return entries
+
+
+def bundle_tree_digest(destination):
+    return canonical_hash(bundle_tree_manifest(destination))
+
+
+def verify_ready_handoff(destination, provenance_output, ready_output):
+    destination = Path(destination).resolve(strict=False)
+    provenance_output = Path(provenance_output).resolve(strict=False)
+    ready_output = Path(ready_output).resolve(strict=False)
+    if not ready_output.is_file() or ready_output.is_symlink():
+        raise ValueError("Handoff READY marker is missing or invalid")
+    ready_bytes = read_regular_file_once(ready_output.parent, Path(ready_output.name), "READY marker")
+    try:
+        ready = json.loads(ready_bytes)
+    except json.JSONDecodeError as error:
+        raise ValueError("Handoff READY marker is not valid JSON") from error
+    if ready.get("schema_version") != READY_SCHEMA_VERSION:
+        raise ValueError("Handoff READY marker has an unsupported schema version")
+    opaque_case_id = ready.get("opaque_case_id")
+    if opaque_case_id != destination.name or not OPAQUE_CASE_PATTERN.fullmatch(str(opaque_case_id)):
+        raise ValueError("Handoff READY marker does not match the opaque destination")
+    if not provenance_output.is_file() or provenance_output.is_symlink():
+        raise ValueError("Handoff provenance is missing or invalid")
+    provenance_bytes = read_regular_file_once(
+        provenance_output.parent, Path(provenance_output.name), "Evaluator provenance"
+    )
+    provenance_digest = hashlib.sha256(provenance_bytes).hexdigest()
+    if provenance_digest != ready.get("provenance_sha256"):
+        raise ValueError("Handoff provenance digest does not match READY")
+    try:
+        provenance = json.loads(provenance_bytes)
+    except json.JSONDecodeError as error:
+        raise ValueError("Handoff provenance is not valid JSON") from error
+    if provenance.get("opaque_case_id") != opaque_case_id:
+        raise ValueError("Handoff provenance identity does not match READY")
+    tree_digest = bundle_tree_digest(destination)
+    if tree_digest != ready.get("bundle_tree_sha256"):
+        raise ValueError("Handoff bundle tree digest does not match READY")
+    if provenance.get("bundle_tree_sha256") != tree_digest:
+        raise ValueError("Handoff provenance bundle tree digest does not match READY")
+    return {
+        "valid": True,
+        "opaque_case_id": opaque_case_id,
+        "provenance_sha256": provenance_digest,
+        "bundle_tree_sha256": tree_digest,
+    }
+
+
+def validate_output_paths(destination, provenance_output, ready_output):
     destination = destination.resolve(strict=False)
     if provenance_output is None:
         raise ValueError("Evaluator provenance output is required")
+    if ready_output is None:
+        raise ValueError("Evaluator READY output is required")
     provenance_output = Path(provenance_output)
+    ready_output = Path(ready_output)
     if not provenance_output.is_absolute():
         raise ValueError("Evaluator provenance output must be an absolute path outside the bundle")
+    if not ready_output.is_absolute():
+        raise ValueError("Evaluator READY output must be an absolute path outside the bundle")
     provenance_output = provenance_output.resolve(strict=False)
-    try:
-        provenance_output.relative_to(destination)
-    except ValueError:
-        pass
-    else:
-        raise ValueError("Evaluator provenance output must stay outside the Agent bundle")
-    if destination.exists():
-        raise ValueError(f"Bundle destination already exists: {destination}")
+    ready_output = ready_output.resolve(strict=False)
+    for label, output in (("provenance", provenance_output), ("READY", ready_output)):
+        try:
+            output.relative_to(destination)
+        except ValueError:
+            pass
+        else:
+            raise ValueError(f"Evaluator {label} output must stay outside the Agent bundle")
+    if provenance_output == ready_output:
+        raise ValueError("Evaluator provenance and READY outputs must be distinct")
     if provenance_output.exists():
         raise ValueError(f"Evaluator provenance output already exists: {provenance_output}")
+    if ready_output.exists():
+        raise ValueError(f"Evaluator READY output already exists: {ready_output}")
     if not destination.parent.is_dir():
         raise ValueError(f"Bundle destination parent does not exist: {destination.parent}")
     if not provenance_output.parent.is_dir():
         raise ValueError(f"Evaluator provenance parent does not exist: {provenance_output.parent}")
-    return destination, provenance_output
+    if not ready_output.parent.is_dir():
+        raise ValueError(f"Evaluator READY parent does not exist: {ready_output.parent}")
+    return destination, provenance_output, ready_output
+
+
+def fsync_bundle_directories(destination):
+    directories = [destination]
+    directories.extend(path for path in destination.rglob("*") if path.is_dir())
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        fsync_directory(directory)
+
+
+def verify_artifact_bytes(payload, declaration, expected=None):
+    expected = expected or declared_artifact_digest(declaration)
+    actual = hashlib.sha256(payload).hexdigest()
+    if actual != expected:
+        raise ValueError(f"Artifact digest mismatch: {declaration.get('artifact_id')}")
+    return actual
 
 
 def prepare(
@@ -312,6 +582,8 @@ def prepare(
     opaque_case_id=None,
     agent_trace_path="/workspace/trace.json",
     provenance_output=None,
+    ready_output=None,
+    _phase_hook=None,
 ):
     questions = case_questions()
     if case not in questions:
@@ -321,53 +593,88 @@ def prepare(
     if not OPAQUE_CASE_PATTERN.fullmatch(opaque_case_id):
         raise ValueError("Opaque case ID must match case-<32 lowercase hex characters>")
     agent_trace_path = validate_agent_trace_path(agent_trace_path)
-    destination, provenance_output = validate_output_paths(destination, provenance_output)
+    destination, provenance_output, ready_output = validate_output_paths(
+        destination, provenance_output, ready_output
+    )
     if destination.name != opaque_case_id:
         raise ValueError("Agent-visible destination basename must equal the opaque case ID")
-    source = FIXTURES / case
-    trace_source = fixture_file(source, Path("trace.json"))
-    source_validation = authoritative_trace_validation(trace_source)
-    trace = json.loads(trace_source.read_text(encoding="utf-8"))
-    validate_trace_identity_and_integrity(trace, case)
-
-    artifacts = []
-    for artifact, relative in validate_artifact_paths(trace["artifacts"]):
-        artifact_source = fixture_file(source, relative)
-        expected_digest = declared_artifact_digest(artifact)
-        verify_artifact(artifact_source, artifact, expected_digest)
-        artifacts.append((artifact, relative, artifact_source, expected_digest))
-
-    canonical_skill = skill_files()
-    derived_trace = sanitize_trace_identity(trace, opaque_case_id)
-    validate_trace_identity_and_integrity(derived_trace, opaque_case_id)
-    derived_bytes = trace_bytes(derived_trace)
-    rendered_prompts = prompts(agent_trace_path, questions[case])
-    staging = Path(
-        tempfile.mkdtemp(prefix=f".{opaque_case_id}.tmp-", dir=str(destination.parent))
-    )
-    published = False
-    provenance_created = False
+    owner_token = uuid.uuid4().hex
+    owner_identity = reserve_destination(destination, owner_token)
+    context = {
+        "opaque_case_id": opaque_case_id,
+        "destination": str(destination),
+        "provenance_output": str(provenance_output),
+        "ready_output": str(ready_output),
+    }
+    provenance_publication = {}
+    ready_publication = {}
     try:
-        (staging / "trace.json").write_bytes(derived_bytes)
-        for _, relative, artifact_source, _ in artifacts:
-            artifact_destination = staging / relative
-            artifact_destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(artifact_source, artifact_destination)
-        for relative, skill_source in canonical_skill:
-            skill_destination = staging / ".claude" / "skills" / "rootcause-analysis" / relative
-            skill_destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(skill_source, skill_destination)
-        for name, content in rendered_prompts.items():
-            (staging / name).write_text(content, encoding="utf-8")
+        emit_phase(_phase_hook, "destination_reserved", context)
 
-        derived_validation = authoritative_trace_validation(staging / "trace.json")
-        staged_trace = json.loads((staging / "trace.json").read_text(encoding="utf-8"))
-        validate_trace_identity_and_integrity(staged_trace, opaque_case_id)
+        source = FIXTURES / case
+        source_trace_bytes = read_regular_file_once(
+            source, Path("trace.json"), "Source Trace"
+        )
+        source_validation = validate_snapshot(
+            destination, "source-trace", source_trace_bytes
+        )
+        trace = json.loads(source_trace_bytes)
+        validate_trace_identity_and_integrity(trace, case)
+        emit_phase(_phase_hook, "source_validated", context)
+
+        artifacts = []
+        for artifact, relative in validate_artifact_paths(trace["artifacts"]):
+            artifact_bytes = read_regular_file_once(source, relative, "Artifact source")
+            expected_digest = declared_artifact_digest(artifact)
+            verify_artifact_bytes(artifact_bytes, artifact, expected_digest)
+            artifacts.append((artifact, relative, artifact_bytes, expected_digest))
+
+        canonical_skill = []
+        for relative, _ in skill_files():
+            canonical_skill.append(
+                (
+                    relative,
+                    read_regular_file_once(SKILL_ROOT, relative, "Canonical Skill file"),
+                )
+            )
+        derived_trace = sanitize_trace_identity(trace, opaque_case_id)
+        validate_trace_identity_and_integrity(derived_trace, opaque_case_id)
+        derived_bytes = trace_bytes(derived_trace)
+        rendered_prompts = prompts(agent_trace_path, questions[case])
+
+        write_new_file(destination / "trace.json", derived_bytes)
+        derived_validation = validate_snapshot(
+            destination, "derived-trace", derived_bytes
+        )
+        for _, relative, artifact_bytes, _ in artifacts:
+            artifact_destination = destination / relative
+            artifact_destination.parent.mkdir(parents=True, exist_ok=True)
+            write_new_file(artifact_destination, artifact_bytes)
+        for relative, skill_bytes in canonical_skill:
+            skill_destination = (
+                destination / ".claude" / "skills" / "rootcause-analysis" / relative
+            )
+            skill_destination.parent.mkdir(parents=True, exist_ok=True)
+            write_new_file(skill_destination, skill_bytes)
+        for name, content in rendered_prompts.items():
+            write_new_file(destination / name, content.encode("utf-8"))
+
+        final_trace_bytes = read_regular_file_once(
+            destination, Path("trace.json"), "Published derived Trace"
+        )
+        if final_trace_bytes != derived_bytes:
+            raise ValueError("Published derived Trace bytes changed after validation")
         artifact_provenance = []
-        for artifact, relative, _, expected_digest in artifacts:
-            copied = regular_file(staging, relative, "Bundle artifact")
-            content_sha256 = verify_artifact(
-                copied, artifact, expected_digest, postwrite=True
+        for artifact, relative, artifact_bytes, expected_digest in artifacts:
+            copied_bytes = read_regular_file_once(
+                destination, relative, "Bundle artifact"
+            )
+            if copied_bytes != artifact_bytes:
+                raise ValueError(
+                    f"Artifact content changed after write: {artifact.get('artifact_id')}"
+                )
+            content_sha256 = verify_artifact_bytes(
+                copied_bytes, artifact, expected_digest
             )
             artifact_provenance.append(
                 {
@@ -376,12 +683,15 @@ def prepare(
                     "content_sha256": content_sha256,
                 }
             )
-
+        fsync_bundle_directories(destination)
+        emit_phase(_phase_hook, "bundle_written", context)
+        tree_digest = bundle_tree_digest(destination)
         provenance = {
             "source_fixture": case,
             "opaque_case_id": opaque_case_id,
-            "source_trace_sha256": hashlib.sha256(trace_source.read_bytes()).hexdigest(),
+            "source_trace_sha256": hashlib.sha256(source_trace_bytes).hexdigest(),
             "derived_trace_sha256": hashlib.sha256(derived_bytes).hexdigest(),
+            "bundle_tree_sha256": tree_digest,
             "source_completeness": source_validation["recovery"],
             "lifecycle": source_validation["lifecycle"],
             "segments": source_validation["segments"],
@@ -394,48 +704,56 @@ def prepare(
                 "derived_trace_validation": derived_validation,
             },
         }
+        provenance_bytes = json_bytes(provenance)
+        provenance_digest = publish_no_replace(
+            provenance_output, provenance_bytes, provenance_publication
+        )
+        emit_phase(_phase_hook, "provenance_published", context)
 
-        staging.rename(destination)
-        published = True
-        try:
-            with provenance_output.open("x", encoding="utf-8") as stream:
-                provenance_created = True
-                json.dump(provenance, stream, ensure_ascii=False, indent=2, sort_keys=True)
-                stream.write("\n")
-        except Exception:
-            if provenance_created:
-                provenance_output.unlink(missing_ok=True)
-            shutil.rmtree(destination)
-            published = False
-            raise
-        return provenance
+        ready = {
+            "schema_version": READY_SCHEMA_VERSION,
+            "opaque_case_id": opaque_case_id,
+            "provenance_sha256": provenance_digest,
+            "bundle_tree_sha256": tree_digest,
+        }
+        publish_no_replace(ready_output, json_bytes(ready), ready_publication)
     except Exception:
-        if staging.exists():
-            shutil.rmtree(staging)
-        if published and destination.exists():
-            shutil.rmtree(destination)
-        if provenance_created and provenance_output.exists():
-            provenance_output.unlink()
+        cleanup_published_file(ready_output, ready_publication)
+        cleanup_published_file(provenance_output, provenance_publication)
+        cleanup_owned_destination(destination, owner_token, owner_identity)
         raise
+    emit_phase(_phase_hook, "ready_published", context)
+    return provenance
 
 
 def main(argv=None):
     questions = case_questions()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=sorted(questions), required=True)
+    parser.add_argument("--case", choices=sorted(questions))
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--opaque-case-id")
     parser.add_argument("--agent-trace-path", default="/workspace/trace.json")
     parser.add_argument("--provenance-output", type=Path, required=True)
+    parser.add_argument("--ready-output", type=Path, required=True)
+    parser.add_argument("--verify-ready-handoff", action="store_true")
     args = parser.parse_args(argv)
     try:
-        prepare(
-            args.case,
-            args.destination,
-            args.opaque_case_id,
-            args.agent_trace_path,
-            provenance_output=args.provenance_output,
-        )
+        if args.verify_ready_handoff:
+            result = verify_ready_handoff(
+                args.destination, args.provenance_output, args.ready_output
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        else:
+            if args.case is None:
+                parser.error("--case is required when building a handoff")
+            prepare(
+                args.case,
+                args.destination,
+                args.opaque_case_id,
+                args.agent_trace_path,
+                provenance_output=args.provenance_output,
+                ready_output=args.ready_output,
+            )
     except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         parser.error(str(error))
     return 0

@@ -24,6 +24,8 @@ trust boundary, and the repository no longer claims to provide one.
 `prepare_isolated_bundle.py` is now the only evaluation helper. Scored execution
 must be delegated to an independently managed trusted benchmark Harness whose
 credential, filesystem, network, cleanup, runtime attestation, and audit controls
-are outside this repository.
+are outside this repository. The current handoff protocol additionally requires
+an external READY marker whose provenance and bundle-tree digests verify before
+the Harness consumes a bundle.
 
 Historical local/source observations remain unscored smoke evidence only.

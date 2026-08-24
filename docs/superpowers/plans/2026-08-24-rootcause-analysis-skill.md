@@ -693,13 +693,14 @@ git diff --check
 
 The evaluator builds each opaque workspace before launching an Agent. The workspace
 contains only the selected finalized Trace and verified Artifacts, the
-canonical Skill, and runtime-specific prompts. It contains no `cases.json`,
+canonical Skill, runtime-specific prompts, and the publisher ownership
+`.handoff-owner` marker. It contains no `cases.json`,
 rubric, hidden expected outcome, sibling fixture, report, Git history, or
 symlink back to the repository.
 
 ```bash
 HANDOFF_ROOT=$(mktemp -d /tmp/rootcause-handoff.XXXXXX)
-mkdir -p "$HANDOFF_ROOT/bundles" "$HANDOFF_ROOT/provenance"
+mkdir -p "$HANDOFF_ROOT/bundles" "$HANDOFF_ROOT/provenance" "$HANDOFF_ROOT/ready"
 
 jq -r '.cases[].fixture' tools/rootcause_skill_tests/pressure/cases.json |
 while IFS= read -r CASE; do
@@ -709,7 +710,14 @@ while IFS= read -r CASE; do
     --opaque-case-id "$OPAQUE_CASE_ID" \
     --agent-trace-path /workspace/trace.json \
     --destination "$HANDOFF_ROOT/bundles/$OPAQUE_CASE_ID" \
-    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json"
+    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json" \
+    --ready-output "$HANDOFF_ROOT/ready/${OPAQUE_CASE_ID}.READY.json"
+
+  python3 tools/rootcause_skill_tests/pressure/prepare_isolated_bundle.py \
+    --verify-ready-handoff \
+    --destination "$HANDOFF_ROOT/bundles/$OPAQUE_CASE_ID" \
+    --provenance-output "$HANDOFF_ROOT/provenance/${OPAQUE_CASE_ID}.provenance.json" \
+    --ready-output "$HANDOFF_ROOT/ready/${OPAQUE_CASE_ID}.READY.json"
 done
 ```
 
@@ -723,20 +731,34 @@ facts preserved in evaluator provenance.
 
 Before writing, the builder performs a collision preflight and rejects Artifact
 paths that collide with reserved bundle files, the canonical Skill tree, one
-another, or portable casefold/Unicode normalization. It builds into a temporary
-sibling, reopens every copied Artifact and verifies its declared
-`content_sha256`, then publishes atomically. Any validation or write failure
-triggers rollback of the temporary tree, destination, and new provenance so no
-partial handoff remains.
+another, or portable casefold/Unicode normalization. The portable policy also
+rejects reserved-path ancestors/descendants, trailing dots/spaces, Windows device
+names, control characters, `:`, `\\`, `<>|?*`, and ambiguous components.
 
-`--provenance-output` is required, must be outside the bundle, and uses exclusive
-creation. Each opaque case therefore receives its own evaluator-only
-`${OPAQUE_CASE_ID}.provenance.json`; do not use shell redirection or a shared
-provenance filename. Existing bundle or provenance paths are rejected, which
-also prevents accidental opaque-ID reuse. After Agent execution, the evaluator
-alone reads the per-case provenance, `cases.json`, and `rubric.json` to score
-captured outputs outside the submitted bundle. Agent-visible identity is opaque;
-fixture mapping, derived provenance, and rubric stay evaluator-only.
+The builder atomically reserves the final destination with no-overwrite `mkdir`
+and immediately writes an exclusive unique owner marker. It reads the source
+Trace once and uses the same bytes for hashing, parsing, and authoritative
+validation through a private snapshot. Each Artifact is likewise read once,
+hashed, and written from the same bytes. The derived Trace is validated from the
+exact bytes written by the publisher. The bundle remains unready and
+non-consumable throughout construction.
+
+`--provenance-output` and `--ready-output` are required outside the bundle and
+published with no-replace semantics. Each opaque case receives evaluator-only
+`${OPAQUE_CASE_ID}.provenance.json` and `${OPAQUE_CASE_ID}.READY.json`; do not use
+shell redirection or shared filenames. Provenance is published first. READY is
+published last and binds the opaque ID, provenance SHA-256, and deterministic
+bundle-tree SHA-256. The owner marker is excluded from the tree digest.
+
+Harness submission is allowed only when READY exists and
+`--verify-ready-handoff` confirms both digests. A destination or provenance file
+without valid READY remains unready/non-consumable. A crash can leave such files;
+this protocol does not claim cross-path transaction atomicity. Ordinary cleanup
+deletes a destination only while its inode and owner token still match, and never
+renames over or deletes an unowned destination. After Agent execution, the
+evaluator alone reads the per-case provenance, `cases.json`, and `rubric.json` to
+score captured outputs outside the submitted bundle. Agent-visible identity is
+opaque; fixture mapping, derived provenance, and rubric stay evaluator-only.
 
 Submit each bundle to an existing trusted benchmark Harness or isolated
 execution service. This repository does not implement credential injection,
