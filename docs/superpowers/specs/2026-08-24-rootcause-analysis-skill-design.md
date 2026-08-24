@@ -350,9 +350,13 @@ erase instruction-following, architecture, safety, or completeness defects.
 
 ## Report Contract
 
-The Agent writes sibling files to a user-specified output prefix. When no
-prefix is supplied, it writes outside the immutable Trace bundle to
-`<trace-parent>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`.
+The Agent writes sibling files to a user-specified output prefix. Given a
+canonical `<runs-root>/<case-dir-name>/trace.json`, the default is the sibling
+analysis tree
+`<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`. If the
+bundle root or runs root cannot be established safely, the Agent requires an
+explicit prefix. Canonicalized destinations inside either the Trace bundle or
+the analyzed project are rejected; an explicit prefix cannot override this.
 
 The JSON report contains:
 
@@ -380,7 +384,7 @@ Every recommendation is structured as:
   "target": "agent|harness|skill|mcp|tool|prompt|context|trace|code|process",
   "owner": "responsible subsystem or team",
   "priority": "critical|high|medium|low",
-  "problem_addressed": "root cause or contributing factor reference",
+  "problem_addressed": "ROOT-001",
   "proposed_change": "what should be changed, without applying it",
   "rationale": "why the change addresses the evidence-backed cause",
   "expected_effect": "observable behavior expected after the change",
@@ -395,10 +399,15 @@ observability, and process improvements. They must identify an owner and cite
 the evidence that motivates the proposal. The report may suggest a future
 validation procedure, but the Skill does not execute that procedure.
 
-Each causal-chain step includes a plain-language explanation and structured
+Each causal-chain step has a stable `STEP-NNN` ID, a plain-language explanation, and structured
 `node_refs`, `edge_refs`, and `artifact_refs`. Each important Markdown claim
 includes bracketed evidence IDs that resolve through `evidence_index`, so the
 human and machine-readable reports can be checked against one another.
+
+Every `problem_addressed` resolves to an existing stable report ID:
+`ROOT-NNN`, `STEP-NNN`, or `GAP-NNN`. Root-correction and resilience proposals
+address roots or steps. Observability proposals address gaps and may only
+recommend future passive evidence capture, never behavioral changes.
 
 The Markdown report presents:
 

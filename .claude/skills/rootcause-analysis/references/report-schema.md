@@ -8,12 +8,24 @@ recommendation in only one representation.
 
 ## Output Location And Immutability
 
-Write sibling files at a user-supplied output prefix. If none is supplied, use
-`<trace-parent>/rootcause-analysis/<case-dir-name>/analysis.json` and
-`analysis.md`. This location must be outside the immutable Trace bundle and the
-analyzed project. Report writing is the only permitted mutation. Never modify
-the Agent, Harness, Skill, MCP, tool, prompt, model configuration, source,
-build environment, Trace, session, or any evidence Artifact.
+Treat a canonical Trace path of `<runs-root>/<case-dir-name>/trace.json` as
+defining the case Trace bundle at `<runs-root>/<case-dir-name>`. When that
+layout and both roots are established safely, the default output is
+`<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`. This is a
+sibling analysis tree, not a child of the case Trace bundle.
+
+If the bundle root or runs root cannot be established safely, do not guess a
+default; require an explicit user-supplied output prefix. Prefix `<prefix>` produces `<prefix>.json` and `<prefix>.md`.
+Paths are
+canonicalized before validation, including symlink resolution. Reject any output inside the Trace bundle.
+Reject any output inside the analyzed project.
+An explicit prefix is not an override for either exclusion. If the canonical
+destination cannot be compared with both exclusion roots, stop and ask for the
+missing root rather than writing a report.
+
+Report writing at the validated destination is the only permitted mutation.
+Never modify the Agent, Harness, Skill, MCP, tool, prompt, model configuration,
+source, build environment, Trace, session, or any evidence Artifact.
 
 ## Normative JSON Shape
 
@@ -70,6 +82,7 @@ provider-specific reasoning or hidden chain-of-thought fields.
   ],
   "causal_chain": [
     {
+      "step_id": "STEP-001",
       "step": 1,
       "from_ref": "decision:dec_24",
       "to_ref": "tool:call_26",
@@ -138,6 +151,42 @@ provider-specific reasoning or hidden chain-of-thought fields.
       "content_sha256": null,
       "excerpt": "Short, faithful excerpt or compact recorded fact.",
       "interpretation": "What this evidence establishes; inference is labeled explicitly."
+    },
+    {
+      "evidence_id": "E-002",
+      "evidence_kind": "node",
+      "immutable_ref": "response:final_01",
+      "trace_ref": "response:final_01",
+      "content_sha256": null,
+      "excerpt": "The recorded final behavior that differs from the expectation.",
+      "interpretation": "Establishes the actual behavior and direct final impact."
+    },
+    {
+      "evidence_id": "E-003",
+      "evidence_kind": "node",
+      "immutable_ref": "decision:dec_24",
+      "trace_ref": "decision:dec_24",
+      "content_sha256": null,
+      "excerpt": "The decision selected the inconsistent action.",
+      "interpretation": "Supports introduction of the semantic defect at the decision."
+    },
+    {
+      "evidence_id": "E-004",
+      "evidence_kind": "edge",
+      "immutable_ref": "edge:dec_24:call_26",
+      "trace_ref": "edge:dec_24:call_26",
+      "content_sha256": null,
+      "excerpt": "Eligible selected-action edge from the decision to the tool call.",
+      "interpretation": "Supports propagation from the decision into execution."
+    },
+    {
+      "evidence_id": "E-005",
+      "evidence_kind": "node",
+      "immutable_ref": "context:ctx_07",
+      "trace_ref": "context:ctx_07",
+      "content_sha256": null,
+      "excerpt": "The competing explanation's required context was present.",
+      "interpretation": "Contradicts the rejected hypothesis that the context was unavailable."
     }
   ]
 }
@@ -163,8 +212,8 @@ are case-sensitive. Required evidence arrays for material claims are non-empty.
   `status`, `component`, `owner`, `semantic_defect`, `taint_state`, and
   `counterfactual`; `node_ref` is `string | null`; `evidence_refs` is
   `array<string>`.
-- `causal_chain`: `array<object>`. `step` is a positive integer represented as
-  `number`; `from_ref` and `to_ref` are `string | null`; `component`,
+- `causal_chain`: `array<object>`. `step_id` is `string`; `step` is a positive
+  integer represented as `number`; `from_ref` and `to_ref` are `string | null`; `component`,
   `semantic_event`, `taint_state`, `taint_transition`, and `explanation` are
   `string`; `node_refs`, `edge_refs`, `artifact_refs`, and `evidence_refs` are
   `array<string>`.
@@ -218,6 +267,12 @@ Every material impact, premise, and
 rejected-hypothesis judgment does as well. All such IDs must resolve through `evidence_index`;
 unresolved IDs are invalid.
 
+Report object IDs are stable and unique within one report: `root_id` uses
+`ROOT-NNN`, `step_id` uses `STEP-NNN`, and `gap_id` uses `GAP-NNN` in recorded
+order. A recommendation's `problem_addressed` is exactly one existing
+`ROOT-NNN | STEP-NNN | GAP-NNN`; prose, component names, Trace refs, missing
+IDs, and recommendation IDs are invalid in that field.
+
 Each evidence entry has a unique `E-NNN` ID and one immutable source ref. Node,
 edge, and record evidence uses its canonical Trace ref. Artifact evidence uses
 the Artifact ref and its verified `content_sha256`; never quote unverified
@@ -225,11 +280,34 @@ Artifact bytes. `excerpt` remains short and faithful. `interpretation` says
 what the fact supports and labels any inference. Evidence entries do not
 contain hidden reasoning.
 
-For `inconclusive`, keep `root_causes` empty unless a partial root is supported,
-name the unresolved hypotheses in `evidence_gaps`, and cite the evidence that
-sets the uncertainty boundary. For `no_defect`, explain which premise was
-contradicted or why the observed fallback was reasonable. Do not invent a root
-to make either report look complete.
+## Verdict And Recommendation Semantics
+
+- `confirmed`: the discrepancy is supported, at least one `ROOT-NNN` is
+  `confirmed`, and eligible evidence connects every reported root through
+  ordered `STEP-NNN` entries to the final impact. Root-correction
+  recommendations address an existing root or causal step.
+- `probable`: at least one `ROOT-NNN` is `probable` and has a substantial
+  evidence-backed path, but a named competing hypothesis or material gap could
+  still change confirmation. Do not describe a probable root as confirmed.
+- `inconclusive`: no candidate meets the probable-root threshold;
+  `root_causes` must be empty. Preserve supported partial `STEP-NNN` entries
+  only when they clarify the uncertainty boundary, and represent every missing
+  fact that blocks confirmation as a `GAP-NNN`.
+- `no_defect`: evidence contradicts the questioned discrepancy or establishes
+  that the observed behavior met the bound expectation. `root_causes` and
+  `causal_chain` must be empty, no material causal uncertainty remains, and no
+  corrective recommendation is emitted.
+
+An observability recommendation is allowed only for a recorded evidence gap:
+its `problem_addressed` must be a `GAP-NNN`, and its proposed change is limited
+to future passive evidence capture or visibility. It must not change Agent,
+Harness, Skill, tool, model, or task behavior under the guise of
+instrumentation. A correction or resilience recommendation instead addresses
+an existing `ROOT-NNN` or `STEP-NNN`. Do not invent a root or gap to make a
+recommendation resolvable.
+
+For an `inconclusive` verdict, only observability recommendations addressing
+existing `GAP-NNN` entries are allowed. For a `no_defect` verdict, `recommendations` must be empty.
 
 ## Markdown Projection
 
@@ -257,7 +335,8 @@ is no confirmed or probable root, say so and point to the relevant gaps.
 
 ## Defect Propagation
 
-Number the JSON causal steps in the same order. Explain in task language what
+Number the JSON causal steps in the same order and display each `STEP-NNN`.
+Explain in task language what
 each component received, produced or omitted, how the taint changed, and how
 that affected the next component `[E-001]`.
 

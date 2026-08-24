@@ -17,6 +17,13 @@ DESIGN_PATH = (
     / "specs"
     / "2026-08-24-rootcause-analysis-skill-design.md"
 )
+PLAN_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "superpowers"
+    / "plans"
+    / "2026-08-24-rootcause-analysis-skill.md"
+)
 REFERENCE_NAMES = {
     "backward-semantic-taint.md",
     "causal-analysis-method.md",
@@ -68,9 +75,9 @@ REQUIRED_OBJECT_KEYS = {
         "taint_state", "counterfactual", "evidence_refs",
     },
     "causal_chain": {
-        "step", "from_ref", "to_ref", "component", "semantic_event", "taint_state",
-        "taint_transition", "explanation", "node_refs", "edge_refs", "artifact_refs",
-        "evidence_refs",
+        "step_id", "step", "from_ref", "to_ref", "component", "semantic_event",
+        "taint_state", "taint_transition", "explanation", "node_refs", "edge_refs",
+        "artifact_refs", "evidence_refs",
     },
     "final_impact": {
         "category", "status", "description", "direct_effect", "inferred_risks",
@@ -103,11 +110,26 @@ def parse_frontmatter(text: str):
     return values
 
 
+def collect_evidence_refs(value):
+    found = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "evidence_refs":
+                found.extend(child)
+            else:
+                found.extend(collect_evidence_refs(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(collect_evidence_refs(child))
+    return found
+
+
 class SkillContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.skill_text = SKILL_PATH.read_text(encoding="utf-8")
         cls.design_text = DESIGN_PATH.read_text(encoding="utf-8")
+        cls.plan_text = PLAN_PATH.read_text(encoding="utf-8")
         cls.frontmatter = parse_frontmatter(cls.skill_text)
         cls.references = {
             name: (SKILL_DIR / "references" / name).read_text(encoding="utf-8")
@@ -340,6 +362,78 @@ class SkillContractTests(unittest.TestCase):
                 rf"every {re.escape(claim)}[^\n]*`evidence_refs`",
             )
         self.assertIn("must resolve through `evidence_index`", schema)
+
+    def test_normative_example_resolves_every_evidence_reference_recursively(self):
+        schema = self.references["report-schema.md"]
+        match = re.search(r"```json\n(.*?)\n```", schema, re.DOTALL)
+        template = json.loads(match.group(1))
+        evidence_ids = [item["evidence_id"] for item in template["evidence_index"]]
+        referenced = collect_evidence_refs(template)
+        self.assertEqual(len(evidence_ids), len(set(evidence_ids)))
+        self.assertTrue(all(re.fullmatch(r"E-\d{3}", item) for item in evidence_ids))
+        self.assertTrue(all(re.fullmatch(r"E-\d{3}", item) for item in referenced))
+        self.assertEqual(set(referenced), set(evidence_ids))
+
+    def test_default_output_is_a_safe_sibling_or_requires_explicit_prefix(self):
+        canonical = "`<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`"
+        for name, text in (
+            ("schema", self.references["report-schema.md"]),
+            ("design", self.design_text),
+            ("plan", self.plan_text),
+        ):
+            self.assertIn(canonical, text, name)
+            self.assertNotIn("<trace-parent>", text, name)
+        self.assertIn("Trace bundle or analyzed project", self.plan_text)
+        schema = self.references["report-schema.md"].lower()
+        for phrase in (
+            "canonicalized",
+            "explicit user-supplied output prefix",
+            "prefix `<prefix>` produces `<prefix>.json` and `<prefix>.md`",
+            "reject any output inside the trace bundle",
+            "reject any output inside the analyzed project",
+            "cannot be established safely",
+        ):
+            self.assertIn(phrase, schema)
+        self.assertIn("safe output rule", self.skill_text.lower())
+
+    def test_stable_report_ids_and_problem_addressed_resolve(self):
+        schema = self.references["report-schema.md"]
+        match = re.search(r"```json\n(.*?)\n```", schema, re.DOTALL)
+        template = json.loads(match.group(1))
+        roots = [item["root_id"] for item in template["root_causes"]]
+        steps = [item["step_id"] for item in template["causal_chain"]]
+        gaps = [item["gap_id"] for item in template["evidence_gaps"]]
+        report_ids = roots + steps + gaps
+        self.assertEqual(len(report_ids), len(set(report_ids)))
+        self.assertTrue(all(re.fullmatch(r"(?:ROOT|STEP|GAP)-\d{3}", item) for item in report_ids))
+        addressed = [item["problem_addressed"] for item in template["recommendations"]]
+        self.assertTrue(addressed)
+        self.assertTrue(set(addressed).issubset(set(report_ids)))
+        self.assertIn("`ROOT-NNN | STEP-NNN | GAP-NNN`", schema)
+        self.assertIn('"problem_addressed": "ROOT-001"', self.design_text)
+        self.assertNotIn(
+            '"problem_addressed": "root cause or contributing factor reference"',
+            self.design_text,
+        )
+
+    def test_verdict_and_observability_recommendation_semantics_are_exact(self):
+        schema = self.references["report-schema.md"].lower()
+        section = schema.split("## verdict and recommendation semantics", 1)
+        self.assertEqual(len(section), 2)
+        semantics = section[1].split("##", 1)[0]
+        for verdict in ("confirmed", "probable", "inconclusive", "no_defect"):
+            self.assertRegex(semantics, rf"(?m)^- `{verdict}`:")
+        self.assertIn("`root_causes` must be empty", semantics)
+        self.assertIn("`problem_addressed` must be a `gap-nnn`", semantics)
+        self.assertIn("passive evidence", semantics)
+        self.assertIn(
+            "for an `inconclusive` verdict, only observability recommendations",
+            semantics,
+        )
+        self.assertIn(
+            "for a `no_defect` verdict, `recommendations` must be empty",
+            semantics,
+        )
 
     def test_markdown_contract_mirrors_json_and_ends_with_no_change_statement(self):
         schema = self.references["report-schema.md"]

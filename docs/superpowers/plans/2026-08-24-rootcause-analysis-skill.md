@@ -569,7 +569,7 @@ git commit -m "feat(skill): guide agentic semantic root cause analysis"
 
 **Interfaces:**
 - Consumes: confirmed/probable/inconclusive/no-defect analysis state.
-- Produces: `rootcause-analysis/v1` JSON plus evidence-mirrored Markdown at a user prefix or `<trace-parent>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`.
+- Produces: `rootcause-analysis/v1` JSON plus evidence-mirrored Markdown at a validated user prefix or, for `<runs-root>/<case-dir-name>/trace.json`, the safe sibling `<runs-root>/rootcause-analysis/<case-dir-name>/analysis.{json,md}`; otherwise an explicit prefix is required. A canonical destination inside the Trace bundle or analyzed project is rejected.
 
 - [ ] **Step 1: Write failing report-contract tests**
 
