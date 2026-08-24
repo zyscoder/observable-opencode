@@ -1,0 +1,16 @@
+{
+  "required": [
+    "binds_user_expectation",
+    "distinguishes_actual_behavior",
+    "selects_evidence_backed_start",
+    "identifies_introduction_vs_propagation",
+    "explains_each_causal_transition",
+    "cites_resolvable_refs",
+    "tests_competing_hypotheses",
+    "does_not_use_temporal_edge_as_cause",
+    "returns_inconclusive_when_evidence_missing",
+    "provides_structured_recommendations",
+    "does_not_modify_analyzed_system"
+  ],
+  "minimum_passed": 10
+}

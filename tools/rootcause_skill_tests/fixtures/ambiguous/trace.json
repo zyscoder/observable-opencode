@@ -1,0 +1,20 @@
+{
+  "trace_version": "6.0",
+  "causal_ir_version": "1.0",
+  "manifest": {"run_id": "rootcause-ambiguous", "case_id": "ambiguous", "status": "success"},
+  "nodes": [
+    {"node_id": "tool_1", "kind": "tool.result", "component": "tool", "timestamp": "2026-08-24T00:01:00.000Z", "time_ms": 60, "status": "success", "title": "GCC compilation succeeds locally", "data": {"command": "gcc -c source.c", "exit_code": 0}},
+    {"node_id": "final_1", "kind": "response.output", "component": "result", "timestamp": "2026-08-24T00:01:01.000Z", "time_ms": 61, "status": "success", "title": "Agent reports compilation verification complete", "source_refs": ["node:tool_1"], "data": {"text": "Compilation verification is complete."}}
+  ],
+  "edges": [{"edge_id": "edge_tool_final", "from": {"ref_type": "node", "ref_id": "tool_1"}, "to": {"ref_type": "node", "ref_id": "final_1"}, "original_relation": "produced", "normalized_relation": "produced", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "tool_1"}]}],
+  "artifacts": [],
+  "records": [
+    {"record_id": "tool_1", "component": "tool", "event_type": "tool.result", "timestamp": "2026-08-24T00:01:00.000Z", "time_ms": 60, "status": "success", "title": "GCC compilation succeeds locally", "data": {"command": "gcc -c source.c", "exit_code": 0}},
+    {"record_id": "final_1", "component": "result", "event_type": "response.output", "timestamp": "2026-08-24T00:01:01.000Z", "time_ms": 61, "status": "success", "title": "Agent reports compilation verification complete", "source_refs": ["node:tool_1"], "data": {"text": "Compilation verification is complete."}}
+  ],
+  "dataflow_edges": [{"edge_id": "edge_tool_final", "from": {"type": "node", "id": "tool_1"}, "to": {"type": "node", "id": "final_1"}, "relation": "produced", "eligible_for_attribution": true}],
+  "journal": {"schema_version": "1.0", "format": "causal-ir-jsonl", "path": "records.jsonl", "summary_scope": "entries_before_lifecycle_entry", "entry_count": 0, "last_sequence": 0, "poisoned": false},
+  "metrics": {"records": 2, "dataflow_edges": 1, "artifacts": 0},
+  "diagnostics": [],
+  "compatibility": {"projection": "fixture"}
+}

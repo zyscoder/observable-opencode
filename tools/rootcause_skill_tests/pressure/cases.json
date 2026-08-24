@@ -1,0 +1,11 @@
+{
+  "cases": [
+    {"fixture": "known-root", "question": "为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？", "expected": {"verdict": "root_cause_identified", "introduction_ref": "node:dec_1", "must_distinguish": ["user requirement", "successful GCC result", "final claim"]}},
+    {"fixture": "ambiguous", "question": "为什么 Agent 使用 GCC 而不是 Yocto？", "expected": {"verdict": "inconclusive", "reason": "Trace lacks user expectation and model-context evidence."}},
+    {"fixture": "skill-omission", "question": "为什么用户要求的 security-review Skill 没有被使用？", "expected": {"verdict": "root_cause_identified", "semantic_break_after": "node:catalog_1", "must_not_fabricate": "skill invocation node"}},
+    {"fixture": "context-contamination", "question": "为什么已经更正为 staging 的请求最终变成了 production 部署计划？", "expected": {"verdict": "root_cause_identified", "introduction_ref": "node:dec_1", "contributing_ref": "node:stale_1"}},
+    {"fixture": "control-flow-change", "question": "为什么要求只增加日志的修改改变了执行控制流？", "expected": {"verdict": "root_cause_identified", "introduction_ref": "node:edit_1", "must_explain": ["invariant", "early return mutation", "missed review", "final impact"]}},
+    {"fixture": "tool-failure-misreported", "question": "为什么失败的测试命令最终被报告为验证成功？", "expected": {"verdict": "root_cause_identified", "introduction_ref": "node:dec_1", "must_distinguish": ["failed tool condition", "false interpretation"]}},
+    {"fixture": "wrong-answer", "question": "为什么最终答案没有采用上下文中已有的发布日期证据？", "expected": {"verdict": "root_cause_identified", "introduction_ref": "node:dec_1", "must_distinguish": ["evidence availability", "reasoning error", "response propagation"]}}
+  ]
+}

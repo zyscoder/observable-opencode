@@ -1,0 +1,40 @@
+{
+  "trace_version": "6.0",
+  "causal_ir_version": "1.0",
+  "manifest": {"run_id": "rootcause-known-root", "case_id": "known-root", "status": "success"},
+  "nodes": [
+    {"node_id": "req_1", "kind": "task.obligation", "component": "prompt", "timestamp": "2026-08-24T00:00:00.000Z", "time_ms": 1, "status": "success", "title": "User requires Yocto verification through the build Skill", "data": {"text": "Use the build Skill and Yocto for compilation verification."}, "artifact_refs": ["build-requirement"]},
+    {"node_id": "ctx_1", "kind": "context.pack", "component": "context", "timestamp": "2026-08-24T00:00:01.000Z", "time_ms": 2, "status": "success", "title": "Model context retains the Yocto requirement and exposes the build Skill", "source_refs": ["node:req_1"], "data": {"requirements": ["Use Yocto", "Use the build Skill"], "skills": ["build"]}},
+    {"node_id": "dec_1", "kind": "decision", "component": "llm", "timestamp": "2026-08-24T00:00:02.000Z", "time_ms": 3, "status": "success", "title": "Model selects direct GCC compilation as sufficient verification", "source_refs": ["node:ctx_1"], "aliases": ["record:decision_legacy"], "data": {"decision": "Run gcc locally instead of the required Yocto build Skill workflow.", "rationale": "A successful local compilation is sufficient."}},
+    {"node_id": "tool_1", "kind": "tool.result", "component": "tool", "timestamp": "2026-08-24T00:00:03.000Z", "time_ms": 4, "status": "success", "title": "Direct GCC compilation succeeds locally", "source_refs": ["node:dec_1"], "data": {"command": "gcc -c source.c", "exit_code": 0, "stdout": ""}},
+    {"node_id": "final_1", "kind": "response.output", "component": "result", "timestamp": "2026-08-24T00:00:04.000Z", "time_ms": 5, "status": "success", "title": "Agent claims compilation verification is complete", "source_refs": ["node:tool_1"], "data": {"text": "Compilation verification is complete."}},
+    {"node_id": "unrelated_1", "kind": "observation", "component": "runtime", "timestamp": "2026-08-24T00:00:03.500Z", "time_ms": 35, "status": "success", "title": "Unrelated workspace status observation", "data": {"text": "No unrelated files changed."}}
+  ],
+  "edges": [
+    {"edge_id": "edge_req_ctx", "from": {"ref_type": "node", "ref_id": "req_1"}, "to": {"ref_type": "node", "ref_id": "ctx_1"}, "original_relation": "used_as_context", "normalized_relation": "used_as_context", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "req_1"}]},
+    {"edge_id": "edge_ctx_dec", "from": {"ref_type": "node", "ref_id": "ctx_1"}, "to": {"ref_type": "node", "ref_id": "dec_1"}, "original_relation": "context_influences_decision", "normalized_relation": "derived_from", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "ctx_1"}]},
+    {"edge_id": "edge_dec_tool", "from": {"ref_type": "node", "ref_id": "dec_1"}, "to": {"ref_type": "node", "ref_id": "tool_1"}, "original_relation": "selected_by", "normalized_relation": "selected_by", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "dec_1"}]},
+    {"edge_id": "edge_tool_final", "from": {"ref_type": "node", "ref_id": "tool_1"}, "to": {"ref_type": "node", "ref_id": "final_1"}, "original_relation": "produced", "normalized_relation": "produced", "evidence_tier": "confirmed", "eligible_for_attribution": true, "derivation_method": "explicit_relation", "evidence_refs": [{"ref_type": "node", "ref_id": "tool_1"}]},
+    {"edge_id": "edge_unrelated_final", "from": {"ref_type": "node", "ref_id": "unrelated_1"}, "to": {"ref_type": "node", "ref_id": "final_1"}, "original_relation": "temporal_adjacency", "normalized_relation": "derived_from", "evidence_tier": "temporal_advisory", "eligible_for_attribution": false, "derivation_method": "recorded_time_order", "evidence_refs": []}
+  ],
+  "artifacts": [{"artifact_id": "build-requirement", "kind": "text", "path": "artifacts/sha256/3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1", "hash": "sha256:3ae017fde4b7a5c634d92ade034c43241b383de7f30b328dea292a91d7a21fb1"}],
+  "records": [
+    {"record_id": "req_1", "component": "prompt", "event_type": "task.obligation", "timestamp": "2026-08-24T00:00:00.000Z", "time_ms": 1, "title": "User requires Yocto verification through the build Skill", "status": "success", "artifact_refs": ["build-requirement"], "data": {"text": "Use the build Skill and Yocto for compilation verification."}},
+    {"record_id": "ctx_1", "component": "context", "event_type": "context.pack", "timestamp": "2026-08-24T00:00:01.000Z", "time_ms": 2, "title": "Model context retains the Yocto requirement and exposes the build Skill", "status": "success", "source_refs": ["node:req_1"], "data": {"requirements": ["Use Yocto", "Use the build Skill"], "skills": ["build"]}},
+    {"record_id": "dec_1", "component": "llm", "event_type": "decision", "timestamp": "2026-08-24T00:00:02.000Z", "time_ms": 3, "title": "Model selects direct GCC compilation as sufficient verification", "status": "success", "source_refs": ["node:ctx_1"], "data": {"decision": "Run gcc locally instead of the required Yocto build Skill workflow."}},
+    {"record_id": "tool_1", "component": "tool", "event_type": "tool.result", "timestamp": "2026-08-24T00:00:03.000Z", "time_ms": 4, "title": "Direct GCC compilation succeeds locally", "status": "success", "source_refs": ["node:dec_1"], "data": {"command": "gcc -c source.c", "exit_code": 0}},
+    {"record_id": "final_1", "component": "result", "event_type": "response.output", "timestamp": "2026-08-24T00:00:04.000Z", "time_ms": 5, "title": "Agent claims compilation verification is complete", "status": "success", "source_refs": ["node:tool_1"], "data": {"text": "Compilation verification is complete."}},
+    {"record_id": "unrelated_1", "component": "runtime", "event_type": "observation", "timestamp": "2026-08-24T00:00:03.500Z", "time_ms": 35, "title": "Unrelated workspace status observation", "status": "success", "data": {"text": "No unrelated files changed."}}
+  ],
+  "dataflow_edges": [
+    {"edge_id": "edge_req_ctx", "from": {"type": "node", "id": "req_1"}, "to": {"type": "node", "id": "ctx_1"}, "relation": "used_as_context", "eligible_for_attribution": true},
+    {"edge_id": "edge_ctx_dec", "from": {"type": "node", "id": "ctx_1"}, "to": {"type": "node", "id": "dec_1"}, "relation": "derived_from", "eligible_for_attribution": true, "metadata": {"original_relation": "context_influences_decision"}},
+    {"edge_id": "edge_dec_tool", "from": {"type": "node", "id": "dec_1"}, "to": {"type": "node", "id": "tool_1"}, "relation": "selected_by", "eligible_for_attribution": true},
+    {"edge_id": "edge_tool_final", "from": {"type": "node", "id": "tool_1"}, "to": {"type": "node", "id": "final_1"}, "relation": "produced", "eligible_for_attribution": true},
+    {"edge_id": "edge_unrelated_final", "from": {"type": "node", "id": "unrelated_1"}, "to": {"type": "node", "id": "final_1"}, "relation": "derived_from", "eligible_for_attribution": false, "metadata": {"evidence_tier": "temporal_advisory"}}
+  ],
+  "journal": {"schema_version": "1.0", "format": "causal-ir-jsonl", "path": "records.jsonl", "summary_scope": "entries_before_lifecycle_entry", "entry_count": 0, "last_sequence": 0, "poisoned": false},
+  "metrics": {"records": 6, "dataflow_edges": 5, "artifacts": 1},
+  "diagnostics": [],
+  "compatibility": {"projection": "fixture"}
+}
