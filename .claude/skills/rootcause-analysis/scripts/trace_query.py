@@ -97,6 +97,33 @@ def _node_scope(node: Mapping[str, object]) -> Mapping[str, object]:
     return _mapping(node.get("scope"))
 
 
+def _finalized_collections(trace: Mapping[str, object]) -> Tuple[Sequence[object], Sequence[object], bool]:
+    required_mappings = ("manifest", "journal", "metrics", "compatibility")
+    required_strings = ("trace_version", "causal_ir_version")
+    if any(not _string(trace.get(key)) for key in required_strings) or any(
+        not isinstance(trace.get(key), MappingABC) for key in required_mappings
+    ):
+        raise TraceInputError("Trace is missing the finalized Causal IR envelope. {0}".format(FINALIZE_HINT))
+
+    canonical_nodes = trace.get("nodes")
+    canonical_edges = trace.get("edges")
+    compatibility_nodes = trace.get("records")
+    compatibility_edges = trace.get("dataflow_edges")
+    has_canonical_fields = "nodes" in trace or "edges" in trace
+    has_compatibility_fields = "records" in trace or "dataflow_edges" in trace
+    has_canonical = isinstance(canonical_nodes, list) and isinstance(canonical_edges, list)
+    has_compatibility = isinstance(compatibility_nodes, list) and isinstance(compatibility_edges, list)
+    if (has_canonical_fields and not has_canonical) or (has_compatibility_fields and not has_compatibility):
+        raise TraceInputError("Trace has incomplete semantic collections. {0}".format(FINALIZE_HINT))
+    if not has_canonical and not has_compatibility:
+        raise TraceInputError("Trace is missing semantic node and edge collections. {0}".format(FINALIZE_HINT))
+    return (
+        canonical_nodes if has_canonical else compatibility_nodes,
+        canonical_edges if has_canonical else compatibility_edges,
+        not has_canonical,
+    )
+
+
 class TraceIndex:
     def __init__(
         self,
@@ -132,21 +159,16 @@ class TraceIndex:
         if not isinstance(trace, MappingABC):
             raise TraceInputError("Trace input must be a JSON object. {0}".format(FINALIZE_HINT))
 
-        canonical_nodes = trace.get("nodes")
-        canonical_edges = trace.get("edges")
-        compatibility_nodes = trace.get("records")
-        compatibility_edges = trace.get("dataflow_edges")
-        has_canonical = isinstance(canonical_nodes, list) and isinstance(canonical_edges, list)
-        has_compatibility = isinstance(compatibility_nodes, list) and isinstance(compatibility_edges, list)
-        if not has_canonical and not has_compatibility:
-            raise TraceInputError("Trace is missing semantic node and edge collections. {0}".format(FINALIZE_HINT))
-
-        source_nodes = canonical_nodes if has_canonical else compatibility_nodes
-        source_edges = canonical_edges if has_canonical else compatibility_edges
-        record_mode = not has_canonical
+        source_nodes, source_edges, record_mode = _finalized_collections(trace)
         prefix = "record" if record_mode else "node"
         nodes = []
         aliases = {}
+
+        def register_alias(alias: str, ref: str) -> None:
+            previous = aliases.get(alias)
+            if previous is not None and previous != ref:
+                raise TraceInputError("Trace contains ambiguous alias {0}. {1}".format(alias, FINALIZE_HINT))
+            aliases[alias] = ref
 
         for source in source_nodes:
             if not isinstance(source, MappingABC):
@@ -157,10 +179,10 @@ class TraceIndex:
             ref = "{0}:{1}".format(prefix, identifier)
             if ref in aliases:
                 raise TraceInputError("Trace contains duplicate semantic node ids. {0}".format(FINALIZE_HINT))
-            aliases[ref] = ref
-            aliases["{0}:{1}".format("node" if record_mode else "record", identifier)] = ref
+            register_alias(ref, ref)
+            register_alias("{0}:{1}".format("node" if record_mode else "record", identifier), ref)
             for alias in _normalize_refs(source.get("aliases")):
-                aliases[alias] = ref
+                register_alias(alias, ref)
             nodes.append(
                 NodeView(
                     ref=ref,
@@ -188,14 +210,22 @@ class TraceIndex:
             identifier = _string(source.get("edge_id"))
             if not identifier:
                 raise TraceInputError("Trace contains a semantic edge without an id. {0}".format(FINALIZE_HINT))
-            relation = _string(source.get("normalized_relation")) or _string(source.get("relation"))
+            metadata = _mapping(source.get("metadata"))
+            relation = (
+                _string(source.get("normalized_relation"))
+                or _string(source.get("relation"))
+                or _string(metadata.get("normalized_relation"))
+            )
+            eligibility = source.get("eligible_for_attribution")
+            if not isinstance(eligibility, bool):
+                eligibility = metadata.get("eligible_for_attribution")
             edges.append(
                 EdgeView(
                     ref="edge:{0}".format(identifier),
                     source=resolve_endpoint(source.get("from")),
                     target=resolve_endpoint(source.get("to")),
                     relation=relation,
-                    eligible_for_attribution=source.get("eligible_for_attribution") is True,
+                    eligible_for_attribution=eligibility is True,
                     evidence_refs=_normalize_refs(source.get("evidence_refs")),
                 )
             )
@@ -214,7 +244,6 @@ class TraceIndex:
     def summary(self) -> Mapping[str, object]:
         """Return lifecycle, component, node, edge, and Artifact counts."""
         components = Counter(node.component for node in self.nodes if node.component)
-        components.setdefault("agent", 0)
         return {
             "causal_ir_version": self.causal_ir_version,
             "lifecycle": _json_value(self.lifecycle),
