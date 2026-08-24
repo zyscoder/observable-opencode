@@ -714,10 +714,25 @@ test "$(jq -r '.generation' "$CASE_DIR/session.json")" = \
 具体疑问读取已经 finalize 的语义 Trace，执行递归后向语义污点分析、多假设回溯和独立根因确认，
 最终同时给出结构化 JSON 与面向人的 Markdown 说明。
 
-在能够发现仓库级 `.claude/skills` 的 Agent 中，从本仓库根目录发起请求：
+不同 Agent runtime 的 Skill 调用语法不同，不能混用。
+
+### Claude Code
+
+Claude Code 使用 slash command `/rootcause-analysis`：
 
 ```text
-Use $rootcause-analysis.
+/rootcause-analysis
+Trace: /absolute/path/to/case/trace.json
+Question: 为什么用户明确要求通过构建 Skill 使用 Yocto，但实际只进行了 GCC 局部编译？
+```
+
+### OpenCode
+
+OpenCode 不使用带美元符号的 Skill 简写。在请求中明确要求 Agent 先 invoke the `skill` tool，
+并把 Skill 名称设置为 `rootcause-analysis`，加载成功后再开始分析：
+
+```text
+开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。
 Trace: /absolute/path/to/case/trace.json
 Question: 为什么用户明确要求通过构建 Skill 使用 Yocto，但实际只进行了 GCC 局部编译？
 ```
@@ -732,7 +747,7 @@ Question: 为什么用户明确要求通过构建 Skill 使用 Yocto，但实际
 **不会写任何文件**。如需保存报告，必须同时提供显式输出前缀和被分析项目根目录，例如：
 
 ```text
-Use $rootcause-analysis.
+使用当前 runtime 的上述方式加载 rootcause-analysis Skill。
 Trace: /data/evo-bench/traces/case-001/trace.json
 Question: 为什么用户要求使用构建 Skill 完成 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？
 Output prefix: /data/evo-bench/rootcause-results/case-001/analysis
@@ -757,7 +772,10 @@ python3 "$TRACE_QUERY" search --trace "$TRACE" --query "yocto" --limit 20 --offs
 python3 "$TRACE_QUERY" node --trace "$TRACE" --ref node:dec_1
 python3 "$TRACE_QUERY" neighbors --trace "$TRACE" --ref node:dec_1 --direction upstream
 python3 "$TRACE_QUERY" paths --trace "$TRACE" --start node:final_1 --max-depth 8 --limit 20
-python3 "$TRACE_QUERY" artifact --trace "$TRACE" --id artifact:prompt_1 --max-chars 12000
+
+# 先从相关节点的 artifact_refs 找到实际 Artifact ID，再读取内容。
+python3 "$TRACE_QUERY" node --trace "$TRACE" --ref node:req_1
+python3 "$TRACE_QUERY" artifact --trace "$TRACE" --id build-requirement --max-chars 12000
 ```
 
 `search` 返回 `truncated` 和 `next_offset`；结果被截断时应继续翻页，不能把单页上限当成候选预算。
@@ -771,7 +789,7 @@ python3 "$TRACE_QUERY" artifact --trace "$TRACE" --id artifact:prompt_1 --max-ch
 
 | 路径 | 适用场景 | 当前状态 |
 | --- | --- | --- |
-| `$rootcause-analysis` Agent Skill | 需要结合问题与语义数据流灵活探索、多假设回溯，并给出可读解释 | 推荐；当前主要使用路径 |
+| `rootcause-analysis` Agent Skill | 需要结合问题与语义数据流灵活探索、多假设回溯，并给出可读解释 | 推荐；当前主要使用路径 |
 | `tools/trace_attribution` Python 模块 | 需要固定 CLI/API、checkpoint 和批处理自动化 | 保留但暂停迭代 |
 
 无论使用哪条路径，分析都必须保持被动、只读、事后执行。`rootcause-analysis` 只读取 finalize 后的

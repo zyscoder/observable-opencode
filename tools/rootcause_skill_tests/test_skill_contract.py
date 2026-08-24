@@ -7,8 +7,10 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+README_PATH = REPO_ROOT / "README.md"
 SKILL_DIR = REPO_ROOT / ".claude" / "skills" / "rootcause-analysis"
 SKILL_PATH = SKILL_DIR / "SKILL.md"
+OPENAI_AGENT_PATH = SKILL_DIR / "agents" / "openai.yaml"
 QUERY_SCRIPT = SKILL_DIR / "scripts" / "trace_query.py"
 DESIGN_PATH = (
     REPO_ROOT
@@ -133,6 +135,8 @@ class SkillContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.skill_text = SKILL_PATH.read_text(encoding="utf-8")
+        cls.readme_text = README_PATH.read_text(encoding="utf-8")
+        cls.openai_agent_text = OPENAI_AGENT_PATH.read_text(encoding="utf-8")
         cls.design_text = DESIGN_PATH.read_text(encoding="utf-8")
         cls.plan_text = PLAN_PATH.read_text(encoding="utf-8")
         cls.frontmatter = parse_frontmatter(cls.skill_text)
@@ -156,6 +160,42 @@ class SkillContractTests(unittest.TestCase):
     def test_skill_requires_question_and_finalized_trace(self):
         self.assertIn("finalized `trace.json`", self.skill_text)
         self.assertIn("user's question", self.skill_text)
+
+    def test_runtime_facing_invocation_uses_each_runtime_contract(self):
+        readme = self.readme_text
+        self.assertIn("### Claude Code", readme)
+        self.assertIn("/rootcause-analysis", readme)
+        self.assertIn("### OpenCode", readme)
+        self.assertRegex(
+            readme,
+            r"(?s)### OpenCode.*invoke the `skill` tool.*`rootcause-analysis`",
+        )
+        self.assertIn("name=rootcause-analysis", readme)
+        for name, text in (
+            ("README", readme),
+            ("OpenAI agent metadata", self.openai_agent_text),
+        ):
+            self.assertNotIn("$rootcause-analysis", text, name)
+
+    def test_readme_artifact_example_uses_discoverable_fixture_id(self):
+        self.assertIn("artifact_refs", self.readme_text)
+        self.assertIn("--id build-requirement", self.readme_text)
+        known_root = json.loads(
+            (
+                REPO_ROOT
+                / "tools"
+                / "rootcause_skill_tests"
+                / "fixtures"
+                / "known-root"
+                / "trace.json"
+            ).read_text(encoding="utf-8")
+        )
+        artifact_ids = {
+            artifact.get("artifact_id")
+            for artifact in known_root.get("artifacts", [])
+            if isinstance(artifact, dict)
+        }
+        self.assertIn("build-requirement", artifact_ids)
 
     def test_skill_preserves_the_required_workflow_order(self):
         steps = [

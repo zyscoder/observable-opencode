@@ -19,12 +19,13 @@ no forward result or rubric score was fabricated.
 
 | Check | Result |
 | --- | --- |
-| Root-cause Skill fixture, query, and contract suite | PASS, 79/79 |
+| Root-cause Skill fixture, query, and contract suite | PASS, 81/81 |
 | `trace_query.py` bytecode compilation | PASS |
 | Official `quick_validate.py` Skill validation | PASS, `Skill is valid!` |
 | Skill canonical-location discovery in current OpenCode source build | PASS |
 | Repository whitespace validation | PASS |
 | Fixture immutability check | PASS |
+| Documented `build-requirement` Artifact query | PASS, integrity verified |
 
 Commands:
 
@@ -42,6 +43,10 @@ uv run --with pyyaml \
 
 git diff --check
 git diff --exit-code -- tools/rootcause_skill_tests/fixtures
+
+python3 .claude/skills/rootcause-analysis/scripts/trace_query.py artifact \
+  --trace tools/rootcause_skill_tests/fixtures/known-root/trace.json \
+  --id build-requirement --max-chars 12000
 ```
 
 The first direct `py_compile` attempt was blocked because the macOS system
@@ -84,52 +89,59 @@ restriction.
 
 Prompts contained only:
 
-- the explicit `$rootcause-analysis` invocation;
+- the runtime-specific Skill request: Claude Code `/rootcause-analysis`, or an
+  OpenCode instruction to invoke the `skill` tool with name
+  `rootcause-analysis` before analysis;
 - the absolute finalized fixture `trace.json` path;
 - the question from `pressure/cases.json`;
-- an output prefix under `/tmp` and the analyzed project root;
 - the analysis-only instruction.
 
 The hidden `expected` objects in `pressure/cases.json` were reserved for the
 evaluator and were never included in an Agent prompt.
 
-### Claude
+The exact expanded commands, separated stdout/stderr, and exit status are in
+[the raw attempt appendix](2026-08-24-rootcause-analysis-skill-raw-attempts.md).
 
-Both bare and normal non-interactive startup were attempted. The exact result
-was:
+### Claude Code
+
+The auditable normal-runtime attempt used `/rootcause-analysis`. It exited with
+status `1`; stdout was:
 
 ```text
 Not logged in · Please run /login
 ```
 
-Authentication is a process-wide prerequisite, so no Claude model request was
-sent for any of the seven fixtures. Repeating the same unauthenticated call
-would not test a different Skill behavior.
+stderr was empty. Authentication is a process-wide prerequisite, so no Claude
+model request was sent. Repeating the same unauthenticated call for every
+fixture would not exercise a different Skill path.
 
 ### OpenCode
 
 All seven cases were individually submitted through the current source build.
-Remote `models.dev` refresh was disabled to keep provider validation bounded:
+Every prompt instructed the Agent to invoke the `skill` tool with name
+`rootcause-analysis` before analysis. Remote `models.dev` refresh and the file
+watcher were disabled only to keep the provider preflight bounded:
 
 ```bash
+OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=1 \
 OPENCODE_DISABLE_MODELS_FETCH=1 \
-XDG_DATA_HOME=/tmp/observable-opencode-rootcause-forward/opencode/data \
-XDG_CACHE_HOME=/tmp/observable-opencode-rootcause-forward/opencode/cache \
-XDG_CONFIG_HOME=/tmp/observable-opencode-rootcause-forward/opencode/config \
-XDG_STATE_HOME=/tmp/observable-opencode-rootcause-forward/opencode/state \
+XDG_DATA_HOME=/tmp/rootcause-task6-fix/opencode/<fixture>/data \
+XDG_CACHE_HOME=/tmp/rootcause-task6-fix/opencode/<fixture>/cache \
+XDG_CONFIG_HOME=/tmp/rootcause-task6-fix/opencode/<fixture>/config \
+XDG_STATE_HOME=/tmp/rootcause-task6-fix/opencode/<fixture>/state \
 bun run --conditions=browser packages/opencode/src/index.ts run \
   --print-logs --log-level ERROR --format json \
-  'Use $rootcause-analysis. Trace: <fixture>/trace.json. Question: <question>. ...'
+  '开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: <fixture>/trace.json. Question: <question>. ...'
 ```
 
-Every case stopped before model inference with the same exact server error:
+Every command returned exit status `1`, empty stdout, and stderr beginning with:
 
 ```text
-Error: no providers found
+error=no providers found cause=Error: no providers found
 ```
 
-The failure originated while selecting `Provider.defaultModel`, before the
-Skill could execute a query or produce a report.
+The captured stacks place the failure in `Provider.defaultModel`, before the
+Agent could invoke the Skill, execute a Trace query, or produce a model result.
 
 ## Case Matrix
 

@@ -1,4 +1,4 @@
 interface:
   display_name: "Root Cause Analysis"
   short_description: "Analyze semantic traces and explain causal defect chains"
-  default_prompt: "Use $rootcause-analysis to analyze this finalized trace against my defect question."
+  default_prompt: "Analyze this finalized semantic trace against my defect question with the rootcause-analysis workflow."
