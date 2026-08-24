@@ -19,7 +19,7 @@ no forward result or rubric score was fabricated.
 
 | Check | Result |
 | --- | --- |
-| Root-cause Skill fixture, query, and contract suite | PASS, 81/81 |
+| Root-cause Skill fixture, query, and contract suite | PASS, 84/84 |
 | `trace_query.py` bytecode compilation | PASS |
 | Official `quick_validate.py` Skill validation | PASS, `Skill is valid!` |
 | Skill canonical-location discovery in current OpenCode source build | PASS |
@@ -118,7 +118,8 @@ fixture would not exercise a different Skill path.
 
 ### OpenCode
 
-All seven cases were individually submitted through the current source build.
+All seven cases were individually submitted through the current source build
+in the preserved round-2 run.
 Every prompt instructed the Agent to invoke the `skill` tool with name
 `rootcause-analysis` before analysis. Remote `models.dev` refresh and the file
 watcher were disabled only to keep the provider preflight bounded:
@@ -145,21 +146,32 @@ The captured stacks place the observed error in `Provider.defaultModel`, before
 the Agent could invoke the Skill, execute a Trace query, or produce a model
 result. None of the seven processes exited by itself within the documented
 8-second timeout. Each record therefore has `timed_out=true` and
-`raw_returncode=null`; the deterministic wrapper sent SIGINT to the child
-process group and reaped it within the 3-second grace period. This termination
-behavior must not be reported as an OpenCode self-exit code.
+`raw_returncode=null`. The legacy wrapper recorded that it requested SIGINT and
+that communication later completed, but it did not independently check whether
+the signal was delivered. Those records therefore establish neither signal
+delivery nor termination cause and must not be reported as an OpenCode self-exit
+code.
+
+The hardened wrapper now accepts `--batch-root` or
+`ROOTCAUSE_FORWARD_BATCH_ROOT`, otherwise creates a unique timestamp/PID/UUID
+root, and refuses to overwrite existing directories. It records signal
+attempts separately from successful operating-system signal calls,
+post-signal state, bounded final cleanup, and per-case `wrapper_error` while
+continuing the remaining cases. A fresh `known-root` spot check exercised this
+schema with a one-second timeout. Its observed post-signal return code is
+reported only as post-signal state; no signal is asserted as the cause.
 
 ## Case Matrix
 
 | Fixture | Claude | OpenCode | Rubric evaluation |
 | --- | --- | --- | --- |
-| `known-root` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
-| `ambiguous` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
-| `skill-omission` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
-| `context-contamination` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
-| `control-flow-change` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
-| `tool-failure-misreported` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
-| `wrong-answer` | Blocked: not logged in | Observed provider error; timed out at 8 s; SIGINT | Not evaluated |
+| `known-root` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
+| `ambiguous` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
+| `skill-omission` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
+| `context-contamination` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
+| `control-flow-change` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
+| `tool-failure-misreported` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
+| `wrong-answer` | Blocked: not logged in | Provider error observed; legacy 8 s timeout; signal delivery unknown | Not evaluated |
 
 No raw Agent outcome exists to compare with the RED baseline. Consequently the
 11 pressure-rubric items, including introduction-versus-propagation accuracy,

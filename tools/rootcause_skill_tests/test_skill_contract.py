@@ -12,6 +12,13 @@ SKILL_DIR = REPO_ROOT / ".claude" / "skills" / "rootcause-analysis"
 SKILL_PATH = SKILL_DIR / "SKILL.md"
 OPENAI_AGENT_PATH = SKILL_DIR / "agents" / "openai.yaml"
 QUERY_SCRIPT = SKILL_DIR / "scripts" / "trace_query.py"
+RAW_FORWARD_REPORT_PATH = (
+    REPO_ROOT
+    / "docs"
+    / "superpowers"
+    / "reports"
+    / "2026-08-24-rootcause-analysis-skill-raw-attempts.md"
+)
 DESIGN_PATH = (
     REPO_ROOT
     / "docs"
@@ -137,6 +144,7 @@ class SkillContractTests(unittest.TestCase):
         cls.skill_text = SKILL_PATH.read_text(encoding="utf-8")
         cls.readme_text = README_PATH.read_text(encoding="utf-8")
         cls.openai_agent_text = OPENAI_AGENT_PATH.read_text(encoding="utf-8")
+        cls.raw_forward_report_text = RAW_FORWARD_REPORT_PATH.read_text(encoding="utf-8")
         cls.design_text = DESIGN_PATH.read_text(encoding="utf-8")
         cls.plan_text = PLAN_PATH.read_text(encoding="utf-8")
         cls.frontmatter = parse_frontmatter(cls.skill_text)
@@ -196,6 +204,56 @@ class SkillContractTests(unittest.TestCase):
             if isinstance(artifact, dict)
         }
         self.assertIn("build-requirement", artifact_ids)
+
+    def test_embedded_forward_wrapper_has_unique_or_explicit_batch_root(self):
+        match = re.search(
+            r"## Deterministic OpenCode Wrapper.*?```python\n(.*?)\n```",
+            self.raw_forward_report_text,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        wrapper = match.group(1)
+        compile(wrapper, str(RAW_FORWARD_REPORT_PATH), "exec")
+        self.assertIn('"--batch-root"', wrapper)
+        self.assertIn("ROOTCAUSE_FORWARD_BATCH_ROOT", wrapper)
+        self.assertIn("uuid.uuid4", wrapper)
+        self.assertIn("os.getpid", wrapper)
+        self.assertIn("exist_ok=False", wrapper)
+
+    def test_embedded_forward_wrapper_audits_safe_signal_delivery_and_cleanup(self):
+        wrapper = re.search(
+            r"## Deterministic OpenCode Wrapper.*?```python\n(.*?)\n```",
+            self.raw_forward_report_text,
+            re.DOTALL,
+        ).group(1)
+        for phrase in (
+            "process.poll()",
+            "except ProcessLookupError",
+            "except PermissionError",
+            '"signal_attempted"',
+            '"signal_sent"',
+            '"last_signal_sent"',
+            '"post_signal_returncode"',
+            '"final_cleanup"',
+        ):
+            self.assertIn(phrase, wrapper)
+        self.assertIn('"raw_returncode": raw_returncode', wrapper)
+
+    def test_embedded_forward_wrapper_records_case_errors_and_continues(self):
+        wrapper = re.search(
+            r"## Deterministic OpenCode Wrapper.*?```python\n(.*?)\n```",
+            self.raw_forward_report_text,
+            re.DOTALL,
+        ).group(1)
+        self.assertIn('"wrapper_error"', wrapper)
+        self.assertRegex(
+            wrapper,
+            re.compile(r"for fixture, question in selected_cases:.*?try:.*?run_case", re.DOTALL),
+        )
+        self.assertRegex(
+            wrapper,
+            re.compile(r"except Exception as error:.*?continue", re.DOTALL),
+        )
 
     def test_skill_preserves_the_required_workflow_order(self):
         steps = [

@@ -2,7 +2,7 @@
 
 Date: 2026-08-24
 
-This appendix supersedes the earlier shell-session exit claims. It records process self-exit separately from wrapper-driven termination. A non-null `raw_returncode` is recorded only when the child exits before the timeout. When `timed_out` is `true`, `raw_returncode` remains `null`; no post-signal status is presented as the original process exit.
+This appendix preserves the seven round-2 observations and embeds the hardened wrapper used for future reruns. Historical records are not rewritten: their stderr and timeout observations remain useful, but their legacy `termination_action` field did not independently distinguish a requested signal from a delivered signal. Therefore those records do not prove that SIGINT was delivered or caused process termination.
 
 ## Claude Code Authentication Attempt
 
@@ -26,24 +26,22 @@ Observed result:
 
 ## Deterministic OpenCode Wrapper
 
-Exact invocation:
+The wrapper accepts `--batch-root` or `ROOTCAUSE_FORWARD_BATCH_ROOT`. Without either, it generates a unique path from UTC timestamp, PID, and UUID. Both batch and case directories use `exist_ok=False`, so reruns never overwrite evidence.
 
-```bash
-python3 /tmp/rootcause-task6-fix-round2/run_forward.py
-```
-
-The wrapper uses one fresh, isolated XDG root per case under `/tmp/rootcause-task6-fix-round2/run-20260824-01`, an 8-second timeout, and a 3-second signal grace period. Hidden `expected` values from `pressure/cases.json` are not loaded or sent.
+Signal records distinguish `signal_attempted`, `signal_sent`, and `last_signal_sent`. `post_signal_returncode` is observational only and is never presented as proof that a requested signal caused termination. `final_cleanup` records the bounded final state. A case-level exception becomes `wrapper_error`; the loop writes that record and continues.
 
 Complete wrapper:
 
 ```python
 #!/usr/bin/env python3
+import argparse
 import json
 import os
 import shlex
 import signal
 import subprocess
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,11 +50,8 @@ REPO = Path(
     "/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/"
     ".worktrees/attribution-execution-reliability"
 )
-BATCH_ROOT = Path("/tmp/rootcause-task6-fix-round2/run-20260824-01")
-RESULTS_PATH = BATCH_ROOT / "results.jsonl"
-TIMEOUT_SECONDS = 8.0
-SIGNAL_GRACE_SECONDS = 3.0
-
+DEFAULT_TIMEOUT_SECONDS = 8.0
+DEFAULT_SIGNAL_GRACE_SECONDS = 3.0
 CASES = [
     (
         "known-root",
@@ -78,11 +73,51 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_case(fixture, question):
-    case_root = BATCH_ROOT / fixture
-    xdg_root = case_root / "xdg"
-    case_root.mkdir(parents=True, exist_ok=False)
+def positive_float(value):
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
 
+
+def unique_default_batch_root():
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return Path(
+        "/tmp/rootcause-forward-attempts"
+    ) / f"run-{timestamp}-pid{os.getpid()}-{uuid.uuid4().hex}"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-root",
+        default=os.environ.get("ROOTCAUSE_FORWARD_BATCH_ROOT"),
+        help="fresh output directory; must not already exist",
+    )
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=[fixture for fixture, _ in CASES],
+        help="run only the named case; repeat to select more than one",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=positive_float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
+        "--signal-grace-seconds",
+        type=positive_float,
+        default=DEFAULT_SIGNAL_GRACE_SECONDS,
+    )
+    args = parser.parse_args()
+    args.batch_root = Path(args.batch_root) if args.batch_root else unique_default_batch_root()
+    return args
+
+
+def case_context(batch_root, fixture, question, timeout_seconds, signal_grace_seconds):
+    case_root = batch_root / fixture
+    xdg_root = case_root / "xdg"
     prompt = (
         "开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。"
         f"Trace: {REPO}/tools/rootcause_skill_tests/fixtures/{fixture}/trace.json. "
@@ -110,98 +145,278 @@ def run_case(fixture, question):
         "XDG_CONFIG_HOME": str(xdg_root / "config"),
         "XDG_STATE_HOME": str(xdg_root / "state"),
     }
+    return {
+        "case": fixture,
+        "question": question,
+        "case_root": case_root,
+        "xdg_root": xdg_root,
+        "timeout_seconds": timeout_seconds,
+        "signal_grace_seconds": signal_grace_seconds,
+        "prompt": prompt,
+        "command_argv": argv,
+        "command_display": shlex.join(argv),
+        "environment_overrides": env_overrides,
+    }
+
+
+def safe_signal(process, requested_signal, audit):
+    signal_name = signal.Signals(requested_signal).name
+    audit["signal_attempted"].append(signal_name)
+    if process.poll() is not None:
+        audit["signal_events"].append(
+            {"signal": signal_name, "sent": False, "reason": "process_already_exited"}
+        )
+        return False
+    try:
+        os.killpg(process.pid, requested_signal)
+    except ProcessLookupError:
+        audit["signal_events"].append(
+            {"signal": signal_name, "sent": False, "reason": "process_not_found"}
+        )
+        return False
+    except PermissionError as error:
+        audit["signal_events"].append(
+            {
+                "signal": signal_name,
+                "sent": False,
+                "reason": "permission_denied",
+                "error": str(error),
+            }
+        )
+        return False
+    audit["signal_sent"].append(signal_name)
+    audit["last_signal_sent"] = signal_name
+    audit["signal_events"].append({"signal": signal_name, "sent": True, "reason": None})
+    return True
+
+
+def communicate_with_grace(process, grace_seconds):
+    try:
+        stdout, stderr = process.communicate(timeout=grace_seconds)
+        return True, stdout, stderr
+    except subprocess.TimeoutExpired as error:
+        return False, error.stdout or "", error.stderr or ""
+
+
+def run_case(batch_root, fixture, question, timeout_seconds, signal_grace_seconds):
+    context = case_context(
+        batch_root, fixture, question, timeout_seconds, signal_grace_seconds
+    )
+    context["case_root"].mkdir(parents=True, exist_ok=False)
     env = os.environ.copy()
-    env.update(env_overrides)
+    env.update(context["environment_overrides"])
 
     started_at = utc_now()
     started_monotonic = time.monotonic()
-    process = subprocess.Popen(
-        argv,
-        cwd=REPO,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-
-    timed_out = False
+    process = None
+    stdout = ""
+    stderr = ""
     raw_returncode = None
-    termination_signal = None
-    termination_action = "none; process exited itself"
+    timed_out = False
+    wrapper_error = None
+    audit = {
+        "signal_attempted": [],
+        "signal_sent": [],
+        "last_signal_sent": None,
+        "signal_events": [],
+        "post_signal_returncode": None,
+        "final_cleanup": {
+            "process_reaped": False,
+            "process_running_at_end": None,
+            "note": "not_started",
+        },
+    }
+
     try:
-        stdout, stderr = process.communicate(timeout=TIMEOUT_SECONDS)
-        raw_returncode = process.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        termination_signal = "SIGINT"
-        termination_action = (
-            f"timeout after {TIMEOUT_SECONDS:.1f}s; sent SIGINT to process group"
+        process = subprocess.Popen(
+            context["command_argv"],
+            cwd=REPO,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-        os.killpg(process.pid, signal.SIGINT)
         try:
-            stdout, stderr = process.communicate(timeout=SIGNAL_GRACE_SECONDS)
-            termination_action += (
-                f"; process reaped within {SIGNAL_GRACE_SECONDS:.1f}s grace"
-            )
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            raw_returncode = process.returncode
+            audit["final_cleanup"] = {
+                "process_reaped": True,
+                "process_running_at_end": False,
+                "note": "process_exited_before_timeout",
+            }
         except subprocess.TimeoutExpired:
-            termination_signal = "SIGTERM"
-            termination_action += "; SIGINT grace expired; sent SIGTERM to process group"
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                stdout, stderr = process.communicate(timeout=SIGNAL_GRACE_SECONDS)
-                termination_action += (
-                    f"; process reaped within {SIGNAL_GRACE_SECONDS:.1f}s SIGTERM grace"
+            timed_out = True
+            for requested_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+                safe_signal(process, requested_signal, audit)
+                reaped, stdout, stderr = communicate_with_grace(
+                    process, signal_grace_seconds
                 )
-            except subprocess.TimeoutExpired:
-                termination_signal = "SIGKILL"
-                termination_action += "; SIGTERM grace expired; sent SIGKILL to process group"
-                os.killpg(process.pid, signal.SIGKILL)
-                stdout, stderr = process.communicate()
-                termination_action += "; process reaped after SIGKILL"
+                if reaped:
+                    break
+            audit["post_signal_returncode"] = process.poll()
+            still_running = process.poll() is None
+            audit["final_cleanup"] = {
+                "process_reaped": not still_running,
+                "process_running_at_end": still_running,
+                "note": (
+                    "process reaped after one or more signal attempts; no signal is "
+                    "asserted as the cause"
+                    if not still_running
+                    else "process still running after all bounded signal attempts"
+                ),
+            }
+    except Exception as error:
+        wrapper_error = {"type": type(error).__name__, "message": str(error)}
+    finally:
+        if process is not None and process.poll() is None:
+            safe_signal(process, signal.SIGKILL, audit)
+            reaped, cleanup_stdout, cleanup_stderr = communicate_with_grace(
+                process, signal_grace_seconds
+            )
+            stdout = cleanup_stdout or stdout
+            stderr = cleanup_stderr or stderr
+            audit["post_signal_returncode"] = process.poll()
+            audit["final_cleanup"] = {
+                "process_reaped": reaped,
+                "process_running_at_end": process.poll() is None,
+                "note": (
+                    "final cleanup reaped process after a signal attempt; no signal is "
+                    "asserted as the cause"
+                    if reaped
+                    else "final bounded cleanup could not reap process"
+                ),
+            }
 
     finished_at = utc_now()
-    elapsed_seconds = round(time.monotonic() - started_monotonic, 6)
     return {
         "case": fixture,
         "started_at": started_at,
         "finished_at": finished_at,
-        "elapsed_seconds": elapsed_seconds,
+        "elapsed_seconds": round(time.monotonic() - started_monotonic, 6),
         "cwd": str(REPO),
-        "xdg_root": str(xdg_root),
-        "timeout_seconds": TIMEOUT_SECONDS,
-        "command_argv": argv,
-        "command_display": shlex.join(argv),
-        "prompt": prompt,
-        "environment_overrides": env_overrides,
+        "batch_root": str(batch_root),
+        "xdg_root": str(context["xdg_root"]),
+        "timeout_seconds": timeout_seconds,
+        "signal_grace_seconds": signal_grace_seconds,
+        "command_argv": context["command_argv"],
+        "command_display": context["command_display"],
+        "prompt": context["prompt"],
+        "environment_overrides": context["environment_overrides"],
         "stdout": stdout,
         "stderr": stderr,
         "raw_returncode": raw_returncode,
         "timed_out": timed_out,
-        "termination_signal": termination_signal,
-        "termination_action": termination_action,
+        "signal_attempted": audit["signal_attempted"],
+        "signal_sent": audit["signal_sent"],
+        "last_signal_sent": audit["last_signal_sent"],
+        "signal_events": audit["signal_events"],
+        "post_signal_returncode": audit["post_signal_returncode"],
+        "final_cleanup": audit["final_cleanup"],
+        "wrapper_error": wrapper_error,
     }
 
 
+def wrapper_failure_record(batch_root, fixture, question, args, error):
+    context = case_context(
+        batch_root,
+        fixture,
+        question,
+        args.timeout_seconds,
+        args.signal_grace_seconds,
+    )
+    observed_at = utc_now()
+    return {
+        "case": fixture,
+        "started_at": observed_at,
+        "finished_at": observed_at,
+        "elapsed_seconds": 0.0,
+        "cwd": str(REPO),
+        "batch_root": str(batch_root),
+        "xdg_root": str(context["xdg_root"]),
+        "timeout_seconds": args.timeout_seconds,
+        "signal_grace_seconds": args.signal_grace_seconds,
+        "command_argv": context["command_argv"],
+        "command_display": context["command_display"],
+        "prompt": context["prompt"],
+        "environment_overrides": context["environment_overrides"],
+        "stdout": "",
+        "stderr": "",
+        "raw_returncode": None,
+        "timed_out": False,
+        "signal_attempted": [],
+        "signal_sent": [],
+        "last_signal_sent": None,
+        "signal_events": [],
+        "post_signal_returncode": None,
+        "final_cleanup": {
+            "process_reaped": False,
+            "process_running_at_end": None,
+            "note": "case wrapper failed before process state was established",
+        },
+        "wrapper_error": {"type": type(error).__name__, "message": str(error)},
+    }
+
+
+def write_result(stream, result):
+    line = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    stream.write(line + "\n")
+    stream.flush()
+    os.fsync(stream.fileno())
+    print(line, flush=True)
+
+
 def main():
-    BATCH_ROOT.mkdir(parents=True, exist_ok=False)
-    with RESULTS_PATH.open("x", encoding="utf-8") as stream:
-        for fixture, question in CASES:
-            result = run_case(fixture, question)
-            line = json.dumps(result, ensure_ascii=False, sort_keys=True)
-            stream.write(line + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-            print(line, flush=True)
+    args = parse_args()
+    batch_root = args.batch_root
+    batch_root.mkdir(parents=True, exist_ok=False)
+    selected_names = set(args.case or [])
+    selected_cases = [
+        item for item in CASES if not selected_names or item[0] in selected_names
+    ]
+    results_path = batch_root / "results.jsonl"
+    with results_path.open("x", encoding="utf-8") as stream:
+        for fixture, question in selected_cases:
+            try:
+                result = run_case(
+                    batch_root,
+                    fixture,
+                    question,
+                    args.timeout_seconds,
+                    args.signal_grace_seconds,
+                )
+            except Exception as error:
+                result = wrapper_failure_record(
+                    batch_root, fixture, question, args, error
+                )
+                write_result(stream, result)
+                continue
+            write_result(stream, result)
 
 
 if __name__ == "__main__":
     main()
 ```
 
-## OpenCode Results
+Example full-batch invocation with a unique default root:
 
-The following JSONL is copied verbatim from `/tmp/rootcause-task6-fix-round2/run-20260824-01/results.jsonl`. Each record contains the case, UTC start and finish times, elapsed duration, exact argv and prompt, XDG overrides, stdout, stderr, timeout state, raw self-exit return code when available, and termination action.
+```bash
+python3 /tmp/rootcause-task6-fix-round3/run_forward.py
+```
+
+Example explicit-root, single-case spot check:
+
+```bash
+python3 /tmp/rootcause-task6-fix-round3/run_forward.py \
+  --batch-root /tmp/rootcause-task6-fix-round3/spot-<unique> \
+  --case known-root \
+  --timeout-seconds 1 \
+  --signal-grace-seconds 1
+```
+
+## Historical Round-2 OpenCode Results
+
+These seven JSONL records are copied verbatim from `/tmp/rootcause-task6-fix-round2/run-20260824-01/results.jsonl`. They establish the observed `Provider.defaultModel` error and eight-second timeout. Because the legacy wrapper did not record safe-signal delivery separately, its `termination_action` text must be interpreted only as the wrapper's requested action, not as proof of delivery or causation.
 
 ```jsonl
 {"case": "known-root", "command_argv": ["bun", "run", "--conditions=browser", "packages/opencode/src/index.ts", "run", "--print-logs", "--log-level", "ERROR", "--format", "json", "开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/known-root/trace.json. Question: 为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？ 只分析并给建议，不得修改任何文件或配置。"], "command_display": "bun run --conditions=browser packages/opencode/src/index.ts run --print-logs --log-level ERROR --format json '开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/known-root/trace.json. Question: 为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？ 只分析并给建议，不得修改任何文件或配置。'", "cwd": "/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability", "elapsed_seconds": 8.018717, "environment_overrides": {"OPENCODE_DISABLE_MODELS_FETCH": "1", "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER": "1", "XDG_CACHE_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/known-root/xdg/cache", "XDG_CONFIG_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/known-root/xdg/config", "XDG_DATA_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/known-root/xdg/data", "XDG_STATE_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/known-root/xdg/state"}, "finished_at": "2026-08-24T11:31:53.367561+00:00", "prompt": "开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/known-root/trace.json. Question: 为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？ 只分析并给建议，不得修改任何文件或配置。", "raw_returncode": null, "started_at": "2026-08-24T11:31:45.348818+00:00", "stderr": "ERROR 2026-08-24T11:31:46 +514ms service=server error=no providers found cause=Error: no providers found\n    at <anonymous> (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/provider/provider.ts:1710:32)\n    at Provider.defaultModel (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1116:30)\n    at Provider.defaultModel (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/provider/provider.ts:1685:33)\n    at SessionPrompt.createUserMessage (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1671:32)\n    at SessionPrompt.createUserMessage (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1119:38)\n    at SessionPrompt.prompt (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts:281:10)\n    at SessionPrompt.prompt (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1630:87)\n    at SessionHttpApi.prompt (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/node_modules/.bun/effect@4.0.0-beta.65/node_modules/effect/dist/unstable/httpapi/HttpApiBuilder.js:295:29)\n    at SessionHttpApi.prompt (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts:274:27) failed\n", "stdout": "", "termination_action": "timeout after 8.0s; sent SIGINT to process group; process reaped within 3.0s grace", "termination_signal": "SIGINT", "timed_out": true, "timeout_seconds": 8.0, "xdg_root": "/tmp/rootcause-task6-fix-round2/run-20260824-01/known-root/xdg"}
@@ -213,6 +428,32 @@ The following JSONL is copied verbatim from `/tmp/rootcause-task6-fix-round2/run
 {"case": "wrong-answer", "command_argv": ["bun", "run", "--conditions=browser", "packages/opencode/src/index.ts", "run", "--print-logs", "--log-level", "ERROR", "--format", "json", "开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/wrong-answer/trace.json. Question: 为什么最终答案没有采用上下文中已有的发布日期证据？ 只分析并给建议，不得修改任何文件或配置。"], "command_display": "bun run --conditions=browser packages/opencode/src/index.ts run --print-logs --log-level ERROR --format json '开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/wrong-answer/trace.json. Question: 为什么最终答案没有采用上下文中已有的发布日期证据？ 只分析并给建议，不得修改任何文件或配置。'", "cwd": "/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability", "elapsed_seconds": 8.024378, "environment_overrides": {"OPENCODE_DISABLE_MODELS_FETCH": "1", "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER": "1", "XDG_CACHE_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/wrong-answer/xdg/cache", "XDG_CONFIG_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/wrong-answer/xdg/config", "XDG_DATA_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/wrong-answer/xdg/data", "XDG_STATE_HOME": "/tmp/rootcause-task6-fix-round2/run-20260824-01/wrong-answer/xdg/state"}, "finished_at": "2026-08-24T11:32:41.500900+00:00", "prompt": "开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/wrong-answer/trace.json. Question: 为什么最终答案没有采用上下文中已有的发布日期证据？ 只分析并给建议，不得修改任何文件或配置。", "raw_returncode": null, "started_at": "2026-08-24T11:32:33.476570+00:00", "stderr": "ERROR 2026-08-24T11:32:34 +507ms service=server error=no providers found cause=Error: no providers found\n    at <anonymous> (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/provider/provider.ts:1710:32)\n    at Provider.defaultModel (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1116:30)\n    at Provider.defaultModel (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/provider/provider.ts:1685:33)\n    at SessionPrompt.createUserMessage (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1671:32)\n    at SessionPrompt.createUserMessage (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1119:38)\n    at SessionPrompt.prompt (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts:281:10)\n    at SessionPrompt.prompt (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/session/prompt.ts:1630:87)\n    at SessionHttpApi.prompt (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/node_modules/.bun/effect@4.0.0-beta.65/node_modules/effect/dist/unstable/httpapi/HttpApiBuilder.js:295:29)\n    at SessionHttpApi.prompt (definition) (/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/packages/opencode/src/server/routes/instance/httpapi/handlers/session.ts:274:27) failed\n", "stdout": "", "termination_action": "timeout after 8.0s; sent SIGINT to process group; process reaped within 3.0s grace", "termination_signal": "SIGINT", "timed_out": true, "timeout_seconds": 8.0, "xdg_root": "/tmp/rootcause-task6-fix-round2/run-20260824-01/wrong-answer/xdg"}
 ```
 
+## Hardened Wrapper Spot Check
+
+Exact invocation:
+
+```bash
+python3 /tmp/rootcause-task6-fix-round3/run_forward.py \
+  --batch-root /tmp/rootcause-task6-fix-round3/spot-20260824T113900Z-pid-check-01 \
+  --case known-root \
+  --timeout-seconds 1 \
+  --signal-grace-seconds 1
+```
+
+Captured JSONL:
+
+```jsonl
+{"batch_root": "/tmp/rootcause-task6-fix-round3/spot-20260824T113900Z-pid-check-01", "case": "known-root", "command_argv": ["bun", "run", "--conditions=browser", "packages/opencode/src/index.ts", "run", "--print-logs", "--log-level", "ERROR", "--format", "json", "开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/known-root/trace.json. Question: 为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？ 只分析并给建议，不得修改任何文件或配置。"], "command_display": "bun run --conditions=browser packages/opencode/src/index.ts run --print-logs --log-level ERROR --format json '开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/known-root/trace.json. Question: 为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？ 只分析并给建议，不得修改任何文件或配置。'", "cwd": "/Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability", "elapsed_seconds": 1.012613, "environment_overrides": {"OPENCODE_DISABLE_MODELS_FETCH": "1", "OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER": "1", "XDG_CACHE_HOME": "/tmp/rootcause-task6-fix-round3/spot-20260824T113900Z-pid-check-01/known-root/xdg/cache", "XDG_CONFIG_HOME": "/tmp/rootcause-task6-fix-round3/spot-20260824T113900Z-pid-check-01/known-root/xdg/config", "XDG_DATA_HOME": "/tmp/rootcause-task6-fix-round3/spot-20260824T113900Z-pid-check-01/known-root/xdg/data", "XDG_STATE_HOME": "/tmp/rootcause-task6-fix-round3/spot-20260824T113900Z-pid-check-01/known-root/xdg/state"}, "final_cleanup": {"note": "process reaped after one or more signal attempts; no signal is asserted as the cause", "process_reaped": true, "process_running_at_end": false}, "finished_at": "2026-08-24T11:43:14.552817+00:00", "last_signal_sent": "SIGINT", "post_signal_returncode": -2, "prompt": "开始分析前，先调用 skill 工具并传入 name=rootcause-analysis。Trace: /Users/zys/Projects/Huawei/bayes/AI_benchmark/observable-opencode/.worktrees/attribution-execution-reliability/tools/rootcause_skill_tests/fixtures/known-root/trace.json. Question: 为什么用户明确要求通过构建 Skill 使用 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？ 只分析并给建议，不得修改任何文件或配置。", "raw_returncode": null, "signal_attempted": ["SIGINT"], "signal_events": [{"reason": null, "sent": true, "signal": "SIGINT"}], "signal_grace_seconds": 1.0, "signal_sent": ["SIGINT"], "started_at": "2026-08-24T11:43:13.540159+00:00", "stderr": "", "stdout": "", "timed_out": true, "timeout_seconds": 1.0, "wrapper_error": null, "xdg_root": "/tmp/rootcause-task6-fix-round3/spot-20260824T113900Z-pid-check-01/known-root/xdg"}
+```
+
+The spot check timed out after one second. The safe-signal function checked the
+process state, attempted SIGINT, recorded that the operating-system call
+returned successfully in `signal_sent`, and observed
+`post_signal_returncode=-2` after communication completed. That return code is
+post-signal state only; neither the wrapper nor this report asserts that SIGINT
+caused termination. Final cleanup records only the observed facts that the
+process was reaped and was not running at the end.
+
 ## Interpretation
 
-All seven processes emitted the same observed server-side error from `Provider.defaultModel`: `error=no providers found cause=Error: no providers found`. None exited by itself within 8 seconds. Every record therefore has `timed_out=true` and `raw_returncode=null`; the wrapper sent SIGINT to the child process group and reaped it within the documented grace period. The evidence establishes the provider-selection blocker, but it does not establish an OpenCode self-exit code or any Agent Skill/model result.
+The historical seven-case run observed `error=no providers found cause=Error: no providers found` before model inference. It did not establish an OpenCode self-exit code or a signal-caused termination. The hardened wrapper preserves that distinction for future runs and continues after individual case failures.
