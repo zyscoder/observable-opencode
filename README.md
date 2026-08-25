@@ -34,6 +34,29 @@ flowchart LR
     R --> O["Root Cause / Causal Chain / Evidence / Gaps"]
 ```
 
+## 稳定分支与迭代规则
+
+`release/observable` 是本仓库唯一面向安装、集成和长期验证的稳定分支。需要源码构建或跟踪稳定
+版本时，应固定使用该分支，而不是选择某个 `codex/*` 迭代分支：
+
+```bash
+git fetch origin
+git switch --track origin/release/observable
+```
+
+后续改动遵循以下晋级流程：
+
+1. 从最新 `release/observable` 创建短期 `codex/*` 迭代分支，开发期间不直接修改稳定分支；
+2. 根据变更范围完成单元测试、类型检查、Trace/归因回归和必要的复杂 case 验证；
+3. 人工确认功能、行为隔离和回归结果有效后，通过 Pull Request 将迭代分支合入
+   `release/observable`；
+4. 仅从更新后的 `release/observable` 触发 `release observable` workflow，并以 workflow 成功、
+   Release 资产和校验和完整作为发布完成条件。
+
+`codex/*` 分支是开发候选，不承诺稳定性，也不应成为部署脚本、benchmark 环境或安装文档中的
+长期依赖。历史迭代分支可以保留用于审计；确认其提交已进入稳定分支且不再需要独立复现后，再
+集中清理。
+
 ## 快速开始
 
 下面以 OpenAI 兼容接口为例，给出从启动 Agent 到生成 Trace 的最短可执行路径。
