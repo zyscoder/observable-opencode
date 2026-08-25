@@ -207,7 +207,6 @@ class FixtureContractTests(unittest.TestCase):
                         Path("trace.json"),
                         Path("prompt-claude.md"),
                         Path("prompt-opencode.md"),
-                        Path(".handoff-owner"),
                     } | canonical_skill_files | artifact_files
                     actual_files = {
                         path.relative_to(destination)
@@ -215,6 +214,7 @@ class FixtureContractTests(unittest.TestCase):
                         if path.is_file()
                     }
                     self.assertEqual(actual_files, expected_files)
+                    self.assertFalse((destination / ".handoff-owner").exists())
                     verify = subprocess.run(
                         [
                             sys.executable,
@@ -472,7 +472,7 @@ class FixtureContractTests(unittest.TestCase):
                             provenance_output=provenance,
                             ready_output=ready,
                         )
-                    self.assertFalse(destination.exists())
+                    self.assertTrue(destination.is_dir())
                     self.assertFalse(provenance.exists())
                     self.assertFalse(ready.exists())
 
@@ -534,8 +534,81 @@ class FixtureContractTests(unittest.TestCase):
             self.assertFalse(provenance.exists())
             self.assertFalse(ready.exists())
 
-    def test_cleanup_refuses_directory_after_owner_token_changes(self):
-        module = self.load_builder("prepare_owner_safe_cleanup")
+    def test_owner_marker_write_failure_leaves_unready_reservation(self):
+        module = self.load_builder("prepare_marker_write_failure")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-50500000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            original_write = module.write_new_file_at
+
+            def fail_marker(directory_fd, relative, payload, mode=0o600):
+                if str(relative) == module.OWNER_MARKER:
+                    raise OSError("injected marker failure")
+                return original_write(directory_fd, relative, payload, mode)
+
+            with mock.patch.object(module, "write_new_file_at", side_effect=fail_marker):
+                with self.assertRaisesRegex(OSError, "reserved|marker|unready"):
+                    module.prepare(
+                        "known-root",
+                        destination,
+                        opaque_id,
+                        "/workspace/trace.json",
+                        provenance_output=provenance,
+                        ready_output=ready,
+                    )
+
+            self.assertTrue(destination.is_dir())
+            self.assertFalse((destination / module.OWNER_MARKER).exists())
+            self.assertFalse(provenance.exists())
+            self.assertFalse(ready.exists())
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                module.prepare(
+                    "known-root",
+                    destination,
+                    opaque_id,
+                    "/workspace/trace.json",
+                    provenance_output=provenance,
+                    ready_output=ready,
+                )
+
+    def test_owner_marker_removal_failure_aborts_without_ready(self):
+        module = self.load_builder("prepare_marker_removal_failure")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-50600000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            original_unlink = module.os.unlink
+
+            def fail_marker_removal(path, *args, **kwargs):
+                if str(path) == module.OWNER_MARKER and kwargs.get("dir_fd") is not None:
+                    raise OSError("injected marker removal failure")
+                return original_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(module.os, "unlink", side_effect=fail_marker_removal):
+                with self.assertRaisesRegex(OSError, "marker|unready"):
+                    module.prepare(
+                        "known-root",
+                        destination,
+                        opaque_id,
+                        "/workspace/trace.json",
+                        provenance_output=provenance,
+                        ready_output=ready,
+                    )
+
+            self.assertTrue(destination.is_dir())
+            self.assertTrue((destination / module.OWNER_MARKER).is_file())
+            self.assertFalse(provenance.exists())
+            self.assertFalse(ready.exists())
+
+    def test_failure_never_deletes_reserved_destination_or_changed_marker(self):
+        module = self.load_builder("prepare_fail_closed_owner")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.copied_fixture_root(module, root)
@@ -545,7 +618,7 @@ class FixtureContractTests(unittest.TestCase):
             ready = root / f"{opaque_id}.READY.json"
 
             def replace_owner_then_fail(phase, _context):
-                if phase == "bundle_written":
+                if phase == "source_validated":
                     marker = destination / module.OWNER_MARKER
                     marker.write_text("foreign-owner\n", encoding="utf-8")
                     raise RuntimeError("fault after ownership replacement")
@@ -615,20 +688,20 @@ class FixtureContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.copied_fixture_root(module, root)
-            original_read = module.read_regular_file_once
+            original_read = module.read_regular_file_at
             reads = []
 
-            def count_reads(file_root, relative, label):
-                result = original_read(file_root, relative, label)
+            def count_reads(directory_fd, relative, label):
+                result = original_read(directory_fd, relative, label)
                 if label == "Artifact source":
-                    reads.append((Path(file_root), Path(relative), result))
+                    reads.append((Path(relative), result))
                 return result
 
             opaque_id = "case-53000000000000000000000000000000"
             destination = root / opaque_id
             provenance = root / f"{opaque_id}.provenance.json"
             ready = root / f"{opaque_id}.READY.json"
-            with mock.patch.object(module, "read_regular_file_once", side_effect=count_reads):
+            with mock.patch.object(module, "read_regular_file_at", side_effect=count_reads):
                 module.prepare(
                     "known-root",
                     destination,
@@ -639,8 +712,115 @@ class FixtureContractTests(unittest.TestCase):
                 )
 
             self.assertEqual(len(reads), 1)
-            _, relative, content = reads[0]
+            relative, content = reads[0]
             self.assertEqual((destination / relative).read_bytes(), content)
+
+    def test_held_fixture_root_fd_survives_case_path_replacement(self):
+        module = self.load_builder("prepare_fixture_root_fd")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.copied_fixture_root(module, root)
+            original_artifact = next(
+                path for path in (source / "artifacts").rglob("*") if path.is_file()
+            ).read_bytes()
+            opaque_id = "case-53500000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+
+            def replace_case_root(phase, _context):
+                if phase == "source_validated":
+                    original = source.with_name("known-root-original")
+                    source.rename(original)
+                    source.mkdir()
+                    (source / "artifacts").mkdir()
+                    (source / "artifacts" / "sha256").mkdir()
+
+            module.prepare(
+                "known-root",
+                destination,
+                opaque_id,
+                "/workspace/trace.json",
+                provenance_output=provenance,
+                ready_output=ready,
+                _phase_hook=replace_case_root,
+            )
+
+            copied_artifact = next(
+                path for path in (destination / "artifacts").rglob("*") if path.is_file()
+            )
+            self.assertEqual(copied_artifact.read_bytes(), original_artifact)
+            self.assertTrue(module.verify_ready_handoff(destination, provenance, ready)["valid"])
+
+    def test_fixture_artifact_ancestor_symlink_swap_is_rejected(self):
+        module = self.load_builder("prepare_fixture_ancestor_symlink")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self.copied_fixture_root(module, root)
+            external = root / "evaluator-artifacts"
+            shutil.copytree(source / "artifacts", external)
+            opaque_id = "case-53600000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+
+            def replace_artifact_ancestor(phase, _context):
+                if phase == "source_validated":
+                    (source / "artifacts").rename(source / "artifacts-original")
+                    (source / "artifacts").symlink_to(external, target_is_directory=True)
+
+            with self.assertRaises((OSError, ValueError)):
+                module.prepare(
+                    "known-root",
+                    destination,
+                    opaque_id,
+                    "/workspace/trace.json",
+                    provenance_output=provenance,
+                    ready_output=ready,
+                    _phase_hook=replace_artifact_ancestor,
+                )
+            self.assertTrue(destination.is_dir())
+            self.assertFalse(provenance.exists())
+            self.assertFalse(ready.exists())
+
+    def test_skill_ancestor_symlink_swap_is_rejected_before_copy(self):
+        module = self.load_builder("prepare_skill_ancestor_symlink")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            copied_skill = root / "canonical-skill"
+            shutil.copytree(SKILL_ROOT, copied_skill)
+            external = root / "evaluator-references"
+            shutil.copytree(copied_skill / "references", external)
+            module.SKILL_ROOT = copied_skill
+            original_listing = module.skill_files
+
+            def swap_after_listing(skill_root_fd):
+                listed = original_listing(skill_root_fd)
+                (copied_skill / "references").rename(copied_skill / "references-original")
+                (copied_skill / "references").symlink_to(
+                    external, target_is_directory=True
+                )
+                return listed
+
+            opaque_id = "case-53700000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            with mock.patch.object(module, "skill_files", side_effect=swap_after_listing):
+                with self.assertRaises((OSError, ValueError)):
+                    module.prepare(
+                        "known-root",
+                        destination,
+                        opaque_id,
+                        "/workspace/trace.json",
+                        provenance_output=provenance,
+                        ready_output=ready,
+                    )
+
+            self.assertTrue(destination.is_dir())
+            self.assertFalse(provenance.exists())
+            self.assertFalse(ready.exists())
 
     def test_ready_marker_is_last_and_binds_provenance_and_bundle_digests(self):
         module = self.load_builder("prepare_ready_marker")
@@ -670,6 +850,7 @@ class FixtureContractTests(unittest.TestCase):
             )
             self.assertEqual(marker["bundle_tree_sha256"], module.bundle_tree_digest(destination))
             self.assertEqual(phases[-1], "ready_published")
+            self.assertFalse((destination / module.OWNER_MARKER).exists())
             self.assertTrue(module.verify_ready_handoff(destination, provenance, ready)["valid"])
 
     def test_unready_or_digest_mismatched_handoff_is_never_accepted(self):
@@ -701,6 +882,24 @@ class FixtureContractTests(unittest.TestCase):
             (destination / "prompt-claude.md").write_text("tampered", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "bundle tree digest"):
                 module.verify_ready_handoff(destination, provenance, ready)
+
+            second_id = "case-55100000000000000000000000000000"
+            second_destination = root / second_id
+            second_provenance = root / f"{second_id}.provenance.json"
+            second_ready = root / f"{second_id}.READY.json"
+            module.prepare(
+                "known-root",
+                second_destination,
+                second_id,
+                "/workspace/trace.json",
+                provenance_output=second_provenance,
+                ready_output=second_ready,
+            )
+            (second_destination / "unexpected.txt").write_text("extra", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "bundle tree digest"):
+                module.verify_ready_handoff(
+                    second_destination, second_provenance, second_ready
+                )
 
     def test_crash_between_publish_phases_leaves_unready_nonconsumable_handoff(self):
         module = self.load_builder("prepare_crash_phases")
@@ -797,11 +996,11 @@ class FixtureContractTests(unittest.TestCase):
                     )
 
                 self.assertEqual(raced_path.read_text(encoding="utf-8"), "foreign-publisher")
-                self.assertFalse(destination.exists())
+                self.assertTrue(destination.is_dir())
                 if race_phase == "provenance_published":
-                    self.assertFalse(provenance.exists())
+                    self.assertTrue(provenance.exists())
 
-    def test_cleanup_does_not_unlink_replaced_provenance_inode(self):
+    def test_failure_does_not_unlink_replaced_provenance_inode(self):
         module = self.load_builder("prepare_replaced_provenance")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -834,10 +1033,10 @@ class FixtureContractTests(unittest.TestCase):
 
             self.assertTrue(provenance.is_file())
             self.assertEqual(provenance.stat().st_ino, replacement_inode)
-            self.assertFalse(destination.exists())
+            self.assertTrue(destination.is_dir())
             self.assertFalse(ready.exists())
 
-    def test_postwrite_artifact_hash_failure_rolls_back_bundle_and_provenance(self):
+    def test_postwrite_artifact_hash_failure_leaves_unready_bundle(self):
         module = self.load_builder("prepare_postwrite_hash")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -865,11 +1064,11 @@ class FixtureContractTests(unittest.TestCase):
                         ready_output=ready,
                     )
 
-            self.assertFalse(destination.exists())
+            self.assertTrue(destination.is_dir())
             self.assertFalse(provenance.exists())
             self.assertFalse(ready.exists())
 
-    def test_authoritative_validator_rejects_invalid_source_without_partials(self):
+    def test_authoritative_validator_rejects_invalid_source_as_unready(self):
         invalid_cases = (
             ("unsupported", lambda trace: trace.update({"trace_version": "7.0"})),
             ("missing-envelope", lambda trace: trace.pop("journal")),
@@ -901,7 +1100,7 @@ class FixtureContractTests(unittest.TestCase):
                             provenance_output=provenance,
                             ready_output=ready,
                         )
-                    self.assertFalse(destination.exists())
+                    self.assertTrue(destination.is_dir())
                     self.assertFalse(provenance.exists())
                     self.assertFalse(ready.exists())
 
@@ -976,7 +1175,7 @@ class FixtureContractTests(unittest.TestCase):
                         provenance_output=provenance,
                         ready_output=ready,
                     )
-            self.assertFalse(destination.exists())
+            self.assertTrue(destination.is_dir())
             self.assertFalse(provenance.exists())
             self.assertFalse(ready.exists())
 
@@ -1061,10 +1260,16 @@ class FixtureContractTests(unittest.TestCase):
             self.assertNotIn(forbidden, source)
         self.assertNotIn(".rename(", source)
         self.assertNotIn("shutil.copyfile", source)
+        self.assertNotIn("shutil.rmtree", source)
+        self.assertNotIn("cleanup_owned_destination", source)
+        self.assertNotIn("cleanup_published_file", source)
+        self.assertNotIn(".resolve(strict=True)", source)
         self.assertIn("os.mkdir(destination", source)
         self.assertIn("os.O_EXCL", source)
         self.assertIn("os.link", source)
         self.assertIn("O_NOFOLLOW", source)
+        self.assertIn("O_DIRECTORY", source)
+        self.assertIn("dir_fd=", source)
 
     def test_repository_does_not_ship_an_opencode_forward_runner(self):
         retired_name = "run_" + "isolated_opencode.py"

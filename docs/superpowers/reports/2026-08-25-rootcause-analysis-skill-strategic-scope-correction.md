@@ -44,15 +44,21 @@ Artifact paths are collision-checked against reserved bundle paths and their
 ancestors/descendants, the canonical Skill prefix, duplicates, portable
 casefold/Unicode normalization, Windows device names, trailing dots/spaces,
 forbidden characters, and ambiguous components. Source Trace and Artifact bytes
-are read once and the same bytes are hashed, parsed/validated, and published.
+are read through one held fixture-root directory descriptor and component-wise
+no-follow `openat`; the same bytes are hashed, parsed/validated, and published.
+The canonical Skill is enumerated and copied through a held directory descriptor
+and rejects symlink traversal.
 
 Construction writes directly into the reserved final destination while it is
 unready. Provenance and READY use no-replace publication outside the bundle;
 READY is published last. A Harness may consume only after
 `--verify-ready-handoff` confirms both READY-bound digests. Crashes can leave an
 unready directory or provenance, so the protocol does not claim cross-path
-transaction atomicity. Normal cleanup removes a destination only when its inode
-and owner token still match the publisher.
+transaction atomicity. The owner marker is removed before digest publication;
+the digest covers every remaining Agent-visible file. The builder performs no
+automatic rollback or deletion of reserved destination, provenance, or READY.
+Failures remain unready, retries require a new opaque ID, and manual operator
+cleanup is allowed only after confirming READY is absent.
 
 The bundle contains no case catalog, rubric, sibling fixture, report, Git history,
 semantic fixture identity, or symlink back to the repository.
@@ -84,6 +90,10 @@ fixture immutability, and clean diffs. Actual model scoring is deliberately
 outside this repository and must not be inferred from these checks.
 
 ## Verified Result
+
+The round-2 numbers below are retained as historical evidence. Current round-3
+verification is recorded in the dedicated round-3 report: 127 deterministic
+tests and seven fresh full-tree READY handoffs passed.
 
 - 121 deterministic tests passed with no skips in bundle handoff fix round 2.
 - `trace_query.py` and `prepare_isolated_bundle.py` compiled successfully.

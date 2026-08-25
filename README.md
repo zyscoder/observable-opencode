@@ -827,9 +827,9 @@ while IFS= read -r CASE; do
 done
 ```
 
-每个 workspace 只包含该 case 的 finalize 派生 `trace.json`、Trace 声明且摘要校验通过的 Artifacts、
-规范 `.claude/skills/rootcause-analysis`、`prompt-claude.md`、`prompt-opencode.md`，以及仅供发布所有权
-检查使用的 `.handoff-owner`。builder
+每个成功发布的 workspace 只包含该 case 的 finalize 派生 `trace.json`、Trace 声明且摘要校验通过的
+Artifacts、规范 `.claude/skills/rootcause-analysis`、`prompt-claude.md` 和 `prompt-opencode.md`。
+构造期间使用的 `.handoff-owner` 会在计算最终目录摘要前移除，不属于可消费 bundle。builder
 拒绝覆盖已有目录、symlink 越界、节点完整性错误和 Artifact 摘要不一致。它不会复制
 `cases.json`、`rubric.json`、隐藏 `expected`、fixture 语义标签、其他 fixture、reports 或 Git 历史。
 每个 canonical node 必须声明有效 `source_hash`；`--agent-trace-path` 必须是无控制字符、无 `..`
@@ -839,25 +839,34 @@ done
 builder 通过 `trace_query.py validate` 复用根因分析 Skill 的权威 finalized Trace 判定，并在匿名化后
 再次验证派生 Trace。终态但 source-incomplete 的 Trace 只要权威 validator 接受就可以交接；原始
 `lifecycle`、`source_completeness`、segment 和 diagnostics 会原样进入 evaluator provenance。
-Artifact 路径会在任何写入前检查保留文件、Skill 目录、重复路径以及 casefold/Unicode 规范化碰撞。
+Artifact 路径会在写入任何 Agent 可见 payload 前检查保留文件、Skill 目录、重复路径以及
+casefold/Unicode 规范化碰撞。
 路径策略还拒绝保留路径的祖先/后代、尾随点或空格、Windows 设备名、控制字符、冒号、反斜杠、
-`<>|?*` 和歧义组件。源 Trace 只读取一次；同一份字节用于 SHA-256、JSON 解析和私有快照上的
-权威验证。Artifact 同样只从源路径读取一次，并将经过摘要验证的同一份字节写入 bundle。
+`<>|?*` 和歧义组件。builder 持有 fixture root 目录 FD，并通过逐组件 `openat`、`O_DIRECTORY` 和
+`O_NOFOLLOW` 读取源 Trace 与 Artifact，不执行 resolve-then-open；同一份 Trace 字节用于 SHA-256、
+JSON 解析和私有快照上的权威验证。Artifact 同样只读取一次，并将经过摘要验证的同一份字节写入
+bundle。Canonical Skill 也通过 held directory FD 枚举和复制，目录树中任意 symlink 或切换成
+symlink 的祖先都会导致交接失败。
 
-builder 先用 `mkdir(exist_ok=False)` 原子占用最终 destination，并立即以 `O_EXCL` 写入唯一
-`.handoff-owner` 标记；随后直接写 bundle，但此时仍是 **unready / 不可消费** 状态。普通错误只在
-目录 inode 和 owner token 仍匹配时清理，绝不覆盖或删除不属于本次发布者的 destination。
+builder 先用 no-overwrite `mkdir` 原子占用最终 destination，并立即以 `O_EXCL` 写入唯一
+`.handoff-owner` 标记；随后直接写 bundle，但此时仍是 **unready / 不可消费** 状态。即使 marker
+写入失败，已占用目录也可能保留。builder **不自动回滚或删除** destination、provenance、READY，
+也不对这些路径执行 `rmtree`/`unlink`。任意失败都保留可审计的 unready 现场；重试必须生成新的
+opaque ID，不能复用失败发布的 ID。
 
 `--provenance-output` 和 `--ready-output` 都必填、都必须位于 bundle 外，并使用 no-replace 发布；
 每个 opaque case 分别使用 `${OPAQUE_CASE_ID}.provenance.json` 和
-`${OPAQUE_CASE_ID}.READY.json`，不要通过 shell 重定向写共享文件。provenance 发布后，builder
-计算其摘要和确定性的 bundle tree 摘要，最后才发布 READY。READY 中绑定 opaque ID 与这两个
-SHA-256；`.handoff-owner` 仅用于安全清理，不进入 tree digest。
+`${OPAQUE_CASE_ID}.READY.json`，不要通过 shell 重定向写共享文件。所有 bundle 内容写入并复核后，
+builder 必须先成功移除 `.handoff-owner`；移除失败则终止且不发布 READY。随后计算覆盖**所有剩余
+Agent 可见文件**的确定性 bundle tree 摘要、发布 provenance，最后才发布 READY。READY 中绑定
+opaque ID、provenance SHA-256 与完整 tree SHA-256；增加、删除或修改任一文件都会使验证失败。
 
 Harness **只有在 READY 存在且 `--verify-ready-handoff` 成功确认 provenance digest 与 bundle tree
 digest 都匹配时才能消费 bundle**。单独存在 destination 或 provenance 不代表发布完成。进程崩溃
-可能留下 unready destination、私有快照或 provenance；这些文件用于审计或人工清理，但没有有效
-READY 时一律不可提交。该协议不宣称 bundle、provenance 和 READY 三条路径构成跨文件系统原子事务。
+可能留下 unready destination、私有快照或 provenance；这些文件用于审计，但没有有效 READY 时
+一律不可提交。人工清理只能由 operator 在确认 READY 不存在后执行；若 READY 已存在但验证失败，
+应隔离并调查，不能自动删除。该协议不宣称 bundle、provenance 和 READY 三条路径构成跨文件系统
+原子事务，也没有失败回滚保证。
 
 把 opaque workspace 提交给组织现有的 **可信 benchmark Harness / 隔离执行服务**。该外部系统
 必须独立管理认证凭据、文件系统与网络隔离、运行时清理、镜像或执行环境证明、输出审计及超时终止；

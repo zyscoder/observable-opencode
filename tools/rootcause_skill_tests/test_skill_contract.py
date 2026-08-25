@@ -233,6 +233,19 @@ class SkillContractTests(unittest.TestCase):
             self.assertRegex(text, r"(?i)only.*READY|只有.*READY|仅当.*READY", name)
             self.assertNotRegex(text, r"(?i)full transaction atomicity|完整事务原子性", name)
 
+    def test_handoff_docs_define_fail_closed_manual_cleanup(self):
+        for name, text in (("README", self.readme_text), ("plan", self.plan_text)):
+            self.assertRegex(text, r"(?i)no automatic (?:rollback|deletion)|不自动(?:回滚|删除)", name)
+            self.assertRegex(text, r"(?i)new opaque ID|新的\s+opaque ID", name)
+            self.assertRegex(text, r"(?i)manual (?:operator )?cleanup|人工清理", name)
+            self.assertRegex(text, r"(?i)absence of READY|确认 READY 不存在|READY 不存在", name)
+            self.assertRegex(
+                text,
+                r"(?is)every.*Agent-visible file|所有.*Agent 可见文件",
+                name,
+            )
+            self.assertNotRegex(text, r"(?i)owner token still match|owner token 仍匹配", name)
+
     def test_no_active_or_historical_doc_references_the_retired_runner(self):
         retired_name = "run_" + "isolated_opencode.py"
         paths = [README_PATH, PLAN_PATH]

@@ -691,10 +691,10 @@ git diff --check
 
 - [ ] **Step 3: Build isolated workspaces for trusted-Harness submission**
 
-The evaluator builds each opaque workspace before launching an Agent. The workspace
-contains only the selected finalized Trace and verified Artifacts, the
-canonical Skill, runtime-specific prompts, and the publisher ownership
-`.handoff-owner` marker. It contains no `cases.json`,
+The evaluator builds each opaque workspace before launching an Agent. A completed
+workspace contains only the selected finalized Trace and verified Artifacts, the
+canonical Skill, and runtime-specific prompts. The temporary publisher ownership
+`.handoff-owner` marker is removed before final digest and READY publication. It contains no `cases.json`,
 rubric, hidden expected outcome, sibling fixture, report, Git history, or
 symlink back to the repository.
 
@@ -729,33 +729,40 @@ Terminal but source-incomplete inputs remain acceptable when that validator
 accepts them, with exact lifecycle, source-completeness, segment, and diagnostic
 facts preserved in evaluator provenance.
 
-Before writing, the builder performs a collision preflight and rejects Artifact
-paths that collide with reserved bundle files, the canonical Skill tree, one
+Before writing any Agent-visible payload, the builder performs a collision
+preflight and rejects Artifact paths that collide with reserved bundle files, the canonical Skill tree, one
 another, or portable casefold/Unicode normalization. The portable policy also
 rejects reserved-path ancestors/descendants, trailing dots/spaces, Windows device
 names, control characters, `:`, `\\`, `<>|?*`, and ambiguous components.
 
 The builder atomically reserves the final destination with no-overwrite `mkdir`
-and immediately writes an exclusive unique owner marker. It reads the source
-Trace once and uses the same bytes for hashing, parsing, and authoritative
-validation through a private snapshot. Each Artifact is likewise read once,
-hashed, and written from the same bytes. The derived Trace is validated from the
-exact bytes written by the publisher. The bundle remains unready and
-non-consumable throughout construction.
+and immediately writes an exclusive unique owner marker. Marker-write failure may
+leave the reservation unready. A held fixture-root directory FD and component-wise
+`openat` with `O_DIRECTORY`/`O_NOFOLLOW` bind Trace and Artifact reads without a
+resolve-then-open window. The source Trace is read once and the same bytes are used
+for hashing, parsing, and authoritative validation through a private snapshot.
+Each Artifact is likewise read once, hashed, and written from the same bytes. The
+Skill tree is enumerated and copied through a held directory FD and rejects any
+symlink traversal. The derived Trace is validated from the exact bytes written by
+the publisher. The bundle remains unready and non-consumable throughout construction.
 
 `--provenance-output` and `--ready-output` are required outside the bundle and
 published with no-replace semantics. Each opaque case receives evaluator-only
 `${OPAQUE_CASE_ID}.provenance.json` and `${OPAQUE_CASE_ID}.READY.json`; do not use
-shell redirection or shared filenames. Provenance is published first. READY is
-published last and binds the opaque ID, provenance SHA-256, and deterministic
-bundle-tree SHA-256. The owner marker is excluded from the tree digest.
+shell redirection or shared filenames. After all bundle bytes are verified, the
+owner marker must be removed; removal failure aborts without READY. The deterministic
+tree digest then covers every remaining Agent-visible file. Provenance is published
+first. READY is published last and binds the opaque ID, provenance SHA-256, and
+complete bundle-tree SHA-256. Any extra, removed, or mutated file invalidates READY.
 
 Harness submission is allowed only when READY exists and
 `--verify-ready-handoff` confirms both digests. A destination or provenance file
 without valid READY remains unready/non-consumable. A crash can leave such files;
-this protocol does not claim cross-path transaction atomicity. Ordinary cleanup
-deletes a destination only while its inode and owner token still match, and never
-renames over or deletes an unowned destination. After Agent execution, the
+this protocol does not claim cross-path transaction atomicity. The builder performs
+no automatic rollback or deletion of destination, provenance, or READY. Retry uses
+a new opaque ID. Manual operator cleanup is permitted only after confirming the
+absence of READY; a present but invalid READY is quarantined for investigation.
+After Agent execution, the
 evaluator alone reads the per-case provenance, `cases.json`, and `rubric.json` to
 score captured outputs outside the submitted bundle. Agent-visible identity is
 opaque; fixture mapping, derived provenance, and rubric stay evaluator-only.
@@ -816,3 +823,15 @@ git commit -m "docs(skill): explain and validate root cause analysis"
 - [ ] Full deterministic tests, Skill validation, `py_compile`, and `git diff --check` pass.
 - [ ] Seven opaque bundles pass integrity and hidden-answer audits before handoff.
 - [ ] Scored execution is delegated to a trusted benchmark Harness; this repository does not claim an execution trust boundary.
+
+## Task 6 Handoff Fix Ledger
+
+- **Round 1:** added authoritative Trace validation, portable collision checks,
+  external per-case provenance, and postwrite Artifact verification.
+- **Round 2:** added no-replace provenance/READY publication and an external
+  readiness digest gate; crash states became explicitly unready.
+- **Round 3:** removes automatic deletion/rollback to eliminate cleanup TOCTOU,
+  uses held directory FDs plus component-wise no-follow `openat` for fixture and
+  Skill bytes, removes the owner marker before hashing, and makes READY bind every
+  remaining Agent-visible file. Failed attempts are retained unready and retried
+  only with a new opaque ID.

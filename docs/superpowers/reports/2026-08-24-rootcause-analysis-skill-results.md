@@ -41,7 +41,15 @@ score. See the historical raw-attempt appendix; it is superseded and unscored.
 
 ## Deterministic Verification
 
-Bundle handoff fix round 2 discovered and passed 121 tests with no skips. Python
+Bundle handoff fix round 3 replaces the round-2 cleanup protocol with a
+fail-closed, no-rollback protocol. It binds fixture and Skill reads to held
+directory descriptors, removes the owner marker before computing the complete
+Agent-visible tree digest, and requires a new opaque ID after every failed
+publication. Exact round-3 evidence is maintained in
+`2026-08-25-rootcause-analysis-skill-bundle-handoff-fix-round-3.md`: 127 tests
+and seven fresh full-tree READY handoffs passed.
+
+The following round-2 result remains historical: 121 tests passed with no skips. Python
 compilation and the official Skill validator passed; the validator reported
 `Skill is valid!`. A fresh seven-bundle audit under
 `/tmp/rootcause-handoff-r2-final-gnabzke7` found zero hidden-answer leaks, zero

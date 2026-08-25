@@ -4,6 +4,11 @@ Date: 2026-08-25
 
 Branch: `codex/trace-stability-integration`
 
+> Superseded on 2026-08-25 by bundle handoff fix round 3. Round 3 removes
+> automatic cleanup of reserved or published paths, removes the owner marker
+> before the full tree digest, and binds fixture/Skill reads to held directory
+> descriptors. The cleanup behavior below is historical, not the current contract.
+
 ## Scope
 
 This round replaces optimistic cleanup-based publication with an explicit
