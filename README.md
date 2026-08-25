@@ -868,8 +868,7 @@ READY 会因 JSON、provenance 摘要或 tree 摘要验证失败而不可消费�
 每个 opaque case 分别使用 `${OPAQUE_CASE_ID}.provenance.json` 和
 `${OPAQUE_CASE_ID}.READY.json`，不要通过 shell 重定向写共享文件。所有 bundle 内容写入并复核后，
 builder 必须先成功移除 `.handoff-owner`；移除失败则终止且不发布 READY。随后计算覆盖**所有剩余
-manifest 覆盖 every Agent-visible file and directory，也就是**所有 Agent 可见目录和文件**的确定性
-directory-and-file tree；随后发布 provenance，最后才发布 READY。
+Agent 可见目录和文件**的确定性 directory-and-file tree；之后发布 provenance，最后才发布 READY。
 记录每个条目的类型、原始及 NFKC normalized relative path、mode，文件还记录 size 与 SHA-256；
 因此增加、删除、修改或重命名文件及空目录都会使验证失败。READY 中绑定 opaque ID、provenance
 SHA-256 与完整 tree SHA-256。
