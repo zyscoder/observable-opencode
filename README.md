@@ -716,6 +716,71 @@ test "$(jq -r '.generation' "$CASE_DIR/session.json")" = \
 
 不同 Agent runtime 的 Skill 调用语法不同，不能混用。
 
+### 安装 Skill
+
+必须安装完整的 `rootcause-analysis` 目录，不能只复制 `SKILL.md`。其中的 `references/` 定义
+Trace、后向语义污点分析和报告格式，`scripts/trace_query.py` 负责只读检索与证据校验，
+`agents/` 保存 runtime 元数据；缺少任一部分都会使分析能力不完整。
+
+**项目级安装（推荐）**：安装后只对目标项目生效，Claude Code 和 Observable OpenCode 均可从
+项目根目录的 `.claude/skills/` 发现它。
+
+```bash
+export OBSERVABLE_OPENCODE_SRC=/absolute/path/to/observable-opencode
+export TARGET_PROJECT=/absolute/path/to/target-project
+export SKILL_SRC="$OBSERVABLE_OPENCODE_SRC/.claude/skills/rootcause-analysis"
+export SKILL_DEST="$TARGET_PROJECT/.claude/skills/rootcause-analysis"
+
+test -f "$SKILL_SRC/SKILL.md"
+test ! -e "$SKILL_DEST"  # 首次安装时防止覆盖已有目录
+mkdir -p "$TARGET_PROJECT/.claude/skills"
+cp -R "$SKILL_SRC" "$TARGET_PROJECT/.claude/skills/"
+```
+
+**用户级安装**：需要在当前用户的多个项目中复用时，安装到
+`~/.claude/skills/rootcause-analysis`。Observable OpenCode 默认兼容该 Claude Skill 路径；若设置了
+`OPENCODE_DISABLE_EXTERNAL_SKILLS=1` 或 `OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1`，则不会发现它。
+
+```bash
+export OBSERVABLE_OPENCODE_SRC=/absolute/path/to/observable-opencode
+export SKILL_SRC="$OBSERVABLE_OPENCODE_SRC/.claude/skills/rootcause-analysis"
+export SKILL_DEST="$HOME/.claude/skills/rootcause-analysis"
+
+test -f "$SKILL_SRC/SKILL.md"
+test ! -e "$SKILL_DEST"  # 首次安装时防止覆盖已有目录
+mkdir -p "$HOME/.claude/skills"
+cp -R "$SKILL_SRC" "$HOME/.claude/skills/"
+```
+
+更新已安装版本前，如有本地修改应先备份；随后用 `rsync` 同步完整目录，避免旧版本遗留文件继续
+生效。项目级安装把 `SKILL_DEST` 指向项目目录，用户级安装则指向 `$HOME/.claude/skills`：
+
+```bash
+export SKILL_SRC=/absolute/path/to/observable-opencode/.claude/skills/rootcause-analysis
+export SKILL_DEST=/absolute/path/to/installed/rootcause-analysis
+rsync -a --delete "$SKILL_SRC/" "$SKILL_DEST/"
+```
+
+安装后先验证目录和查询工具，再从目标项目目录验证 Observable OpenCode 的实际发现结果：
+
+```bash
+export TARGET_PROJECT=/absolute/path/to/target-project
+export SKILL_DEST="$TARGET_PROJECT/.claude/skills/rootcause-analysis"  # 用户级安装时改为 $HOME/.claude/skills/rootcause-analysis
+
+test -f "$SKILL_DEST/SKILL.md"
+test -f "$SKILL_DEST/references/backward-semantic-taint.md"
+python3 "$SKILL_DEST/scripts/trace_query.py" --help
+
+cd "$TARGET_PROJECT"
+opencode debug skill | grep -F '"name": "rootcause-analysis"'
+```
+
+如果最后一条命令没有结果，确认启动目录确实位于目标项目中、环境变量没有关闭外部/Claude
+Skills，并重启 Agent runtime 使其重新扫描。Skill 的查询脚本只需要 Python 3 标准库；安装 Skill
+不需要安装 `tools/trace_attribution`、不需要提供 Observable OpenCode 源码路径，也不单独接收
+模型 URL 或 API Key。LLM Provider、模型和认证仍由正在调用 Skill 的 Claude Code、OpenCode 或
+其他 Agent runtime 自己配置。
+
 ### Claude Code
 
 Claude Code 使用 slash command `/rootcause-analysis`：
