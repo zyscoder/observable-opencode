@@ -246,6 +246,21 @@ class SkillContractTests(unittest.TestCase):
             )
             self.assertNotRegex(text, r"(?i)owner token still match|owner token 仍匹配", name)
 
+    def test_handoff_docs_define_fd_bound_direct_publication(self):
+        for name, text in (("README", self.readme_text), ("plan", self.plan_text)):
+            self.assertIn("destination_fd", text, name)
+            self.assertRegex(text, r"(?i)fstat.*lstat|lstat.*fstat", name)
+            self.assertRegex(text, r"(?i)O_CREAT.*O_EXCL.*O_NOFOLLOW", name)
+            self.assertRegex(text, r"(?i)partial.*provenance|部分写入.*provenance", name)
+            self.assertRegex(text, r"(?i)Skill.*snapshot|Skill.*快照", name)
+            self.assertRegex(text, r"(?i)empty director|空目录", name)
+            self.assertRegex(text, r"(?i)directory.*file.*tree|目录.*文件.*tree", name)
+            self.assertRegex(
+                text,
+                r"(?i)no temporary-file/hard-link|不创建临时文件.*hard-link",
+                name,
+            )
+
     def test_no_active_or_historical_doc_references_the_retired_runner(self):
         retired_name = "run_" + "isolated_opencode.py"
         paths = [README_PATH, PLAN_PATH]

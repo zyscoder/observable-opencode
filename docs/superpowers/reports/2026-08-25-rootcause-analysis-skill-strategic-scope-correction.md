@@ -49,13 +49,15 @@ no-follow `openat`; the same bytes are hashed, parsed/validated, and published.
 The canonical Skill is enumerated and copied through a held directory descriptor
 and rejects symlink traversal.
 
-Construction writes directly into the reserved final destination while it is
-unready. Provenance and READY use no-replace publication outside the bundle;
+Construction is bound to the reserved final destination FD while it is unready.
+Path/inode identity is rechecked before provenance and READY. Provenance and READY use
+direct exclusive no-follow publication outside the bundle;
 READY is published last. A Harness may consume only after
 `--verify-ready-handoff` confirms both READY-bound digests. Crashes can leave an
 unready directory or provenance, so the protocol does not claim cross-path
-transaction atomicity. The owner marker is removed before digest publication;
-the digest covers every remaining Agent-visible file. The builder performs no
+transaction atomicity. The owner marker is removed through the held FD before
+digest publication; the digest covers every remaining Agent-visible directory
+and file, including empty directories. The builder performs no
 automatic rollback or deletion of reserved destination, provenance, or READY.
 Failures remain unready, retries require a new opaque ID, and manual operator
 cleanup is allowed only after confirming READY is absent.
@@ -94,6 +96,9 @@ outside this repository and must not be inferred from these checks.
 The round-2 numbers below are retained as historical evidence. Current round-3
 verification is recorded in the dedicated round-3 report: 127 deterministic
 tests and seven fresh full-tree READY handoffs passed.
+
+Round 4 supersedes the construction details with FD-bound writes, Skill byte
+snapshotting, directory-aware manifests, and direct partial-preserving publication.
 
 - 121 deterministic tests passed with no skips in bundle handoff fix round 2.
 - `trace_query.py` and `prepare_isolated_bundle.py` compiled successfully.

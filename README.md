@@ -845,8 +845,9 @@ casefold/Unicode 规范化碰撞。
 `<>|?*` 和歧义组件。builder 持有 fixture root 目录 FD，并通过逐组件 `openat`、`O_DIRECTORY` 和
 `O_NOFOLLOW` 读取源 Trace 与 Artifact，不执行 resolve-then-open；同一份 Trace 字节用于 SHA-256、
 JSON 解析和私有快照上的权威验证。Artifact 同样只读取一次，并将经过摘要验证的同一份字节写入
-bundle。Canonical Skill 也通过 held directory FD 枚举和复制，目录树中任意 symlink 或切换成
-symlink 的祖先都会导致交接失败。
+bundle。Canonical Skill 通过 held directory FD 枚举时立即把每个文件字节和全部目录项做成
+Skill 快照；后续 bundle 只使用快照，不再读取 Skill 源路径。目录树中任意 symlink、special file
+或切换成 symlink 的祖先都会导致交接失败，快照中的空目录也会保留。
 
 builder 先用 no-overwrite `mkdir` 原子占用最终 destination，并立即以 `O_EXCL` 写入唯一
 `.handoff-owner` 标记；随后直接写 bundle，但此时仍是 **unready / 不可消费** 状态。即使 marker
@@ -854,12 +855,24 @@ builder 先用 no-overwrite `mkdir` 原子占用最终 destination，并立即�
 也不对这些路径执行 `rmtree`/`unlink`。任意失败都保留可审计的 unready 现场；重试必须生成新的
 opaque ID，不能复用失败发布的 ID。
 
-`--provenance-output` 和 `--ready-output` 都必填、都必须位于 bundle 外，并使用 no-replace 发布；
+预留后，builder 的 mkdir、open、write、reopen、list、hash、fsync 和 owner marker unlink 全部绑定
+到同一个 `destination_fd`，通过 `dir_fd`/`openat` 和 `O_NOFOLLOW` 完成，不再通过 destination
+路径写入或重新打开 bundle。发布 provenance 前和发布 READY 前，builder 都会比较
+`fstat(destination_fd)` 与 `lstat(destination)` 的 dev+ino，并确认命名路径仍是非 symlink 目录；
+路径被替换、重命名或指向其他 inode 时立即终止，不向 replacement 写入，也不发布 READY。
+
+`--provenance-output` 和 `--ready-output` 都必填、都必须位于 bundle 外，并使用 direct no-replace
+发布：直接对最终文件执行 `O_CREAT|O_EXCL|O_NOFOLLOW`、完整写入和 fsync，不创建临时文件，也不使用 hard-link。
+进程在写入中途退出时，部分写入的 provenance 会因没有 READY 而不可消费；部分写入的
+READY 会因 JSON、provenance 摘要或 tree 摘要验证失败而不可消费。这些 partial 文件不会被删除。
 每个 opaque case 分别使用 `${OPAQUE_CASE_ID}.provenance.json` 和
 `${OPAQUE_CASE_ID}.READY.json`，不要通过 shell 重定向写共享文件。所有 bundle 内容写入并复核后，
 builder 必须先成功移除 `.handoff-owner`；移除失败则终止且不发布 READY。随后计算覆盖**所有剩余
-Agent 可见文件**的确定性 bundle tree 摘要、发布 provenance，最后才发布 READY。READY 中绑定
-opaque ID、provenance SHA-256 与完整 tree SHA-256；增加、删除或修改任一文件都会使验证失败。
+manifest 覆盖 every Agent-visible file and directory，也就是**所有 Agent 可见目录和文件**的确定性
+directory-and-file tree；随后发布 provenance，最后才发布 READY。
+记录每个条目的类型、原始及 NFKC normalized relative path、mode，文件还记录 size 与 SHA-256；
+因此增加、删除、修改或重命名文件及空目录都会使验证失败。READY 中绑定 opaque ID、provenance
+SHA-256 与完整 tree SHA-256。
 
 Harness **只有在 READY 存在且 `--verify-ready-handoff` 成功确认 provenance digest 与 bundle tree
 digest 都匹配时才能消费 bundle**。单独存在 destination 或 provenance 不代表发布完成。进程崩溃

@@ -4,6 +4,11 @@ Date: 2026-08-25
 
 Branch: `codex/trace-stability-integration`
 
+> Superseded on 2026-08-25 by bundle handoff fix round 4. Round 4 binds all
+> Agent-visible bundle operations to the reserved directory FD, replaces
+> temporary hard-link publication with direct exclusive writes, snapshots Skill
+> bytes during enumeration, and hashes directories as well as files.
+
 ## Scope
 
 This round simplifies bundle publication to a fail-closed, monotonic handoff.

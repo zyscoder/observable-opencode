@@ -534,6 +534,125 @@ class FixtureContractTests(unittest.TestCase):
             self.assertFalse(provenance.exists())
             self.assertFalse(ready.exists())
 
+    def test_destination_replacement_aborts_without_touching_replacement(self):
+        module = self.load_builder("prepare_destination_replacement")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-50100000000000000000000000000000"
+            destination = root / opaque_id
+            detached = root / f"{opaque_id}.detached"
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+
+            def replace_destination(phase, _context):
+                if phase == "source_validated":
+                    destination.rename(detached)
+                    destination.mkdir()
+                    (destination / "foreign.txt").write_text(
+                        "foreign replacement", encoding="utf-8"
+                    )
+
+            with self.assertRaisesRegex(ValueError, "reserved destination|identity"):
+                module.prepare(
+                    "known-root",
+                    destination,
+                    opaque_id,
+                    "/workspace/trace.json",
+                    provenance_output=provenance,
+                    ready_output=ready,
+                    _phase_hook=replace_destination,
+                )
+
+            self.assertEqual(
+                list(destination.iterdir()), [destination / "foreign.txt"]
+            )
+            self.assertEqual(
+                (destination / "foreign.txt").read_text(encoding="utf-8"),
+                "foreign replacement",
+            )
+            self.assertTrue((detached / module.OWNER_MARKER).is_file())
+            self.assertFalse(provenance.exists())
+            self.assertFalse(ready.exists())
+
+    def test_destination_replacement_after_provenance_aborts_ready(self):
+        module = self.load_builder("prepare_destination_replacement_after_provenance")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-50110000000000000000000000000000"
+            destination = root / opaque_id
+            detached = root / f"{opaque_id}.detached"
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+
+            def replace_destination(phase, _context):
+                if phase == "provenance_published":
+                    destination.rename(detached)
+                    destination.mkdir()
+                    (destination / "foreign.txt").write_text("foreign", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "reserved destination|identity"):
+                module.prepare(
+                    "known-root",
+                    destination,
+                    opaque_id,
+                    "/workspace/trace.json",
+                    provenance_output=provenance,
+                    ready_output=ready,
+                    _phase_hook=replace_destination,
+                )
+            self.assertTrue(provenance.is_file())
+            self.assertFalse(ready.exists())
+            self.assertEqual(
+                (destination / "foreign.txt").read_text(encoding="utf-8"), "foreign"
+            )
+
+    def test_bundle_payload_never_uses_destination_path_after_reservation(self):
+        module = self.load_builder("prepare_fd_only_destination")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-50200000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            original_write = module.write_new_file
+            original_mkdir = Path.mkdir
+            canonical_destination = destination.resolve(strict=False)
+
+            def reject_path_write(target, payload, mode=0o600):
+                target = Path(target)
+                canonical_target = target.resolve(strict=False)
+                if (
+                    canonical_target == canonical_destination
+                    or canonical_destination in canonical_target.parents
+                ):
+                    raise AssertionError("destination path write after reservation")
+                return original_write(target, payload, mode)
+
+            def reject_path_mkdir(target, *args, **kwargs):
+                canonical_target = target.resolve(strict=False)
+                if (
+                    canonical_target == canonical_destination
+                    or canonical_destination in canonical_target.parents
+                ):
+                    raise AssertionError("destination path mkdir after reservation")
+                return original_mkdir(target, *args, **kwargs)
+
+            with mock.patch.object(
+                module, "write_new_file", side_effect=reject_path_write
+            ), mock.patch.object(Path, "mkdir", new=reject_path_mkdir):
+                module.prepare(
+                    "known-root",
+                    destination,
+                    opaque_id,
+                    "/workspace/trace.json",
+                    provenance_output=provenance,
+                    ready_output=ready,
+                )
+            self.assertTrue(module.verify_ready_handoff(destination, provenance, ready)["valid"])
+
     def test_owner_marker_write_failure_leaves_unready_reservation(self):
         module = self.load_builder("prepare_marker_write_failure")
         with tempfile.TemporaryDirectory() as directory:
@@ -793,21 +912,22 @@ class FixtureContractTests(unittest.TestCase):
             external = root / "evaluator-references"
             shutil.copytree(copied_skill / "references", external)
             module.SKILL_ROOT = copied_skill
-            original_listing = module.skill_files
+            original_snapshot = module.snapshot_tree_at
 
-            def swap_after_listing(skill_root_fd):
-                listed = original_listing(skill_root_fd)
+            def swap_before_snapshot(skill_root_fd, label):
                 (copied_skill / "references").rename(copied_skill / "references-original")
                 (copied_skill / "references").symlink_to(
                     external, target_is_directory=True
                 )
-                return listed
+                return original_snapshot(skill_root_fd, label)
 
             opaque_id = "case-53700000000000000000000000000000"
             destination = root / opaque_id
             provenance = root / f"{opaque_id}.provenance.json"
             ready = root / f"{opaque_id}.READY.json"
-            with mock.patch.object(module, "skill_files", side_effect=swap_after_listing):
+            with mock.patch.object(
+                module, "snapshot_tree_at", side_effect=swap_before_snapshot
+            ):
                 with self.assertRaises((OSError, ValueError)):
                     module.prepare(
                         "known-root",
@@ -821,6 +941,118 @@ class FixtureContractTests(unittest.TestCase):
             self.assertTrue(destination.is_dir())
             self.assertFalse(provenance.exists())
             self.assertFalse(ready.exists())
+
+    def test_skill_files_are_copied_from_one_fd_snapshot(self):
+        module = self.load_builder("prepare_skill_snapshot")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            copied_skill = root / "canonical-skill"
+            shutil.copytree(SKILL_ROOT, copied_skill)
+            module.SKILL_ROOT = copied_skill
+            source_file = copied_skill / "SKILL.md"
+            original_bytes = source_file.read_bytes()
+            hook_seen = []
+            opaque_id = "case-53800000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+
+            def mutate_after_snapshot(phase, _context):
+                if phase == "skill_snapshotted":
+                    hook_seen.append(phase)
+                    source_file.write_bytes(b"mutated after fd snapshot\n")
+
+            module.prepare(
+                "known-root",
+                destination,
+                opaque_id,
+                "/workspace/trace.json",
+                provenance_output=provenance,
+                ready_output=ready,
+                _phase_hook=mutate_after_snapshot,
+            )
+
+            self.assertEqual(hook_seen, ["skill_snapshotted"])
+            self.assertEqual(
+                (
+                    destination
+                    / ".claude"
+                    / "skills"
+                    / "rootcause-analysis"
+                    / "SKILL.md"
+                ).read_bytes(),
+                original_bytes,
+            )
+            self.assertEqual(source_file.read_bytes(), b"mutated after fd snapshot\n")
+
+    def test_empty_directories_are_preserved_and_bound_by_ready_digest(self):
+        module = self.load_builder("prepare_empty_directories")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            copied_skill = root / "canonical-skill"
+            shutil.copytree(SKILL_ROOT, copied_skill)
+            (copied_skill / "references" / "empty-contract").mkdir()
+            module.SKILL_ROOT = copied_skill
+            opaque_id = "case-53900000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+
+            module.prepare(
+                "known-root",
+                destination,
+                opaque_id,
+                "/workspace/trace.json",
+                provenance_output=provenance,
+                ready_output=ready,
+            )
+            empty = (
+                destination
+                / ".claude"
+                / "skills"
+                / "rootcause-analysis"
+                / "references"
+                / "empty-contract"
+            )
+            self.assertTrue(empty.is_dir())
+            manifest = module.bundle_tree_manifest(destination)
+            self.assertIn(
+                {
+                    "type": "directory",
+                    "path": ".claude/skills/rootcause-analysis/references/empty-contract",
+                    "normalized_path": ".claude/skills/rootcause-analysis/references/empty-contract",
+                    "mode": "0700",
+                },
+                manifest,
+            )
+            self.assertTrue(module.verify_ready_handoff(destination, provenance, ready)["valid"])
+
+            empty.rename(empty.with_name("renamed-empty-contract"))
+            with self.assertRaisesRegex(ValueError, "bundle tree digest"):
+                module.verify_ready_handoff(destination, provenance, ready)
+
+    def test_added_empty_directory_invalidates_ready_digest(self):
+        module = self.load_builder("prepare_added_empty_directory")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-53910000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            module.prepare(
+                "known-root",
+                destination,
+                opaque_id,
+                "/workspace/trace.json",
+                provenance_output=provenance,
+                ready_output=ready,
+            )
+            (destination / "unexpected-empty").mkdir()
+            with self.assertRaisesRegex(ValueError, "bundle tree digest"):
+                module.verify_ready_handoff(destination, provenance, ready)
 
     def test_ready_marker_is_last_and_binds_provenance_and_bundle_digests(self):
         module = self.load_builder("prepare_ready_marker")
@@ -968,6 +1200,108 @@ class FixtureContractTests(unittest.TestCase):
                     self.assertEqual(existing.read_text(encoding="utf-8"), "foreign")
                     self.assertFalse(destination.exists())
 
+    def test_partial_provenance_remains_unready_and_is_never_deleted(self):
+        module = self.load_builder("prepare_partial_provenance")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-75000000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            original_write_all = module.write_all
+
+            def interrupt_provenance(descriptor, payload):
+                content = bytes(payload)
+                if b'"source_fixture"' in content:
+                    module.os.write(descriptor, content[:17])
+                    module.os.fsync(descriptor)
+                    raise OSError("injected partial provenance")
+                return original_write_all(descriptor, payload)
+
+            with mock.patch.object(
+                module, "write_all", side_effect=interrupt_provenance
+            ):
+                with self.assertRaisesRegex(OSError, "partial provenance"):
+                    module.prepare(
+                        "known-root",
+                        destination,
+                        opaque_id,
+                        "/workspace/trace.json",
+                        provenance_output=provenance,
+                        ready_output=ready,
+                    )
+
+            self.assertEqual(len(provenance.read_bytes()), 17)
+            self.assertFalse(ready.exists())
+            with self.assertRaisesRegex(ValueError, "READY"):
+                module.verify_ready_handoff(destination, provenance, ready)
+
+    def test_partial_ready_is_invalid_and_is_never_deleted(self):
+        module = self.load_builder("prepare_partial_ready")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-75100000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            original_write_all = module.write_all
+
+            def interrupt_ready(descriptor, payload):
+                content = bytes(payload)
+                if module.READY_SCHEMA_VERSION.encode("ascii") in content:
+                    module.os.write(descriptor, content[:19])
+                    module.os.fsync(descriptor)
+                    raise OSError("injected partial READY")
+                return original_write_all(descriptor, payload)
+
+            with mock.patch.object(module, "write_all", side_effect=interrupt_ready):
+                with self.assertRaisesRegex(OSError, "partial READY"):
+                    module.prepare(
+                        "known-root",
+                        destination,
+                        opaque_id,
+                        "/workspace/trace.json",
+                        provenance_output=provenance,
+                        ready_output=ready,
+                    )
+
+            self.assertTrue(provenance.is_file())
+            self.assertEqual(len(ready.read_bytes()), 19)
+            with self.assertRaisesRegex(ValueError, "valid JSON"):
+                module.verify_ready_handoff(destination, provenance, ready)
+
+    def test_direct_publication_does_not_touch_temporary_lookalikes(self):
+        module = self.load_builder("prepare_direct_publication")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.copied_fixture_root(module, root)
+            opaque_id = "case-75200000000000000000000000000000"
+            destination = root / opaque_id
+            provenance = root / f"{opaque_id}.provenance.json"
+            ready = root / f"{opaque_id}.READY.json"
+            lookalikes = (
+                root / f".{provenance.name}.tmp-foreign",
+                root / f".{ready.name}.tmp-foreign",
+            )
+            for lookalike in lookalikes:
+                lookalike.write_text("foreign temporary lookalike", encoding="utf-8")
+
+            module.prepare(
+                "known-root",
+                destination,
+                opaque_id,
+                "/workspace/trace.json",
+                provenance_output=provenance,
+                ready_output=ready,
+            )
+            for lookalike in lookalikes:
+                self.assertEqual(
+                    lookalike.read_text(encoding="utf-8"),
+                    "foreign temporary lookalike",
+                )
+
     def test_publish_races_do_not_replace_foreign_provenance_or_ready(self):
         for index, race_phase in enumerate(("bundle_written", "provenance_published")):
             with self.subTest(phase=race_phase), tempfile.TemporaryDirectory() as directory:
@@ -1045,15 +1379,30 @@ class FixtureContractTests(unittest.TestCase):
             destination = root / opaque_id
             provenance = root / f"{opaque_id}.provenance.json"
             ready = root / f"{opaque_id}.READY.json"
-            original_write = module.write_new_file
+            original_write = module.write_new_file_at
 
-            def corrupt_artifact(target, payload, mode=0o600):
-                result = original_write(target, payload, mode)
-                if "artifacts" in Path(target).parts:
-                    Path(target).write_bytes(b"postwrite corruption")
+            def corrupt_artifact(directory_fd, relative, payload, mode=0o600):
+                result = original_write(directory_fd, relative, payload, mode)
+                if "artifacts" in Path(relative).parts:
+                    parent_fd, name = module.open_parent_at(
+                        directory_fd, relative, "corrupt test artifact"
+                    )
+                    try:
+                        flags = module.os.O_WRONLY | module.os.O_TRUNC
+                        if hasattr(module.os, "O_NOFOLLOW"):
+                            flags |= module.os.O_NOFOLLOW
+                        descriptor = module.os.open(name, flags, dir_fd=parent_fd)
+                        try:
+                            module.os.write(descriptor, b"postwrite corruption")
+                        finally:
+                            module.os.close(descriptor)
+                    finally:
+                        module.os.close(parent_fd)
                 return result
 
-            with mock.patch.object(module, "write_new_file", side_effect=corrupt_artifact):
+            with mock.patch.object(
+                module, "write_new_file_at", side_effect=corrupt_artifact
+            ):
                 with self.assertRaisesRegex(ValueError, "content changed"):
                     module.prepare(
                         "known-root",
@@ -1264,9 +1613,11 @@ class FixtureContractTests(unittest.TestCase):
         self.assertNotIn("cleanup_owned_destination", source)
         self.assertNotIn("cleanup_published_file", source)
         self.assertNotIn(".resolve(strict=True)", source)
+        self.assertNotIn("publish_no_replace", source)
+        self.assertNotIn("os.link", source)
+        self.assertNotIn("tmp-", source)
         self.assertIn("os.mkdir(destination", source)
         self.assertIn("os.O_EXCL", source)
-        self.assertIn("os.link", source)
         self.assertIn("O_NOFOLLOW", source)
         self.assertIn("O_DIRECTORY", source)
         self.assertIn("dir_fd=", source)

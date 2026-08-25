@@ -742,16 +742,30 @@ leave the reservation unready. A held fixture-root directory FD and component-wi
 resolve-then-open window. The source Trace is read once and the same bytes are used
 for hashing, parsing, and authoritative validation through a private snapshot.
 Each Artifact is likewise read once, hashed, and written from the same bytes. The
-Skill tree is enumerated and copied through a held directory FD and rejects any
-symlink traversal. The derived Trace is validated from the exact bytes written by
-the publisher. The bundle remains unready and non-consumable throughout construction.
+Skill tree is snapshotted during FD-based enumeration: every file is read
+immediately and every directory entry, including empty directories, is recorded.
+Later writes use only this Skill snapshot. Symlinks and special files are rejected.
+The derived Trace is validated from the exact bytes written by the publisher. The
+bundle remains unready and non-consumable throughout construction.
+
+After reservation, every bundle mkdir, open, write, reopen, list, hash, fsync, and
+owner-marker unlink is performed relative to the reserved `destination_fd` with
+`dir_fd`/`openat` and no-follow flags. No payload is written through the destination
+path. Before provenance and again before READY publication, `fstat(destination_fd)` and `lstat(destination)`
+must identify the same non-symlink directory dev+ino;
+replacement aborts without READY and the replacement is never touched.
 
 `--provenance-output` and `--ready-output` are required outside the bundle and
-published with no-replace semantics. Each opaque case receives evaluator-only
+published directly to their final names with `O_CREAT|O_EXCL|O_NOFOLLOW`, full
+write, and fsync. There is no temporary-file/hard-link publication or cleanup.
+A partial provenance has no READY; a partial READY fails JSON or digest validation.
+Both remain non-consumable and are never deleted. Each opaque case receives evaluator-only
 `${OPAQUE_CASE_ID}.provenance.json` and `${OPAQUE_CASE_ID}.READY.json`; do not use
 shell redirection or shared filenames. After all bundle bytes are verified, the
-owner marker must be removed; removal failure aborts without READY. The deterministic
-tree digest then covers every remaining Agent-visible file. Provenance is published
+owner marker must be removed through `destination_fd`; removal failure aborts without
+READY. The deterministic directory-and-file tree manifest then covers every remaining Agent-visible
+directory and file, including empty directories, with entry type, exact and NFKC
+normalized relative path, mode, and file content SHA-256. Provenance is published
 first. READY is published last and binds the opaque ID, provenance SHA-256, and
 complete bundle-tree SHA-256. Any extra, removed, or mutated file invalidates READY.
 
@@ -835,3 +849,8 @@ git commit -m "docs(skill): explain and validate root cause analysis"
   Skill bytes, removes the owner marker before hashing, and makes READY bind every
   remaining Agent-visible file. Failed attempts are retained unready and retried
   only with a new opaque ID.
+- **Round 4:** binds all bundle construction and hashing to the reserved
+  `destination_fd`, verifies path/inode identity before both publications,
+  snapshots Skill bytes and directories during enumeration, directly publishes
+  final provenance/READY files, and extends the tree digest to directories and
+  empty-directory renames.

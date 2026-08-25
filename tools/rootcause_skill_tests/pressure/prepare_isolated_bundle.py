@@ -196,11 +196,17 @@ def validate_relative_components(relative, label):
     return relative
 
 
-def open_parent_at(root_fd, relative, label):
+def open_parent_at(root_fd, relative, label, create=False):
     relative = validate_relative_components(relative, label)
     current_fd = os.dup(root_fd)
     try:
         for component in relative.parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current_fd)
+                    os.fsync(current_fd)
+                except FileExistsError:
+                    pass
             next_fd = None
             try:
                 next_fd = os.open(
@@ -260,7 +266,36 @@ def read_regular_file_once(root, relative, label):
         os.close(root_fd)
 
 
-def regular_file_paths_at(root_fd, label):
+def read_named_regular_at(directory_fd, name, label, expected=None):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise ValueError(f"{label} must not be a symlink: {name}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError(f"{label} must be a regular file: {name}")
+        if expected is not None and (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise ValueError(f"{label} changed while being snapshotted: {name}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), metadata
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_tree_at(root_fd, label):
+    directories = []
     files = []
 
     def walk(directory_fd, prefix):
@@ -276,16 +311,28 @@ def regular_file_paths_at(root_fd, label):
             if stat.S_ISDIR(metadata.st_mode):
                 child_fd = os.open(name, directory_open_flags(), dir_fd=directory_fd)
                 try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ):
+                        raise ValueError(
+                            f"{label} directory changed while being snapshotted: {relative}"
+                        )
+                    directories.append(relative)
                     walk(child_fd, relative)
                 finally:
                     os.close(child_fd)
             elif stat.S_ISREG(metadata.st_mode):
-                files.append(relative)
+                payload, _ = read_named_regular_at(
+                    directory_fd, name, label, expected=metadata
+                )
+                files.append((relative, payload))
             else:
                 raise ValueError(f"{label} contains an unsupported entry: {relative}")
 
     walk(root_fd, Path())
-    return files
+    return {"directories": directories, "files": files}
 
 
 def fsync_directory(path):
@@ -322,42 +369,55 @@ def write_new_file(path, payload, mode=0o600):
 
 def write_new_file_at(directory_fd, relative, payload, mode=0o600):
     relative = validate_relative_components(Path(relative), "Published file")
-    if len(relative.parts) != 1:
-        raise ValueError(
-            f"Published file must be directly under its directory: {relative}"
-        )
+    parent_fd, name = open_parent_at(
+        directory_fd, relative, "Published file", create=True
+    )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(relative.name, flags, mode, dir_fd=directory_fd)
     try:
-        write_all(descriptor, payload)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def publish_no_replace(path, payload):
-    temporary = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
-    created = False
-    digest = hashlib.sha256(payload).hexdigest()
-    try:
-        write_new_file(temporary, payload)
-        created = True
-        fsync_directory(path.parent)
+        descriptor = os.open(name, flags, mode, dir_fd=parent_fd)
         try:
-            os.link(temporary, path, follow_symlinks=False)
-        except FileExistsError as error:
-            raise ValueError(f"Handoff output already exists: {path}") from error
-        fsync_directory(path.parent)
+            write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_fd)
     finally:
-        if created or temporary.exists():
+        os.close(parent_fd)
+
+
+def ensure_directory_at(root_fd, relative):
+    relative = validate_relative_components(Path(relative), "Bundle directory")
+    current_fd = os.dup(root_fd)
+    try:
+        for component in relative.parts:
             try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                # The no-replace target, if linked, is already the publication fact.
+                os.mkdir(component, 0o700, dir_fd=current_fd)
+                os.fsync(current_fd)
+            except FileExistsError:
                 pass
-    return digest
+            next_fd = os.open(component, directory_open_flags(), dir_fd=current_fd)
+            metadata = os.fstat(next_fd)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(next_fd)
+                raise ValueError(f"Bundle directory is not a directory: {relative}")
+            os.close(current_fd)
+            current_fd = next_fd
+    finally:
+        os.close(current_fd)
+
+
+def publish_direct_no_replace(path, payload):
+    parent_fd = open_directory_fd(path.parent, "Handoff output parent")
+    try:
+        write_new_file_at(parent_fd, Path(path.name), payload)
+        os.fsync(parent_fd)
+    except FileExistsError as error:
+        raise ValueError(f"Handoff output already exists: {path}") from error
+    finally:
+        os.close(parent_fd)
+    return hashlib.sha256(payload).hexdigest()
 
 
 def reserve_destination(destination, owner_token):
@@ -379,7 +439,24 @@ def reserve_destination(destination, owner_token):
             f"Bundle destination was reserved but owner marker write failed; "
             f"handoff remains unready: {destination}"
         ) from error
-    return destination_fd
+    metadata = os.fstat(destination_fd)
+    return destination_fd, (metadata.st_dev, metadata.st_ino)
+
+
+def assert_reserved_destination(destination, destination_fd, identity):
+    opened = os.fstat(destination_fd)
+    try:
+        named = os.lstat(destination)
+    except OSError as error:
+        raise ValueError("Reserved destination identity is no longer reachable") from error
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or (opened.st_dev, opened.st_ino) != identity
+        or (named.st_dev, named.st_ino) != identity
+    ):
+        raise ValueError("Reserved destination identity no longer matches destination_fd")
 
 
 def remove_owner_marker(destination_fd):
@@ -392,7 +469,7 @@ def remove_owner_marker(destination_fd):
         ) from error
 
 
-def validate_snapshot(_destination, label, payload):
+def validate_snapshot(label, payload):
     with tempfile.TemporaryDirectory(prefix=f"rootcause-{label}-") as directory:
         snapshot = Path(directory) / "trace.json"
         write_new_file(snapshot, payload)
@@ -470,13 +547,6 @@ def declared_artifact_digest(declaration):
     return next(iter(declared))
 
 
-def skill_files(skill_root_fd):
-    files = regular_file_paths_at(skill_root_fd, "Canonical Skill")
-    if not files:
-        raise ValueError("Canonical rootcause-analysis Skill is empty")
-    return files
-
-
 def prompts(trace_path, question):
     common = (
         f"Trace: {trace_path}\n"
@@ -517,20 +587,84 @@ def json_bytes(value):
     ).encode("utf-8")
 
 
+def normalized_manifest_path(relative):
+    return "/".join(unicodedata.normalize("NFKC", part) for part in relative.parts)
+
+
+def bundle_tree_manifest_at(destination_fd):
+    entries = []
+    normalized_paths = {}
+
+    def add_entry(relative, entry):
+        normalized = normalized_manifest_path(relative)
+        previous = normalized_paths.get(normalized)
+        if previous is not None and previous != relative.as_posix():
+            raise ValueError(
+                f"Bundle tree path normalization collision: {previous} and {relative}"
+            )
+        normalized_paths[normalized] = relative.as_posix()
+        entries.append(
+            {
+                "type": entry["type"],
+                "path": relative.as_posix(),
+                "normalized_path": normalized,
+                "mode": entry["mode"],
+                **entry.get("content", {}),
+            }
+        )
+
+    def walk(directory_fd, prefix):
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError as error:
+            raise ValueError(f"Unable to enumerate bundle tree: {prefix}") from error
+        for name in names:
+            relative = prefix / name if prefix.parts else Path(name)
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            mode = f"{stat.S_IMODE(metadata.st_mode):04o}"
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"Bundle tree must not contain symlinks: {relative}")
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(name, directory_open_flags(), dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    ):
+                        raise ValueError(
+                            f"Bundle directory changed while hashing: {relative}"
+                        )
+                    add_entry(relative, {"type": "directory", "mode": mode})
+                    walk(child_fd, relative)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(metadata.st_mode):
+                content, opened = read_named_regular_at(
+                    directory_fd, name, "Bundle tree file", expected=metadata
+                )
+                add_entry(
+                    relative,
+                    {
+                        "type": "file",
+                        "mode": f"{stat.S_IMODE(opened.st_mode):04o}",
+                        "content": {
+                            "size": len(content),
+                            "content_sha256": hashlib.sha256(content).hexdigest(),
+                        },
+                    },
+                )
+            else:
+                raise ValueError(f"Bundle tree has an unsupported entry: {relative}")
+
+    walk(destination_fd, Path())
+    return sorted(entries, key=lambda entry: entry["path"])
+
+
 def bundle_tree_manifest(destination):
     destination_fd = open_directory_fd(destination, "Bundle destination")
     try:
-        entries = []
-        for relative in regular_file_paths_at(destination_fd, "Bundle tree"):
-            content = read_regular_file_at(destination_fd, relative, "Bundle tree file")
-            entries.append(
-                {
-                    "path": relative.as_posix(),
-                    "size": len(content),
-                    "content_sha256": hashlib.sha256(content).hexdigest(),
-                }
-            )
-        return entries
+        return bundle_tree_manifest_at(destination_fd)
     finally:
         os.close(destination_fd)
 
@@ -539,13 +673,20 @@ def bundle_tree_digest(destination):
     return canonical_hash(bundle_tree_manifest(destination))
 
 
+def bundle_tree_digest_at(destination_fd):
+    return canonical_hash(bundle_tree_manifest_at(destination_fd))
+
+
 def verify_ready_handoff(destination, provenance_output, ready_output):
-    destination = Path(destination).resolve(strict=False)
-    provenance_output = Path(provenance_output).resolve(strict=False)
-    ready_output = Path(ready_output).resolve(strict=False)
-    if not ready_output.is_file() or ready_output.is_symlink():
+    destination = Path(destination)
+    provenance_output = Path(provenance_output)
+    ready_output = Path(ready_output)
+    try:
+        ready_bytes = read_regular_file_once(
+            ready_output.parent, Path(ready_output.name), "READY marker"
+        )
+    except (OSError, ValueError) as error:
         raise ValueError("Handoff READY marker is missing or invalid")
-    ready_bytes = read_regular_file_once(ready_output.parent, Path(ready_output.name), "READY marker")
     try:
         ready = json.loads(ready_bytes)
     except json.JSONDecodeError as error:
@@ -555,11 +696,14 @@ def verify_ready_handoff(destination, provenance_output, ready_output):
     opaque_case_id = ready.get("opaque_case_id")
     if opaque_case_id != destination.name or not OPAQUE_CASE_PATTERN.fullmatch(str(opaque_case_id)):
         raise ValueError("Handoff READY marker does not match the opaque destination")
-    if not provenance_output.is_file() or provenance_output.is_symlink():
+    try:
+        provenance_bytes = read_regular_file_once(
+            provenance_output.parent,
+            Path(provenance_output.name),
+            "Evaluator provenance",
+        )
+    except (OSError, ValueError) as error:
         raise ValueError("Handoff provenance is missing or invalid")
-    provenance_bytes = read_regular_file_once(
-        provenance_output.parent, Path(provenance_output.name), "Evaluator provenance"
-    )
     provenance_digest = hashlib.sha256(provenance_bytes).hexdigest()
     if provenance_digest != ready.get("provenance_sha256"):
         raise ValueError("Handoff provenance digest does not match READY")
@@ -618,11 +762,23 @@ def validate_output_paths(destination, provenance_output, ready_output):
     return destination, provenance_output, ready_output
 
 
-def fsync_bundle_directories(destination):
-    directories = [destination]
-    directories.extend(path for path in destination.rglob("*") if path.is_dir())
-    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
-        fsync_directory(directory)
+def fsync_bundle_directories_at(destination_fd):
+    def walk(directory_fd):
+        for name in sorted(os.listdir(directory_fd)):
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(f"Bundle tree must not contain symlinks: {name}")
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd = os.open(name, directory_open_flags(), dir_fd=directory_fd)
+                try:
+                    walk(child_fd)
+                finally:
+                    os.close(child_fd)
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"Bundle tree has an unsupported entry: {name}")
+        os.fsync(directory_fd)
+
+    walk(destination_fd)
 
 
 def verify_artifact_bytes(payload, declaration, expected=None):
@@ -656,7 +812,7 @@ def prepare(
     if destination.name != opaque_case_id:
         raise ValueError("Agent-visible destination basename must equal the opaque case ID")
     owner_token = uuid.uuid4().hex
-    destination_fd = reserve_destination(destination, owner_token)
+    destination_fd, destination_identity = reserve_destination(destination, owner_token)
     context = {
         "opaque_case_id": opaque_case_id,
         "destination": str(destination),
@@ -672,9 +828,7 @@ def prepare(
             source_trace_bytes = read_regular_file_at(
                 source_fd, Path("trace.json"), "Source Trace"
             )
-            source_validation = validate_snapshot(
-                destination, "source-trace", source_trace_bytes
-            )
+            source_validation = validate_snapshot("source-trace", source_trace_bytes)
             trace = json.loads(source_trace_bytes)
             validate_trace_identity_and_integrity(trace, case)
             emit_phase(_phase_hook, "source_validated", context)
@@ -690,52 +844,40 @@ def prepare(
         finally:
             os.close(source_fd)
 
-        canonical_skill = []
         skill_root_fd = open_directory_fd(SKILL_ROOT, "Canonical Skill root")
         try:
-            for relative in skill_files(skill_root_fd):
-                canonical_skill.append(
-                    (
-                        relative,
-                        read_regular_file_at(
-                            skill_root_fd, relative, "Canonical Skill file"
-                        ),
-                    )
-                )
+            canonical_skill = snapshot_tree_at(skill_root_fd, "Canonical Skill")
         finally:
             os.close(skill_root_fd)
+        if not canonical_skill["files"]:
+            raise ValueError("Canonical rootcause-analysis Skill is empty")
+        emit_phase(_phase_hook, "skill_snapshotted", context)
         derived_trace = sanitize_trace_identity(trace, opaque_case_id)
         validate_trace_identity_and_integrity(derived_trace, opaque_case_id)
         derived_bytes = trace_bytes(derived_trace)
         rendered_prompts = prompts(agent_trace_path, questions[case])
 
-        write_new_file(destination / "trace.json", derived_bytes)
-        derived_validation = validate_snapshot(
-            destination, "derived-trace", derived_bytes
-        )
+        write_new_file_at(destination_fd, Path("trace.json"), derived_bytes)
         for _, relative, artifact_bytes, _ in artifacts:
-            artifact_destination = destination / relative
-            artifact_destination.parent.mkdir(parents=True, exist_ok=True)
-            write_new_file(artifact_destination, artifact_bytes)
-        for relative, skill_bytes in canonical_skill:
-            skill_destination = (
-                destination / ".claude" / "skills" / "rootcause-analysis" / relative
-            )
-            skill_destination.parent.mkdir(parents=True, exist_ok=True)
-            write_new_file(skill_destination, skill_bytes)
+            write_new_file_at(destination_fd, relative, artifact_bytes)
+        skill_prefix = Path(".claude/skills/rootcause-analysis")
+        ensure_directory_at(destination_fd, skill_prefix)
+        for relative in canonical_skill["directories"]:
+            ensure_directory_at(destination_fd, skill_prefix / relative)
+        for relative, skill_bytes in canonical_skill["files"]:
+            write_new_file_at(destination_fd, skill_prefix / relative, skill_bytes)
         for name, content in rendered_prompts.items():
-            write_new_file(destination / name, content.encode("utf-8"))
+            write_new_file_at(destination_fd, Path(name), content.encode("utf-8"))
 
-        final_trace_bytes = read_regular_file_once(
-            destination, Path("trace.json"), "Published derived Trace"
+        final_trace_bytes = read_regular_file_at(
+            destination_fd, Path("trace.json"), "Published derived Trace"
         )
         if final_trace_bytes != derived_bytes:
             raise ValueError("Published derived Trace bytes changed after validation")
+        derived_validation = validate_snapshot("derived-trace", final_trace_bytes)
         artifact_provenance = []
         for artifact, relative, artifact_bytes, expected_digest in artifacts:
-            copied_bytes = read_regular_file_once(
-                destination, relative, "Bundle artifact"
-            )
+            copied_bytes = read_regular_file_at(destination_fd, relative, "Bundle artifact")
             if copied_bytes != artifact_bytes:
                 raise ValueError(
                     f"Artifact content changed after write: {artifact.get('artifact_id')}"
@@ -750,10 +892,13 @@ def prepare(
                     "content_sha256": content_sha256,
                 }
             )
-        fsync_bundle_directories(destination)
+        fsync_bundle_directories_at(destination_fd)
+        assert_reserved_destination(
+            destination, destination_fd, destination_identity
+        )
         remove_owner_marker(destination_fd)
+        tree_digest = bundle_tree_digest_at(destination_fd)
         emit_phase(_phase_hook, "bundle_written", context)
-        tree_digest = bundle_tree_digest(destination)
         provenance = {
             "source_fixture": case,
             "opaque_case_id": opaque_case_id,
@@ -773,7 +918,12 @@ def prepare(
             },
         }
         provenance_bytes = json_bytes(provenance)
-        provenance_digest = publish_no_replace(provenance_output, provenance_bytes)
+        assert_reserved_destination(
+            destination, destination_fd, destination_identity
+        )
+        provenance_digest = publish_direct_no_replace(
+            provenance_output, provenance_bytes
+        )
         emit_phase(_phase_hook, "provenance_published", context)
 
         ready = {
@@ -782,7 +932,10 @@ def prepare(
             "provenance_sha256": provenance_digest,
             "bundle_tree_sha256": tree_digest,
         }
-        publish_no_replace(ready_output, json_bytes(ready))
+        assert_reserved_destination(
+            destination, destination_fd, destination_identity
+        )
+        publish_direct_no_replace(ready_output, json_bytes(ready))
     finally:
         os.close(destination_fd)
     emit_phase(_phase_hook, "ready_published", context)

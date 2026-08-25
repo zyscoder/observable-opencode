@@ -49,6 +49,11 @@ publication. Exact round-3 evidence is maintained in
 `2026-08-25-rootcause-analysis-skill-bundle-handoff-fix-round-3.md`: 127 tests
 and seven fresh full-tree READY handoffs passed.
 
+Bundle handoff fix round 4 further binds every Agent-visible operation to the
+reserved destination FD, snapshots Skill bytes during enumeration, hashes empty
+directories, and directly publishes final provenance/READY files. Its exact
+verification evidence is maintained in the dedicated round-4 report.
+
 The following round-2 result remains historical: 121 tests passed with no skips. Python
 compilation and the official Skill validator passed; the validator reported
 `Skill is valid!`. A fresh seven-bundle audit under
