@@ -90,7 +90,7 @@ export OPENCODE_CONFIG_CONTENT='{
 export OPENCODE_DISABLE_MODELS_FETCH=1
 export OPENCODE_CASE_TRACE=1
 export OPENCODE_CASE_ID="benchmark-case-001"
-export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+export OPENCODE_CASE_TRACE_DIR="/tmp/evo-bench/traces"
 
 opencode /data/repos/target-project
 ```
@@ -336,7 +336,7 @@ export APIKEY="<api-key>"
 
 export OPENCODE_DISABLE_MODELS_FETCH=1
 export OPENCODE_CASE_TRACE=1
-export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+export OPENCODE_CASE_TRACE_DIR="/tmp/evo-bench/traces"
 # 可选：为一次 benchmark case 指定稳定名称
 export OPENCODE_CASE_ID="benchmark-case-001"
 
@@ -353,9 +353,9 @@ opencode /data/repos/target-project
   session: ses_...
   case: benchmark-case-001
   status: completed
-  directory: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4
-  json: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.json
-  partial: /data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/partial/latest.json
+  directory: /tmp/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4
+  json: /tmp/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/trace.json
+  partial: /tmp/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4/partial/latest.json
 ```
 
 在 TUI 中，正常退出、`Ctrl-C`/`SIGINT` 和 `SIGTERM` 都走同一条 parent/worker 生命周期：
@@ -400,7 +400,7 @@ Harness 的实际交互行为。HTTP 路径与 TUI 使用同一套原生配置�
 ```bash
 export OPENCODE_SERVER_PASSWORD="<server-password>"
 export OPENCODE_CASE_TRACE=1
-export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+export OPENCODE_CASE_TRACE_DIR="/tmp/evo-bench/traces"
 export OPENCODE_CASE_ID="benchmark-case-001"
 
 opencode serve --hostname 127.0.0.1 --port 4096
@@ -467,7 +467,7 @@ Observable OpenCode 与 Trace 工具承担不同职责：
 `./observable-trace-darwin-arm64`，其他平台使用 Release 中相同平台后缀的资产。
 
 ```bash
-TRACE_ROOT="/data/evo-bench/traces"
+TRACE_ROOT="/tmp/evo-bench/traces"
 TRACE_BIN="./observable-trace-linux-x64"
 
 # 1. 找到 logical case。每个有效 case 目录的根部都有 session.json。
@@ -519,7 +519,7 @@ partial: <logical-case-dir>/partial/latest.json
 process-level 记录可能产生带 session/digest 后缀的 sibling directory：
 
 ```text
-/data/evo-bench/traces/
+/tmp/evo-bench/traces/
 ├── benchmark-case-001/
 │   ├── session.json                    # 一个 logical root
 │   └── segments/
@@ -634,7 +634,7 @@ usage: observable-trace render <case-dir-or-file> [--output <path>]
 
 ```bash
 "$TRACE_BIN" render "$CASE_DIR"
-"$TRACE_BIN" render "$CASE_DIR" --output "/data/evo-bench/reports/case-001.html"
+"$TRACE_BIN" render "$CASE_DIR" --output "/tmp/evo-bench/reports/case-001.html"
 ```
 
 不指定 `--output` 时，默认生成 `<case-dir>/trace.html`。`render` 还接受 root
@@ -672,7 +672,7 @@ valid journal prefix 恢复可用事实。
 
 ```bash
 export OPENCODE_CASE_TRACE=1
-export OPENCODE_CASE_TRACE_DIR="/data/evo-bench/traces"
+export OPENCODE_CASE_TRACE_DIR="/tmp/evo-bench/traces"
 export OPENCODE_CASE_ID="benchmark-case-001"
 
 opencode -s "<session-id>" /data/repos/target-project
@@ -836,14 +836,14 @@ Question: 为什么用户明确要求通过构建 Skill 使用 Yocto，但实际
 
 ```text
 使用当前 runtime 的上述方式加载 rootcause-analysis Skill。
-Trace: /data/evo-bench/traces/case-001/trace.json
+Trace: /tmp/evo-bench/traces/case-001/trace.json
 Question: 为什么用户要求使用构建 Skill 完成 Yocto 验证，但 Agent 最终只执行了 GCC 局部编译并声称验证完成？
-Output prefix: /data/evo-bench/rootcause-results/case-001/analysis
+Output prefix: /tmp/evo-bench/rootcause-results/case-001/analysis
 Analyzed project root: /workspace/product-repo
 ```
 
 输出前缀必须位于 Trace bundle 和被分析项目之外。Skill 会生成
-`/data/evo-bench/rootcause-results/case-001/analysis.json` 与同名 `.md`；无法可靠确认目录边界时，
+`/tmp/evo-bench/rootcause-results/case-001/analysis.json` 与同名 `.md`；无法可靠确认目录边界时，
 它会停止写入并请求补充信息，而不是猜测路径。
 
 ### 诊断 Trace 查询
@@ -998,7 +998,7 @@ export CLAUDE_MODEL="deepseek-v4-flash"
 export CLAUDE_TIMEOUT_SECONDS=3600
 
 # 必须是 finalize 后、根部直接包含 trace.json 的实际 logical case 目录。
-export CASE_DIR="/data/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4"
+export CASE_DIR="/tmp/evo-bench/traces/benchmark-case-001--ses_...--a1b2c3d4"
 test -s "$CASE_DIR/trace.json"
 
 PYTHONPATH="$OBSERVABLE_OPENCODE_HOME/tools/trace_attribution" \
@@ -1007,7 +1007,7 @@ python -m trace_attribution \
   --fusion-mode retrieval-global \
   --trace "$CASE_DIR/trace.json" \
   --question "为什么本次修改编译失败？" \
-  --out /data/evo-bench/attribution/benchmark-case-001.json \
+  --out /tmp/evo-bench/attribution/benchmark-case-001.json \
   --judge-timeout-sec 3600 \
   --judge-max-tokens 16000
 ```
@@ -1108,7 +1108,7 @@ Trace 引用收窄起点；若不知道节点，保持自动候选检索即可�
 
 ### CLI 产物
 
-若 `--out` 为 `/data/evo-bench/attribution/case-001.json`，归因过程中会同时维护结果、
+若 `--out` 为 `/tmp/evo-bench/attribution/case-001.json`，归因过程中会同时维护结果、
 message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程重启后，可使用相同
 参数继续分析，避免重复消耗已经完成的 Judge 请求。分析正常结束后，CLI 会依次打印
 `--out` 指定的 JSON 路径和面向人工阅读的 Markdown 解释路径。
@@ -1116,7 +1116,7 @@ message lineage、Judge cache 和递归 checkpoint。发生网络中断或进程
 以上述 `--out` 为例，默认会得到：
 
 ```text
-/data/evo-bench/attribution/
+/tmp/evo-bench/attribution/
 ├── case-001.json                       # 最终结构化归因报告
 ├── case-001.explanation.md             # 完整缺陷描述和逐节点产生过程
 ├── case-001.message-lineage.json       # 离线重建的消息、上下文和数据流
@@ -1151,7 +1151,7 @@ Trace、问题、模型、endpoint、预算、输出路径和 checkpoint 路径�
 直接阅读完整的缺陷产生过程：
 
 ```bash
-cat /data/evo-bench/attribution/case-001.explanation.md
+cat /tmp/evo-bench/attribution/case-001.explanation.md
 ```
 
 Markdown 默认采用工程复盘式表达：先明确本次追踪的偏差、期望动作顺序、实际动作顺序和首次
@@ -1169,7 +1169,7 @@ JSON 和 Markdown 报告；变化仅包括 `defect_evolution/v2` 新增偏差对
 先指定报告路径：
 
 ```bash
-REPORT=/data/evo-bench/attribution/case-001.json
+REPORT=/tmp/evo-bench/attribution/case-001.json
 ```
 
 查看面向用户的核心结论：
@@ -1251,8 +1251,8 @@ from trace_attribution import AttributionOptions, AttributionRequest, analyze
 
 result = analyze(
     AttributionRequest(
-        trace_path=Path("/data/evo-bench/traces/benchmark-case-001/trace.json"),
-        output_path=Path("/data/evo-bench/attribution/benchmark-case-001.json"),
+        trace_path=Path("/tmp/evo-bench/traces/benchmark-case-001/trace.json"),
+        output_path=Path("/tmp/evo-bench/attribution/benchmark-case-001.json"),
         question="为什么本次修改编译失败？",
         options=AttributionOptions(
             engine="recursive-agentic",
