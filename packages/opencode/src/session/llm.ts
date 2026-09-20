@@ -375,6 +375,17 @@ const live: Layer.Layer<
         type: "ai-sdk" as const,
         result: streamText({
           onError(error) {
+            recordLatestTrace(trace, {
+              operation: "llm.call",
+              component: "llm",
+              data: {
+                phase: "provider_error",
+                provider_id: input.model.providerID,
+                model_id: input.model.id,
+                message: String(error),
+              },
+            })
+            trace?.close("failed")
             bridge.fork(
               Effect.logError("stream error", {
                 providerID: input.model.providerID,
