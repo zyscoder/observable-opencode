@@ -78,6 +78,7 @@ type Input = {
   readonly entries: readonly Entry[]
   readonly model: Model
   readonly request: LLMRequest
+  readonly observe?: (operation: string, data: Record<string, unknown>) => void
 }
 
 const estimate = (value: unknown) => Token.estimate(JSON.stringify(value))
@@ -175,6 +176,13 @@ export const buildPrompt = (input: { readonly previousSummary?: string; readonly
 
 export const make = (dependencies: Dependencies) => {
   const config = settings(dependencies.config)
+  const observe = (input: Input, operation: string, data: Record<string, unknown>) => {
+    try {
+      input.observe?.(operation, data)
+    } catch {
+      // Observability is a passive sidecar and must not affect compaction.
+    }
+  }
   const compactAfterOverflow = Effect.fn("SessionCompaction.compactAfterOverflow")(function* (input: Input) {
     const context = input.model.route.defaults.limits?.context
     if (context === undefined || context <= 0) return false
@@ -188,6 +196,16 @@ export const make = (dependencies: Dependencies) => {
     })
     const summaryOutput = Math.min(output || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS)
     if (Token.estimate(summaryPrompt) > context - summaryOutput) return false
+    observe(input, "context.compaction", {
+      phase: "started",
+      algorithm: "anchored_summary",
+      entry_count: input.entries.length,
+      selected_head_characters: selected.head.length,
+      selected_recent_characters: selected.recent.length,
+      previous_summary_present: previousSummary?.type === "compaction",
+      summary_prompt_characters: summaryPrompt.length,
+      summary_output_budget: summaryOutput,
+    })
     const messageID = SessionMessage.ID.create()
     yield* dependencies.events.publish(SessionEvent.Compaction.Started, {
       sessionID: input.sessionID,
@@ -218,7 +236,15 @@ export const make = (dependencies: Dependencies) => {
         Effect.catchTag("LLM.Error", () => Effect.succeed(false)),
       )
     const summary = chunks.join("")
-    if (!summarized || failed || !summary.trim()) return false
+    if (!summarized || failed || !summary.trim()) {
+      observe(input, "context.compaction", {
+        phase: "failed",
+        algorithm: "anchored_summary",
+        failed,
+        summary_characters: summary.length,
+      })
+      return false
+    }
     yield* dependencies.events.publish(SessionEvent.Compaction.Ended, {
       sessionID: input.sessionID,
       messageID,
@@ -226,6 +252,12 @@ export const make = (dependencies: Dependencies) => {
       reason: "auto",
       text: summary,
       recent: selected.recent,
+    })
+    observe(input, "context.compaction", {
+      phase: "completed",
+      algorithm: "anchored_summary",
+      summary_characters: summary.length,
+      recent_characters: selected.recent.length,
     })
     return true
   })

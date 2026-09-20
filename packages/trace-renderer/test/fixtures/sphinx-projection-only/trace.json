@@ -1,0 +1,68 @@
+{
+  "case_id": "sphinx-recursive-minimal",
+  "trace_schema_version": "causal-ir-fixture/v1",
+  "records": [
+    {
+      "record_id": "prompt",
+      "component": "prompt",
+      "event_type": "prompt.assembly",
+      "data": {
+        "text": "Implement the listed interfaces using the repository."
+      }
+    },
+    {
+      "record_id": "decision",
+      "component": "processor",
+      "event_type": "decision",
+      "source_refs": ["record:prompt"],
+      "data": {
+        "decision_type": "reasoning_block",
+        "rationale": "Now I have a comprehensive understanding. Implement the five listed methods.",
+        "chosen_action": "implement_listed_methods"
+      }
+    },
+    {
+      "record_id": "change",
+      "component": "tool",
+      "event_type": "change",
+      "source_refs": ["record:decision"],
+      "data": {
+        "files": ["sphinx/domains/c/_parser.py"],
+        "summary": "Implemented listed methods without parse_namespace_object."
+      }
+    },
+    {
+      "record_id": "verification",
+      "component": "verification",
+      "event_type": "verification",
+      "source_refs": ["record:change"],
+      "data": {
+        "status": "failed",
+        "failure": "parse_namespace_object is absent"
+      }
+    },
+    {
+      "record_id": "timeout",
+      "component": "harness",
+      "event_type": "run.interruption",
+      "source_refs": ["record:verification"],
+      "data": {
+        "reason": "headers timeout"
+      }
+    },
+    {
+      "record_id": "observed",
+      "component": "evaluation",
+      "event_type": "case.observed_defect",
+      "source_refs": ["record:verification", "record:timeout"],
+      "data": {
+        "failure_type": "missing_parse_namespace_object_contract",
+        "expected": "The compatibility method exists.",
+        "actual": "The method is absent.",
+        "mechanism": "The delivered parser does not satisfy the compatibility contract.",
+        "scope": "parser_contract_recovery"
+      }
+    }
+  ],
+  "dataflow_edges": []
+}

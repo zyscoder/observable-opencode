@@ -1,0 +1,494 @@
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import {
+  CausalIRJournalValidationError,
+  projectProvenanceTrace,
+  replayFinalizedCausalIRTrace,
+  replayCausalIRJournal,
+  replayCausalIRTrace,
+  validateCausalIRJournal,
+  type CausalIREdge,
+  type CausalIRNode,
+  type CausalIRRef,
+  type CausalIRStoreSnapshot,
+  type CausalIRTraceDocument,
+  type ProvenanceProjectionInput,
+  type ProvenanceTraceProjection,
+} from "@opencode-ai/core/observability/causal-ir"
+import { materializeTrace } from "@opencode-ai/core/observability/trace-materializer"
+import {
+  openTraceFileNoFollow,
+  readTraceSessionManifest,
+  traceSessionLockRootForCase,
+  TRACE_MANIFEST_LOCK_KEY,
+  withTraceSessionLock,
+} from "@opencode-ai/core/observability/trace-segment"
+
+export type CompatibilityTraceProjection = {
+  trace_version: string
+  manifest: { case_id: string; run_id?: string }
+  records: unknown[]
+  dataflow_edges: unknown[]
+  artifacts: unknown[]
+  metrics: {
+    spans: number
+    events: number
+    records: number
+    dataflow_edges: number
+    artifacts: number
+    token_usage: Record<string, unknown>
+    trace_health: { issues: unknown[] }
+  }
+}
+
+export type RenderableTrace = ProvenanceTraceProjection | CompatibilityTraceProjection
+
+export type RenderableTraceLoadResult = {
+  trace: RenderableTrace
+  caseDir: string
+  source: "trace.json" | "records.jsonl"
+  incomplete: boolean
+}
+
+type TraceSource = RenderableTraceLoadResult["source"]
+
+type CompatibilityTraceDocument = Record<string, unknown> & {
+  trace_schema_version: string
+  case_id: string
+  run_id?: string
+  records: unknown[]
+  dataflow_edges: unknown[]
+  artifacts?: unknown[]
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return Boolean(input) && typeof input === "object" && !Array.isArray(input)
+}
+
+function isNonEmptyString(input: unknown): input is string {
+  return typeof input === "string" && input.length > 0
+}
+
+function isReference(input: unknown): input is CausalIRRef {
+  return (
+    isRecord(input) &&
+    ["node", "artifact", "raw_event", "external"].includes(input.ref_type as string) &&
+    isNonEmptyString(input.ref_id)
+  )
+}
+
+function isReferenceList(input: unknown) {
+  return Array.isArray(input) && input.every(isReference)
+}
+
+function isCausalIRNode(input: unknown): input is CausalIRNode {
+  if (!isRecord(input) || !isRecord(input.order) || !isRecord(input.scope) || !isRecord(input.payload)) return false
+  return (
+    isNonEmptyString(input.node_id) &&
+    isNonEmptyString(input.kind) &&
+    isNonEmptyString(input.schema_version) &&
+    ["observed", "deterministic_derived", "offline_derived"].includes(input.origin as string) &&
+    isNonEmptyString(input.component) &&
+    typeof input.order.sequence === "number" &&
+    Number.isFinite(input.order.sequence) &&
+    isNonEmptyString(input.order.timestamp) &&
+    typeof input.order.time_ms === "number" &&
+    Number.isFinite(input.order.time_ms) &&
+    isNonEmptyString(input.scope.run_id) &&
+    isNonEmptyString(input.scope.case_id) &&
+    isReferenceList(input.input_refs) &&
+    isReferenceList(input.output_refs) &&
+    isReferenceList(input.source_refs) &&
+    Array.isArray(input.source_locations) &&
+    Array.isArray(input.artifact_refs) &&
+    input.artifact_refs.every((item) => typeof item === "string") &&
+    Array.isArray(input.aliases) &&
+    input.aliases.every((item) => typeof item === "string") &&
+    (input.derivation === null || isRecord(input.derivation)) &&
+    isRecord(input.integrity) &&
+    isNonEmptyString(input.integrity.payload_hash)
+  )
+}
+
+function isCausalIREdge(input: unknown): input is CausalIREdge {
+  return (
+    isRecord(input) &&
+    isNonEmptyString(input.edge_id) &&
+    isReference(input.from) &&
+    isReference(input.to) &&
+    isNonEmptyString(input.original_relation) &&
+    isNonEmptyString(input.normalized_relation) &&
+    ["confirmed", "content_matched", "temporal_advisory"].includes(input.evidence_tier as string) &&
+    typeof input.eligible_for_attribution === "boolean" &&
+    isNonEmptyString(input.derivation_method) &&
+    isReferenceList(input.evidence_refs)
+  )
+}
+
+function isArtifact(input: unknown) {
+  return (
+    isRecord(input) &&
+    isNonEmptyString(input.artifact_id) &&
+    isNonEmptyString(input.hash) &&
+    isNonEmptyString(input.path)
+  )
+}
+
+function isDiagnostic(input: unknown) {
+  return isRecord(input) && isNonEmptyString(input.diagnostic_id)
+}
+
+function isManifest(input: unknown) {
+  return isRecord(input) && isNonEmptyString(input.case_id) && isNonEmptyString(input.run_id)
+}
+
+function isMetrics(input: unknown) {
+  return (
+    isRecord(input) &&
+    isRecord(input.token_usage) &&
+    isRecord(input.trace_health) &&
+    Array.isArray(input.trace_health.issues)
+  )
+}
+
+function isCausalIRTraceDocument(input: unknown): input is CausalIRTraceDocument {
+  if (!isRecord(input) || !isManifest(input.manifest) || !isMetrics(input.metrics) || !isRecord(input.journal))
+    return false
+  return (
+    isNonEmptyString(input.trace_version) &&
+    input.causal_ir_version === "1.0" &&
+    Array.isArray(input.nodes) &&
+    input.nodes.every(isCausalIRNode) &&
+    Array.isArray(input.edges) &&
+    input.edges.every(isCausalIREdge) &&
+    Array.isArray(input.artifacts) &&
+    input.artifacts.every(isArtifact) &&
+    Array.isArray(input.diagnostics) &&
+    input.diagnostics.every(isDiagnostic) &&
+    Array.isArray(input.records) &&
+    Array.isArray(input.dataflow_edges) &&
+    isRecord(input.compatibility) &&
+    input.journal.schema_version === "1.0" &&
+    ((input.journal.format === "causal-ir-jsonl" && input.journal.path === "records.jsonl") ||
+      (input.journal.format === "causal-ir-segmented-jsonl" &&
+        input.journal.path === "session.json" &&
+        Array.isArray(input.journal.segments))) &&
+    input.journal.summary_scope === "entries_before_lifecycle_entry" &&
+    typeof input.journal.entry_count === "number" &&
+    typeof input.journal.last_sequence === "number" &&
+    typeof input.journal.poisoned === "boolean"
+  )
+}
+
+function materializeReadOnly(caseDir: string) {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-trace-renderer-"))
+  try {
+    const materialized = materializeTrace({ caseDir, outputDir: temporary })
+    return {
+      file: materialized.traceFile,
+      caseDir,
+      source: "trace.json" as const,
+      cleanup: () => fs.rmSync(temporary, { recursive: true, force: true }),
+    }
+  } catch (error) {
+    fs.rmSync(temporary, { recursive: true, force: true })
+    throw error
+  }
+}
+
+function rootTraceIsCurrent(caseDir: string, traceFile: string) {
+  const sessionFile = path.join(caseDir, "session.json")
+  const session = readTraceSessionManifest(sessionFile)
+  if (!session) return true
+  const trace = readJSON(traceFile)
+  return isRecord(trace) && isRecord(trace.manifest) && trace.manifest.session_generation === session.generation
+}
+
+function selectSource(input: string): { file: string; caseDir: string; source: TraceSource; cleanup?: () => void } {
+  const target = path.resolve(input)
+  const stats = fs.statSync(target)
+  if (stats.isDirectory()) {
+    const trace = path.join(target, "trace.json")
+    if (fs.existsSync(trace)) {
+      if (rootTraceIsCurrent(target, trace)) return { file: trace, caseDir: target, source: "trace.json" }
+      return materializeReadOnly(target)
+    }
+    const session = path.join(target, "session.json")
+    if (fs.existsSync(session)) return materializeReadOnly(target)
+    const journal = path.join(target, "records.jsonl")
+    if (fs.existsSync(journal)) return { file: journal, caseDir: target, source: "records.jsonl" }
+    throw new Error(`${target}: expected session.json, trace.json, or records.jsonl`)
+  }
+  if (!stats.isFile())
+    throw new Error(`${target}: expected a case directory, session.json, trace.json, or records.jsonl`)
+
+  if (path.basename(target) === "session.json") {
+    const caseDir = path.dirname(target)
+    const trace = path.join(caseDir, "trace.json")
+    if (fs.existsSync(trace) && rootTraceIsCurrent(caseDir, trace))
+      return { file: trace, caseDir, source: "trace.json" }
+    return materializeReadOnly(caseDir)
+  }
+  const source = path.basename(target) as TraceSource
+  if (source !== "trace.json" && source !== "records.jsonl")
+    throw new Error(`${target}: expected a case directory, session.json, trace.json, or records.jsonl`)
+  if (source === "trace.json" && !rootTraceIsCurrent(path.dirname(target), target))
+    return materializeReadOnly(path.dirname(target))
+  return { file: target, caseDir: path.dirname(target), source }
+}
+
+function protectedRendererReadPath(file: string) {
+  const stats = fs.lstatSync(file)
+  if (!stats.isSymbolicLink()) return file
+  const caseDir = path.dirname(file)
+  const physicalCaseDir = fs.realpathSync(caseDir)
+  const physical = fs.realpathSync(file)
+  const relative = path.relative(physicalCaseDir, physical)
+  const insideDerivedGeneration =
+    relative.startsWith(`.derived${path.sep}generations${path.sep}`) &&
+    relative.split(path.sep).length >= 4 &&
+    path.basename(file) === "trace.json"
+  if (!insideDerivedGeneration)
+    throw new Error(`${file}: protected renderer source is a symbolic link that escapes its case directory`)
+  return physical
+}
+
+function readProtectedFile(file: string) {
+  const source = protectedRendererReadPath(file)
+  const handle = openTraceFileNoFollow(source)
+  try {
+    return fs.readFileSync(handle, "utf8")
+  } finally {
+    fs.closeSync(handle)
+  }
+}
+
+function readJSON(file: string) {
+  try {
+    return JSON.parse(readProtectedFile(file)) as unknown
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`${file}: invalid JSON (${detail})`)
+  }
+}
+
+function project(
+  snapshot: CausalIRStoreSnapshot,
+  traceVersion: string,
+  manifest: Record<string, unknown>,
+  metrics: Record<string, unknown>,
+) {
+  return projectProvenanceTrace(snapshot, {
+    traceVersion,
+    manifest: manifest as ProvenanceProjectionInput["manifest"],
+    metrics: metrics as ProvenanceProjectionInput["metrics"],
+  })
+}
+
+function projectDocument(document: CausalIRTraceDocument) {
+  return project(
+    {
+      version: document.causal_ir_version,
+      runID: document.manifest.run_id as string,
+      caseID: document.manifest.case_id as string,
+      nodes: document.nodes,
+      edges: document.edges,
+      artifacts: document.artifacts,
+      diagnostics: document.diagnostics,
+    },
+    document.trace_version,
+    document.manifest,
+    document.metrics,
+  )
+}
+
+function isCompatibilityTraceDocument(input: unknown): input is CompatibilityTraceDocument {
+  return (
+    isRecord(input) &&
+    isNonEmptyString(input.trace_schema_version) &&
+    isNonEmptyString(input.case_id) &&
+    Array.isArray(input.records) &&
+    Array.isArray(input.dataflow_edges) &&
+    (input.artifacts === undefined || Array.isArray(input.artifacts))
+  )
+}
+
+function projectCompatibilityDocument(document: CompatibilityTraceDocument): CompatibilityTraceProjection {
+  const artifacts = Array.isArray(document.artifacts) ? document.artifacts : []
+  const manifest: CompatibilityTraceProjection["manifest"] = { case_id: document.case_id }
+  if (isNonEmptyString(document.run_id)) manifest.run_id = document.run_id
+  return {
+    trace_version: document.trace_schema_version as string,
+    manifest,
+    records: document.records,
+    dataflow_edges: document.dataflow_edges,
+    artifacts,
+    metrics: {
+      spans: 0,
+      events: document.records.length,
+      records: document.records.length,
+      dataflow_edges: document.dataflow_edges.length,
+      artifacts: artifacts.length,
+      token_usage: {},
+      trace_health: { issues: [] },
+    },
+  }
+}
+
+function readJournal(file: string) {
+  const content = readProtectedFile(file)
+  const lines = content.split(/\r?\n/)
+  if (lines.at(-1) === "") lines.pop()
+  if (!lines.length) throw new Error(`${file}:1: journal is empty`)
+
+  return lines.map((line, index) => {
+    const lineNumber = index + 1
+    if (!line.trim()) throw new Error(`${file}:${lineNumber}: expected a JSON object`)
+    try {
+      const entry = JSON.parse(line) as unknown
+      if (!isRecord(entry)) throw new Error("expected a JSON object")
+      return entry
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`${file}:${lineNumber}: invalid JSONL entry (${detail})`)
+    }
+  })
+}
+
+function recoveryManifest(
+  snapshot: CausalIRStoreSnapshot,
+  trace: CausalIRTraceDocument | undefined,
+): Record<string, unknown> {
+  const manifest = trace?.manifest && isManifest(trace.manifest) ? trace.manifest : {}
+  return {
+    ...manifest,
+    trace_version: typeof manifest.trace_version === "string" ? manifest.trace_version : "6.0",
+    case_id:
+      typeof manifest.case_id === "string" && manifest.case_id ? manifest.case_id : snapshot.caseID || "recovered-case",
+    run_id:
+      typeof manifest.run_id === "string" && manifest.run_id ? manifest.run_id : snapshot.runID || "recovered-run",
+    status: "error",
+    server_status: "error",
+    process_status: "error",
+    case_status: "error",
+    recovery_status: "incomplete_journal_replay",
+  }
+}
+
+function recoveryMetrics(trace: CausalIRTraceDocument | undefined): Record<string, unknown> {
+  const metrics = trace?.metrics && isMetrics(trace.metrics) ? trace.metrics : {}
+  return {
+    ...metrics,
+    token_usage: isRecord(metrics.token_usage) ? metrics.token_usage : {},
+    trace_health:
+      isRecord(metrics.trace_health) && Array.isArray(metrics.trace_health.issues)
+        ? metrics.trace_health
+        : { issues: [] },
+  }
+}
+
+function loadRenderableTraceSnapshot(input: string): RenderableTraceLoadResult {
+  const selected = selectSource(input)
+  try {
+    if (selected.source === "trace.json") {
+      const document = readJSON(selected.file)
+      if (isCompatibilityTraceDocument(document)) {
+        return {
+          trace: projectCompatibilityDocument(document),
+          caseDir: selected.caseDir,
+          source: selected.source,
+          incomplete: false,
+        }
+      }
+      if (!isCausalIRTraceDocument(document)) throw new Error(`${selected.file}: invalid Causal IR trace document`)
+      return {
+        trace: projectDocument(document),
+        caseDir: selected.caseDir,
+        source: selected.source,
+        incomplete:
+          document.manifest.recovery_status === "incomplete_journal_replay" ||
+          document.manifest.historical_interruptions === true ||
+          isRecord(document.manifest.session_recovery),
+      }
+    }
+
+    const journal = readJournal(selected.file)
+    try {
+      validateCausalIRJournal(journal, { requireInitialRunNode: true })
+    } catch (error) {
+      if (error instanceof CausalIRJournalValidationError) {
+        throw new Error(`${selected.file}:${error.line}: ${error.message}`)
+      }
+      throw error
+    }
+    const replayedTrace = replayCausalIRTrace(journal)
+    const finalizedTrace = replayFinalizedCausalIRTrace(journal)
+    if (finalizedTrace) {
+      return {
+        trace: projectDocument(finalizedTrace),
+        caseDir: selected.caseDir,
+        source: selected.source,
+        incomplete: false,
+      }
+    }
+
+    const snapshot = replayCausalIRJournal(journal)
+    return {
+      trace: project(
+        snapshot,
+        replayedTrace?.trace_version ?? "6.0",
+        recoveryManifest(snapshot, replayedTrace),
+        recoveryMetrics(replayedTrace),
+      ),
+      caseDir: selected.caseDir,
+      source: selected.source,
+      incomplete: true,
+    }
+  } finally {
+    selected.cleanup?.()
+  }
+}
+
+function flatTraceRevision(caseDir: string) {
+  return ["trace.json", "records.jsonl"].map((relative) => {
+    const file = path.join(caseDir, relative)
+    try {
+      const stats = fs.statSync(file, { bigint: true })
+      return [relative, String(stats.dev), String(stats.ino), String(stats.size), String(stats.mtimeNs)]
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [relative, "missing"]
+      throw error
+    }
+  })
+}
+
+function loadRevision(caseDir: string) {
+  const session = readTraceSessionManifest(path.join(caseDir, "session.json"))
+  if (session) return JSON.stringify(["session", session.session_id ?? null, session.generation])
+  return JSON.stringify(["flat", flatTraceRevision(caseDir)])
+}
+
+export function loadRenderableTrace(input: string): RenderableTraceLoadResult {
+  const target = path.resolve(input)
+  if (fs.lstatSync(target).isSymbolicLink()) protectedRendererReadPath(target)
+  const stats = fs.statSync(target)
+  const caseDir = stats.isDirectory() ? target : path.dirname(target)
+  const locked = <T>(operation: () => T) =>
+    withTraceSessionLock(traceSessionLockRootForCase(caseDir), TRACE_MANIFEST_LOCK_KEY, operation)
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const before = locked(() => loadRevision(caseDir))
+    let result: RenderableTraceLoadResult | undefined
+    let failure: unknown
+    try {
+      result = loadRenderableTraceSnapshot(target)
+    } catch (error) {
+      failure = error
+    }
+    const after = locked(() => loadRevision(caseDir))
+    if (after !== before) continue
+    if (failure) throw failure
+    return result!
+  }
+  throw new Error(`${caseDir}: trace session changed repeatedly while loading`)
+}

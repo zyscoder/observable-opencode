@@ -1,0 +1,172 @@
+{
+  "trace_version": "6.0",
+  "manifest": {
+    "trace_version": "6.0",
+    "case_id": "task6-sigterm-emergency-recovery",
+    "run_id": "fixture-task6-sigterm-emergency-recovery",
+    "started_at": "2026-08-11T00:00:00.000Z",
+    "ended_at": "2026-08-11T00:00:00.015Z",
+    "duration_ms": 15,
+    "status": "cancelled",
+    "server_status": "cancelled",
+    "process_status": "cancelled",
+    "server_shutdown_reason": "process_signal",
+    "shutdown_signal": "SIGTERM",
+    "shutdown_disposition": "interrupted_before_case_completion",
+    "case_status": "cancelled",
+    "collection_mode": "passive_sidecar",
+    "behavior_impact": "none",
+    "input": {
+      "prompt": "emergency terminal recovery"
+    },
+    "environment": {},
+    "token_usage": {},
+    "result": {
+      "reason": "SIGTERM",
+      "signal": "SIGTERM",
+      "trace_flush": "process_signal"
+    },
+    "files": {
+      "trace": "trace.json",
+      "legacy_trace": "legacy-trace.json",
+      "provenance_trace": "provenance-trace.json",
+      "records": "records.jsonl",
+      "raw_events": "raw-events.jsonl",
+      "partial_latest": "partial/latest.json"
+    }
+  },
+  "records": [
+    {
+      "record_id": "node_1_7dce1383",
+      "component": "run",
+      "event_type": "run.start",
+      "timestamp": "2026-08-11T00:00:00.003Z",
+      "time_ms": 3,
+      "title": "task6-sigterm-emergency-recovery",
+      "status": "cancelled",
+      "source_locations": [],
+      "artifact_refs": [],
+      "data": {
+        "case_id": "task6-sigterm-emergency-recovery",
+        "run_id": "fixture-task6-sigterm-emergency-recovery",
+        "input": {
+          "prompt": "emergency terminal recovery"
+        },
+        "finalized_status": "finalized_without_close",
+        "finalized_reason": "trace_cancelled",
+        "finalized_at": "2026-08-11T00:00:00.039Z",
+        "original_status": "running"
+      }
+    },
+    {
+      "record_id": "persisted_before_emergency",
+      "component": "runtime",
+      "event_type": "execution.observation",
+      "timestamp": "2026-08-11T00:00:00.005Z",
+      "time_ms": 5,
+      "title": "persisted before emergency",
+      "source_locations": [],
+      "artifact_refs": [],
+      "data": {}
+    },
+    {
+      "record_id": "process_signal_d1a8873e",
+      "component": "runtime",
+      "event_type": "process.signal",
+      "timestamp": "2026-08-11T00:00:00.008Z",
+      "time_ms": 8,
+      "title": "process received SIGTERM",
+      "status": "cancelled",
+      "source_locations": [],
+      "artifact_refs": [],
+      "data": {
+        "signal": "SIGTERM",
+        "shutdown_disposition": "interrupted_before_case_completion",
+        "server_shutdown_reason": "process_signal",
+        "observation_source": "process_signal_handler",
+        "sender_identity_available": false,
+        "recording_mode": "passive_posthoc",
+        "agent_feedback": "none"
+      }
+    },
+    {
+      "record_id": "case_failed_d437c522",
+      "component": "run",
+      "event_type": "case.failed",
+      "timestamp": "2026-08-11T00:00:00.009Z",
+      "time_ms": 9,
+      "title": "case failed",
+      "status": "cancelled",
+      "source_refs": ["node:node_1_7dce1383", "node:process_signal_d1a8873e"],
+      "source_locations": [],
+      "artifact_refs": [],
+      "data": {
+        "run_id": "fixture-task6-sigterm-emergency-recovery",
+        "case_id": "task6-sigterm-emergency-recovery",
+        "server_status": "cancelled",
+        "process_status": "cancelled",
+        "server_shutdown_reason": "process_signal",
+        "shutdown_signal": "SIGTERM",
+        "shutdown_disposition": "interrupted_before_case_completion",
+        "case_status": "cancelled",
+        "result": {
+          "reason": "SIGTERM",
+          "signal": "SIGTERM",
+          "trace_flush": "process_signal"
+        },
+        "token_usage": {},
+        "finalized_open_record_refs": ["node:node_1_7dce1383"],
+        "finalized_open_record_count": 1
+      }
+    }
+  ],
+  "dataflow_edges": [
+    {
+      "edge_id": "cedge_1_763d7119",
+      "from": { "type": "node", "id": "process_signal_d1a8873e" },
+      "to": { "type": "node", "id": "case_failed_d437c522" },
+      "relation": "failed_before",
+      "eligible_for_attribution": true,
+      "label": "External process signal interrupted the case before completion",
+      "metadata": {
+        "causal_role": "external_interruption",
+        "sender_identity_available": false,
+        "original_relation": "failed_before",
+        "normalized_relation": "failed_before",
+        "evidence_tier": "confirmed",
+        "eligible_for_attribution": true,
+        "derivation_method": "explicit_relation"
+      }
+    },
+    {
+      "edge_id": "cedge_2_41a9fbfe",
+      "from": { "type": "node", "id": "node_1_7dce1383" },
+      "to": { "type": "node", "id": "case_failed_d437c522" },
+      "relation": "failed_before",
+      "eligible_for_attribution": true,
+      "label": "Running semantic record was finalized before case failure",
+      "metadata": {
+        "original_relation": "failed_before",
+        "normalized_relation": "failed_before",
+        "evidence_tier": "confirmed",
+        "eligible_for_attribution": true,
+        "derivation_method": "explicit_relation"
+      }
+    }
+  ],
+  "artifacts": [],
+  "metrics": {
+    "spans": 0,
+    "events": 0,
+    "records": 4,
+    "dataflow_edges": 2,
+    "artifacts": 0,
+    "token_usage": {},
+    "stream_summary": {},
+    "trace_health": {
+      "execution_observations": 1,
+      "compaction_quality_flags": {},
+      "issues": []
+    }
+  }
+}

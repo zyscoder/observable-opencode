@@ -37,6 +37,7 @@ import { SessionRevert } from "./session/revert"
 import { Revert } from "@opencode-ai/schema/revert"
 import { FSUtil } from "./fs-util"
 import { SessionDurable } from "@opencode-ai/schema/durable-event-manifest"
+import { recordPromptTrace } from "./observability/latest-trace"
 
 export const RevertState = Revert.State
 export type RevertState = Revert.State
@@ -379,6 +380,12 @@ const layer = Layer.effect(
             )
             if (!SessionInput.equivalent(admitted, expected))
               return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
+            recordPromptTrace({
+              sessionID: input.sessionID,
+              messageID,
+              delivery,
+              prompt,
+            })
             if (input.resume !== false) yield* execution.wake(admitted.sessionID)
             return admitted
           }),

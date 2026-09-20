@@ -1,6 +1,10 @@
 import fs from "node:fs"
 import path from "node:path"
 import { Global } from "@opencode-ai/core/global"
+import { CausalIRRuntimeStore } from "./causal-ir-runtime-store"
+import type { CausalEdgeLike } from "./causal-ir"
+import { isFormalRecordType } from "./trace-semantic-contract"
+import type { TraceComponent } from "./case-trace"
 import { openTraceSegment, type TraceSegment, type TraceSegmentStatus } from "./trace-segment"
 import { writeTraceArtifact, type TraceArtifactInput, type TraceArtifactRef } from "./trace-artifact"
 
@@ -23,19 +27,51 @@ export type TraceHandle = {
   readonly caseDir: string
   readonly segmentDir: string
   readonly sessionFile: string
+  readonly runID: string
   record(record: TraceRuntimeRecord): void
+  edge(edge: CausalEdgeLike): void
   recordArtifact(input: Omit<TraceArtifactInput, "segmentDir">): TraceArtifactRef | undefined
   close(status: Exclude<TraceSegmentStatus, "running" | "interrupted_unfinalized">): void
 }
 
-function appendRecord(segment: TraceSegment, record: TraceRuntimeRecord) {
+function appendJournalEntry(segment: TraceSegment, entry: unknown) {
   const recordsFile = path.join(segment.logicalRoot, segment.descriptor.records)
-  const payload = {
-    sequence: Date.now(),
-    recorded_at: new Date().toISOString(),
-    ...record,
+  fs.appendFileSync(recordsFile, `${JSON.stringify(entry)}\n`, "utf8")
+}
+
+const TRACE_COMPONENTS = new Set<TraceComponent>([
+  "run",
+  "runtime",
+  "prompt",
+  "context",
+  "llm",
+  "processor",
+  "tool",
+  "skill",
+  "task",
+  "mcp",
+  "plugin",
+  "result",
+  "evaluation",
+  "trace",
+])
+
+function componentOf(input: unknown): TraceComponent {
+  return typeof input === "string" && TRACE_COMPONENTS.has(input as TraceComponent)
+    ? (input as TraceComponent)
+    : "runtime"
+}
+
+function dataOf(record: TraceRuntimeRecord, caseID: string, runID: string) {
+  const data = record.data && typeof record.data === "object" && !Array.isArray(record.data) ? record.data : {}
+  const { operation: _operation, component: _component, node_id: _nodeID, data: _data, ...metadata } = record
+  return {
+    ...data,
+    ...metadata,
+    case_id: caseID,
+    run_id: runID,
+    original_operation: record.operation,
   }
-  fs.appendFileSync(recordsFile, `${JSON.stringify(payload)}\n`, "utf8")
 }
 
 function safe<T>(fallback: T, fn: () => T) {
@@ -53,23 +89,85 @@ function open(input: TraceRuntimeOpenInput): TraceHandle {
     sessionID: input.sessionID,
     runID: input.runID,
   })
+  const store = new CausalIRRuntimeStore({
+    indexPath: path.join(segment.logicalRoot, segment.descriptor.index),
+    caseID: input.caseID,
+    runID: input.runID,
+    append: (entry) => appendJournalEntry(segment, entry),
+  })
+  safe(undefined, () => {
+    const timestamp = new Date().toISOString()
+    store.createNode({
+      node_id: `run_${input.runID}`,
+      kind: "run.start",
+      component: "run",
+      timestamp,
+      time_ms: Date.now(),
+      data: {
+        run_id: input.runID,
+        case_id: input.caseID,
+        ...(input.sessionID ? { session_id: input.sessionID } : {}),
+      },
+    })
+  })
   let closed = false
+  let nodeSequence = 0
   return {
     caseDir: segment.logicalRoot,
     segmentDir: segment.segmentDir,
     sessionFile: segment.sessionFile,
+    runID: input.runID,
     record(record) {
       if (closed) return
-      safe(undefined, () => appendRecord(segment, record))
+      nodeSequence += 1
+      safe(undefined, () => {
+        const nodeID = record.node_id ?? `observation_${input.runID}_${nodeSequence}`
+        const kind = isFormalRecordType(record.operation) ? record.operation : "execution.observation"
+        store.createNode({
+          node_id: nodeID,
+          kind,
+          component: componentOf(record.component),
+          timestamp: new Date().toISOString(),
+          time_ms: Date.now(),
+          title: typeof record.name === "string" ? record.name : undefined,
+          data: dataOf(record, input.caseID, input.runID),
+        })
+      })
+    },
+    edge(edge) {
+      if (closed) return
+      safe(undefined, () => store.createEdge(edge))
     },
     recordArtifact(input) {
       if (closed) return undefined
-      return safe(undefined, () => writeTraceArtifact({ ...input, segmentDir: segment.segmentDir }))
+      return safe(undefined, () => {
+        const artifact = writeTraceArtifact({ ...input, segmentDir: segment.segmentDir })
+        store.createArtifact({
+          artifact_id: artifact.artifact_id,
+          hash: artifact.sha256,
+          path: path.relative(segment.logicalRoot, path.join(segment.segmentDir, artifact.path)).split(path.sep).join("/"),
+          media_type: artifact.media_type,
+          bytes: artifact.bytes,
+          preview: artifact.preview,
+        })
+        return artifact
+      })
     },
     close(status) {
       if (closed) return
       closed = true
       safe(undefined, () => {
+        store.closeRuntime({
+          format: "runtime_close",
+          status: status === "completed" ? "success" : status === "cancelled" ? "cancelled" : "error",
+          closed_at: new Date().toISOString(),
+          manifest: {
+            case_id: input.caseID,
+            run_id: input.runID,
+            session_id: input.sessionID,
+          },
+        })
+        store.close()
         segment.finalize(status)
       })
     },

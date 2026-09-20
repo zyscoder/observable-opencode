@@ -39,6 +39,7 @@ import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
 import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
+import { openLatestTrace, recordLatestEdge, recordLatestTrace, recordLLMEvent } from "../../observability/latest-trace"
 
 /**
  * Runs one durable coding-agent Session until it settles.
@@ -201,6 +202,7 @@ const layer = Layer.effect(
       const context = entries.map((entry) => entry.message)
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
       const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
+      const modelMessages = toLLMMessages(context, model)
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
       const request = LLM.request({
         model,
@@ -215,12 +217,115 @@ const layer = Layer.effect(
         system: [agent.info?.system, system.baseline]
           .filter((part): part is string => part !== undefined && part.length > 0)
           .map(SystemPart.make),
-        messages: [...toLLMMessages(context, model), ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])],
+        messages: [...modelMessages, ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])],
         tools: toolMaterialization?.definitions ?? [],
         toolChoice: isLastStep ? "none" : undefined,
       })
-      if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
+      const trace = openLatestTrace({
+        sessionID: session.id,
+        step: currentStep,
+        agent: agent.id,
+        model: `${model.provider}/${model.id}`,
+      })
+      const requestArtifact = trace?.recordArtifact({
+        value: {
+          system: request.system,
+          messages: request.messages,
+          tools: request.tools,
+        },
+        mediaType: "application/json",
+        previewLimit: 4_000,
+      })
+      recordLatestTrace(trace, {
+        operation: "context.transform",
+        component: "context",
+        node_id: trace ? `context_transform_${trace.runID}` : undefined,
+        data: {
+          session_id: session.id,
+          source_message_count: context.length,
+          source_message_types: context.map((message) => message.type),
+          target_message_count: modelMessages.length,
+          target_message_types: modelMessages.map((message) => message.role),
+          transformation: "SessionMessage.toLLMMessages",
+          ...(requestArtifact ? { prepared_request_artifact_id: requestArtifact.artifact_id } : {}),
+        },
+      })
+      recordLatestTrace(trace, {
+        operation: "context.pack",
+        component: "context",
+        node_id: trace ? `context_pack_${trace.runID}` : undefined,
+        data: {
+          session_id: session.id,
+          entry_count: entries.length,
+          baseline_sequence: system.baselineSeq,
+          system_parts: request.system.length,
+          message_count: request.messages.length,
+          tool_count: request.tools.length,
+          tool_names: request.tools.map((tool) => tool.name),
+          max_step: isLastStep,
+          ...(requestArtifact ? { prepared_request_artifact_id: requestArtifact.artifact_id } : {}),
+          system_context_characters: system.baseline.length,
+          skill_catalog_visible: system.baseline.includes("<available_skills>"),
+        },
+      })
+      recordLatestTrace(trace, {
+        operation: "prompt.assembly",
+        component: "prompt",
+        node_id: trace ? `prompt_assembly_${trace.runID}` : undefined,
+        data: {
+          session_id: session.id,
+          message_count: request.messages.length,
+          system_parts: request.system.length,
+          tool_count: request.tools.length,
+          tool_names: request.tools.map((tool) => tool.name),
+          agent: agent.id,
+          model: `${model.provider}/${model.id}`,
+        },
+      })
+      recordLatestTrace(trace, {
+        operation: "context.compaction_check",
+        component: "context",
+        node_id: trace ? `compaction_check_${trace.runID}` : undefined,
+        data: { session_id: session.id, entry_count: entries.length },
+      })
+      const compacted = yield* compaction.compactIfNeeded({
+        sessionID: session.id,
+        entries,
+        model,
+        request,
+        observe: (operation, data) => recordLatestTrace(trace, { operation, component: "context", data }),
+      })
+      if (compacted) {
+        trace?.close("completed")
         return yield* Effect.die(continueAfterCompaction(currentStep))
+      }
+      recordLatestTrace(trace, {
+        operation: "llm.call",
+        component: "llm",
+        node_id: trace ? `llm_call_${trace.runID}` : undefined,
+        data: {
+          session_id: session.id,
+          provider: model.provider,
+          model: model.id,
+          message_count: request.messages.length,
+          tool_count: request.tools.length,
+          tool_names: request.tools.map((tool) => tool.name),
+        },
+      })
+      if (trace) {
+        recordLatestEdge(trace, {
+          edge_id: `context_to_llm_${trace.runID}`,
+          from: { type: "node", id: `context_pack_${trace.runID}` },
+          to: { type: "node", id: `llm_call_${trace.runID}` },
+          relation: "prompted",
+        })
+        recordLatestEdge(trace, {
+          edge_id: `transform_to_prompt_${trace.runID}`,
+          from: { type: "node", id: `context_transform_${trace.runID}` },
+          to: { type: "node", id: `prompt_assembly_${trace.runID}` },
+          relation: "transformed_to",
+        })
+      }
       const startSnapshot = yield* snapshots.capture()
       const publisher = createLLMEventPublisher(events, {
         sessionID: session.id,
@@ -240,6 +345,7 @@ const layer = Layer.effect(
         Stream.runForEach((event) =>
           Effect.gen(function* () {
             if (overflowFailure || publisher.hasProviderError()) return
+            recordLLMEvent(trace, event)
             if (LLMEvent.is.providerError(event)) {
               if (isContextOverflowFailure(event) && !publisher.hasAssistantStarted()) {
                 overflowFailure = event
@@ -286,13 +392,21 @@ const layer = Layer.effect(
           const stream = yield* restore(providerStream).pipe(Effect.exit)
           const failure =
             stream._tag === "Failure" ? Option.getOrUndefined(Cause.findErrorOption(stream.cause)) : undefined
-          if (
-            recoverOverflow &&
-            !publisher.hasAssistantStarted() &&
-            isContextOverflowFailure(overflowFailure ?? failure) &&
-            (yield* restore(recoverOverflow({ sessionID: session.id, entries, model, request })))
-          )
-            return yield* Effect.die(continueAfterOverflowCompaction(currentStep))
+          if (recoverOverflow && !publisher.hasAssistantStarted() && isContextOverflowFailure(overflowFailure ?? failure)) {
+            const recovered = yield* restore(
+              recoverOverflow({
+                sessionID: session.id,
+                entries,
+                model,
+                request,
+                observe: (operation, data) => recordLatestTrace(trace, { operation, component: "context", data }),
+              }),
+            )
+            if (recovered) {
+              trace?.close("completed")
+              return yield* Effect.die(continueAfterOverflowCompaction(currentStep))
+            }
+          }
           if (overflowFailure) yield* publish(overflowFailure)
           const llmFailure = failure instanceof LLMError ? failure : undefined
           if (llmFailure && !publisher.hasProviderError()) {
@@ -304,6 +418,7 @@ const layer = Layer.effect(
           if (settled._tag === "Failure" && isUserDeclined(settled.cause)) {
             yield* FiberSet.clear(toolFibers)
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
+            trace?.close("cancelled")
             return yield* Effect.interrupt
           }
           if (
@@ -346,6 +461,9 @@ const layer = Layer.effect(
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
           if (stream._tag === "Success" && !publisher.hasProviderError())
             yield* withPublication(publisher.failUnsettledTools("Provider did not return a tool result", true))
+          if (stream._tag === "Failure" || publisher.hasProviderError()) trace?.close("failed")
+          else if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause)) trace?.close("cancelled")
+          else trace?.close("completed")
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)
