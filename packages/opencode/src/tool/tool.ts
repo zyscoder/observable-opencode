@@ -7,6 +7,7 @@ import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
+import { openLatestTrace, recordLatestEdge, recordLatestTrace } from "@opencode-ai/core/observability/latest-trace"
 
 interface Metadata {
   [key: string]: any
@@ -117,6 +118,30 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           "message.id": ctx.messageID,
           ...(ctx.callID ? { "tool.call_id": ctx.callID } : {}),
         }
+        const trace = openLatestTrace({
+          sessionID: ctx.sessionID,
+          step: Date.now(),
+          agent: ctx.agent,
+        })
+        const traceRunID = trace?.runID ?? ctx.sessionID
+        const inputArtifact = trace?.recordArtifact({
+          value: args,
+          mediaType: "application/json",
+          previewLimit: 4_000,
+        })
+        recordLatestTrace(trace, {
+          operation: "tool.call",
+          component: id === "skill" ? "skill" : id === "task" ? "task" : id.startsWith("mcp") ? "mcp" : "tool",
+          node_id: `tool_exec_${traceRunID}`,
+          data: {
+            tool: id,
+            call_id: ctx.callID,
+            phase: "execution",
+            selection_phase: "runtime_dispatch",
+            input_shape: args && typeof args === "object" ? Object.keys(args as object) : typeof args,
+            ...(inputArtifact ? { input_artifact_id: inputArtifact.artifact_id } : {}),
+          },
+        })
         return Effect.gen(function* () {
           const decoded = yield* decode(args).pipe(
             Effect.mapError(
@@ -133,7 +158,7 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           }
           const agent = yield* agents.get(ctx.agent)
           const truncated = yield* truncate.output(result.output, {}, agent)
-          return {
+          const finalResult = {
             ...result,
             output: truncated.content,
             metadata: {
@@ -142,7 +167,53 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               ...(truncated.truncated && { outputPath: truncated.outputPath }),
             },
           }
-        }).pipe(Effect.orDie, Effect.withSpan("Tool.execute", { attributes: attrs }))
+          const outputArtifact = trace?.recordArtifact({
+            value: finalResult.output,
+            mediaType: "text/plain",
+            previewLimit: 4_000,
+          })
+          const metadataArtifact = trace?.recordArtifact({
+            value: finalResult.metadata,
+            mediaType: "application/json",
+            previewLimit: 4_000,
+          })
+          recordLatestTrace(trace, {
+            operation: "tool.result",
+            component: id === "skill" ? "skill" : id === "task" ? "task" : id.startsWith("mcp") ? "mcp" : "tool",
+            node_id: `tool_exec_result_${traceRunID}`,
+            data: {
+              tool: id,
+              call_id: ctx.callID,
+              title: finalResult.title,
+              truncated: finalResult.metadata.truncated === true,
+              ...(outputArtifact ? { result_artifact_id: outputArtifact.artifact_id } : {}),
+              ...(metadataArtifact ? { metadata_artifact_id: metadataArtifact.artifact_id } : {}),
+            },
+          })
+          recordLatestEdge(trace, {
+            edge_id: `tool_exec_result_for_${traceRunID}`,
+            from: { type: "node", id: `tool_exec_${traceRunID}` },
+            to: { type: "node", id: `tool_exec_result_${traceRunID}` },
+            relation: "returned_by",
+            label: `${id} execution returned a result`,
+          })
+          trace?.close("completed")
+          return finalResult
+        }).pipe(
+          Effect.tapError((error) =>
+            Effect.sync(() =>
+              recordLatestTrace(trace, {
+                operation: "tool.error",
+                component: id === "skill" ? "skill" : id === "task" ? "task" : id.startsWith("mcp") ? "mcp" : "tool",
+                node_id: `tool_exec_error_${traceRunID}`,
+                data: { tool: id, call_id: ctx.callID, message: String(error) },
+              }),
+            ),
+          ),
+          Effect.orDie,
+          Effect.withSpan("Tool.execute", { attributes: attrs }),
+          Effect.ensuring(Effect.sync(() => trace?.close("failed"))),
+        )
       }
       return toolInfo
     })

@@ -22,6 +22,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import { openLatestTrace, recordLatestTrace } from "@opencode-ai/core/observability/latest-trace"
 
 export const Event = SessionCompactionEvent
 
@@ -369,6 +370,43 @@ const layer = Layer.effect(
         cfg,
         model,
       })
+      const trace = openLatestTrace({
+        sessionID: input.sessionID,
+        step: Date.now(),
+        agent: "compaction",
+        model: `${model.providerID}/${model.id}`,
+        parentSessionID: undefined,
+      })
+      const traceRunID = trace?.runID ?? input.sessionID
+      const selectedArtifact = trace?.recordArtifact({
+        value: {
+          history_message_count: history.length,
+          selected_head_count: selected.head.length,
+          selected_tail_start_id: selected.tail_start_id,
+          previous_summary: previousSummary,
+          algorithm: "turn_tail_selection",
+          preserve_recent_tokens: preserveRecentBudget({ cfg, model }),
+          auto: input.auto,
+          overflow: input.overflow === true,
+        },
+        mediaType: "application/json",
+        previewLimit: 4_000,
+      })
+      recordLatestTrace(trace, {
+        operation: "context.compaction",
+        component: "context",
+        node_id: `compaction_select_${traceRunID}`,
+        data: {
+          phase: "selected",
+          algorithm: "turn_tail_selection",
+          history_message_count: history.length,
+          selected_head_count: selected.head.length,
+          selected_tail_start_id: selected.tail_start_id,
+          previous_summary_present: Boolean(previousSummary),
+          preserve_recent_tokens: preserveRecentBudget({ cfg, model }),
+          ...(selectedArtifact ? { selection_artifact_id: selectedArtifact.artifact_id } : {}),
+        },
+      })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
@@ -389,6 +427,23 @@ const layer = Layer.effect(
         ]
           .filter(Boolean)
           .join("\n\n")
+      const promptArtifact = trace?.recordArtifact({
+        value: nextPrompt,
+        mediaType: "text/plain",
+        previewLimit: 4_000,
+      })
+      recordLatestTrace(trace, {
+        operation: "context.transform",
+        component: "context",
+        node_id: `compaction_prompt_${traceRunID}`,
+        data: {
+          phase: "summary_prompt",
+          algorithm: "anchored_summary",
+          conversation_message_count: msgs.length,
+          prompt_characters: nextPrompt.length,
+          ...(promptArtifact ? { prompt_artifact_id: promptArtifact.artifact_id } : {}),
+        },
+      })
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
@@ -455,6 +510,7 @@ const layer = Layer.effect(
         }).toObject()
         processor.message.finish = "error"
         yield* session.updateMessage(processor.message)
+        trace?.close("failed")
         return "stop"
       }
 
@@ -549,10 +605,14 @@ const layer = Layer.effect(
         }
       }
 
-      if (processor.message.error) return "stop"
+      if (processor.message.error) {
+        trace?.close("failed")
+        return "stop"
+      }
       if (result === "continue") {
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
       }
+      trace?.close("completed")
       return result
     })
 

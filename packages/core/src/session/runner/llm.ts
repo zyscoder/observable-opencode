@@ -226,6 +226,7 @@ const layer = Layer.effect(
         step: currentStep,
         agent: agent.id,
         model: `${model.provider}/${model.id}`,
+        parentSessionID: session.parentID,
       })
       const requestArtifact = trace?.recordArtifact({
         value: {

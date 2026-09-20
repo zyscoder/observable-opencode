@@ -29,6 +29,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { openLatestTrace, recordLatestEdge, recordLatestTrace, recordLLMEvent } from "@opencode-ai/core/observability/latest-trace"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -110,6 +111,100 @@ const live: Layer.Layer<
         plugin,
         flags,
         isWorkflow,
+      })
+
+      // The default latest-version session still routes through this V1
+      // service. Trace this boundary as a passive sidecar so request
+      // preparation and the emitted LLM events are visible without changing
+      // the request or execution path.
+      const trace = openLatestTrace({
+        sessionID: input.sessionID,
+        step: Date.now(),
+        agent: input.agent.name,
+        model: `${input.model.providerID}/${input.model.id}`,
+        parentSessionID: input.parentSessionID,
+      })
+      const requestArtifact = trace?.recordArtifact({
+        value: {
+          system: prepared.system,
+          messages: prepared.messages,
+          tools: Object.keys(prepared.tools),
+          tool_choice: input.toolChoice,
+          model: { provider_id: input.model.providerID, model_id: input.model.id },
+        },
+        mediaType: "application/json",
+        previewLimit: 4_000,
+      })
+      const traceRunID = trace?.runID ?? input.sessionID
+      recordLatestTrace(trace, {
+        operation: "context.transform",
+        component: "context",
+        node_id: `context_transform_${traceRunID}`,
+        data: {
+          session_id: input.sessionID,
+          source_message_count: input.messages.length,
+          prepared_message_count: prepared.messages.length,
+          transformation: "LLMRequestPrep.prepare",
+          ...(requestArtifact ? { request_artifact_id: requestArtifact.artifact_id } : {}),
+        },
+      })
+      recordLatestTrace(trace, {
+        operation: "context.pack",
+        component: "context",
+        node_id: `context_pack_${traceRunID}`,
+        data: {
+          system_count: prepared.system.length,
+          message_count: prepared.messages.length,
+          tool_count: Object.keys(prepared.tools).length,
+          tool_names: Object.keys(prepared.tools),
+          small: input.small === true,
+          ...(requestArtifact ? { request_artifact_id: requestArtifact.artifact_id } : {}),
+        },
+      })
+      recordLatestTrace(trace, {
+        operation: "prompt.assembly",
+        component: "prompt",
+        node_id: `prompt_assembly_${traceRunID}`,
+        data: {
+          system_count: prepared.system.length,
+          message_count: prepared.messages.length,
+          tool_names: Object.keys(prepared.tools),
+          agent: input.agent.name,
+        },
+      })
+      recordLatestTrace(trace, {
+        operation: "llm.call",
+        component: "llm",
+        node_id: `llm_call_${traceRunID}`,
+        data: {
+          provider_id: input.model.providerID,
+          model_id: input.model.id,
+          system_count: prepared.system.length,
+          message_count: prepared.messages.length,
+          tool_names: Object.keys(prepared.tools),
+          runtime: flags.experimentalNativeLlm ? "native_or_ai_sdk" : "ai_sdk",
+        },
+      })
+      recordLatestEdge(trace, {
+        edge_id: `context_transform_to_pack_${traceRunID}`,
+        from: { type: "node", id: `context_transform_${traceRunID}` },
+        to: { type: "node", id: `context_pack_${traceRunID}` },
+        relation: "transformed_to",
+        label: "prepared messages entered the packed context",
+      })
+      recordLatestEdge(trace, {
+        edge_id: `prompt_assembly_to_llm_${traceRunID}`,
+        from: { type: "node", id: `prompt_assembly_${traceRunID}` },
+        to: { type: "node", id: `llm_call_${traceRunID}` },
+        relation: "assembled_for",
+        label: "assembled prompt metadata accompanied the model call",
+      })
+      recordLatestEdge(trace, {
+        edge_id: `context_pack_to_llm_${traceRunID}`,
+        from: { type: "node", id: `context_pack_${traceRunID}` },
+        to: { type: "node", id: `llm_call_${traceRunID}` },
+        relation: "prompted",
+        label: "prepared context was sent to the model",
       })
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
@@ -249,6 +344,7 @@ const live: Layer.Layer<
           return {
             type: "native" as const,
             stream: native.stream,
+            trace,
           }
         }
         yield* Effect.logInfo("llm runtime selected", {
@@ -335,6 +431,24 @@ const live: Layer.Layer<
                       input.model,
                       prepared.messageTransformOptions,
                     )
+                    recordLatestTrace(trace, {
+                      operation: "context.transform",
+                      component: "context",
+                      node_id: `provider_transform_${traceRunID}`,
+                      data: {
+                        transformation: "ProviderTransform.message",
+                        provider_id: input.model.providerID,
+                        model_id: input.model.id,
+                        prompt_type: typeof args.params.prompt,
+                      },
+                    })
+                    recordLatestEdge(trace, {
+                      edge_id: `provider_transform_to_llm_${traceRunID}`,
+                      from: { type: "node", id: `provider_transform_${traceRunID}` },
+                      to: { type: "node", id: `llm_call_${traceRunID}` },
+                      relation: "transformed_to",
+                      label: "provider-specific request transformation",
+                    })
                   }
                   return args.params
                 },
@@ -351,6 +465,7 @@ const live: Layer.Layer<
             },
           },
         }),
+        trace,
       }
     })
 
@@ -365,7 +480,12 @@ const live: Layer.Layer<
 
             const result = yield* run({ ...input, abort: ctrl.signal })
 
-            if (result.type === "native") return result.stream
+            if (result.type === "native") {
+              return result.stream.pipe(
+                Stream.tap((event) => Effect.sync(() => recordLLMEvent(result.trace, event))),
+                Stream.ensuring(Effect.sync(() => result.trace?.close("completed"))),
+              )
+            }
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
@@ -375,6 +495,8 @@ const live: Layer.Layer<
             ).pipe(
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
+              Stream.tap((event) => Effect.sync(() => recordLLMEvent(result.trace, event))),
+              Stream.ensuring(Effect.sync(() => result.trace?.close("completed"))),
             )
           }),
         ),

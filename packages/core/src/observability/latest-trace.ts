@@ -31,7 +31,13 @@ function toolComponent(name: string) {
   return "tool" as const
 }
 
-export function openLatestTrace(input: { sessionID: string; step: number; agent?: string; model?: string }) {
+export function openLatestTrace(input: {
+  sessionID: string
+  step: number
+  agent?: string
+  model?: string
+  parentSessionID?: string
+}) {
   if (!enabled()) return undefined
   const caseID = process.env.OPENCODE_CASE_ID || `session-${input.sessionID}`
   const runID = `${input.sessionID}-${Date.now()}-${input.step}-${randomUUID().slice(0, 8)}`
@@ -50,6 +56,7 @@ export function openLatestTrace(input: { sessionID: string; step: number; agent?
         step: input.step,
         ...(input.agent ? { agent: input.agent } : {}),
         ...(input.model ? { model: input.model } : {}),
+        ...(input.parentSessionID ? { parent_session_id: input.parentSessionID } : {}),
       },
     })
     return trace

@@ -56,6 +56,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { recordPromptTrace } from "@opencode-ai/core/observability/latest-trace"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1055,6 +1056,19 @@ const layer = Layer.effect(
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
+      recordPromptTrace({
+        sessionID: input.sessionID,
+        messageID: message.info.id,
+        delivery: "v1.session.prompt",
+        prompt: {
+          agent: input.agent,
+          model: input.model,
+          no_reply: input.noReply === true,
+          part_types: message.parts.map((part) => part.type),
+          part_count: message.parts.length,
+          parts: message.parts,
+        },
+      })
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []

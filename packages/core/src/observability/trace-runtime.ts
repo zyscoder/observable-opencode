@@ -34,6 +34,33 @@ export type TraceHandle = {
   close(status: Exclude<TraceSegmentStatus, "running" | "interrupted_unfinalized">): void
 }
 
+const activeHandles = new Set<TraceHandle>()
+const signalHandlers = new Map<NodeJS.Signals, () => void>()
+
+function uninstallSignalHandlers() {
+  for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler)
+  signalHandlers.clear()
+}
+
+function installSignalHandlers() {
+  if (signalHandlers.size > 0) return
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    const handler = () => {
+      const hasOtherHandlers = process.listenerCount(signal) > 1
+      for (const trace of [...activeHandles]) trace.close("cancelled")
+      uninstallSignalHandlers()
+      if (hasOtherHandlers) return
+      try {
+        process.kill(process.pid, signal)
+      } catch {
+        // The original signal has already completed process shutdown.
+      }
+    }
+    signalHandlers.set(signal, handler)
+    process.once(signal, handler)
+  }
+}
+
 function appendJournalEntry(segment: TraceSegment, entry: unknown) {
   const recordsFile = path.join(segment.logicalRoot, segment.descriptor.records)
   fs.appendFileSync(recordsFile, `${JSON.stringify(entry)}\n`, "utf8")
@@ -112,7 +139,7 @@ function open(input: TraceRuntimeOpenInput): TraceHandle {
   })
   let closed = false
   let nodeSequence = 0
-  return {
+  const handle: TraceHandle = {
     caseDir: segment.logicalRoot,
     segmentDir: segment.segmentDir,
     sessionFile: segment.sessionFile,
@@ -156,6 +183,8 @@ function open(input: TraceRuntimeOpenInput): TraceHandle {
     close(status) {
       if (closed) return
       closed = true
+      activeHandles.delete(handle)
+      if (activeHandles.size === 0) uninstallSignalHandlers()
       safe(undefined, () => {
         store.closeRuntime({
           format: "runtime_close",
@@ -172,6 +201,9 @@ function open(input: TraceRuntimeOpenInput): TraceHandle {
       })
     },
   }
+  activeHandles.add(handle)
+  installSignalHandlers()
+  return handle
 }
 
 export const TraceRuntime = { open }
