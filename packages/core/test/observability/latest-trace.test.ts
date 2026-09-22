@@ -4,7 +4,15 @@ import os from "node:os"
 import path from "node:path"
 import { LLMEvent } from "@opencode-ai/llm"
 import { materializeTrace } from "@opencode-ai/core/observability/trace-materializer"
-import { openLatestTrace, recordLatestTrace, recordLLMEvent, recordPromptTrace } from "@opencode-ai/core/observability/latest-trace"
+import {
+  activeLatestTrace,
+  closeLatestTrace,
+  openLatestTrace,
+  recordLatestTrace,
+  recordLLMEvent,
+  recordPromptTrace,
+  recordSessionTrace,
+} from "@opencode-ai/core/observability/latest-trace"
 
 const roots: string[] = []
 
@@ -54,7 +62,7 @@ test("records tool provenance and a resolvable call-to-result edge", async () =>
       result: { type: "text", value: "skill content" },
     }),
   )
-  trace.close("completed")
+  closeLatestTrace("ses_latest", trace, "completed")
 
   const result = materializeTrace({ caseDir: path.join(root, "case_latest_tool") })
   const document = JSON.parse(await fs.readFile(result.traceFile, "utf8"))
@@ -62,4 +70,40 @@ test("records tool provenance and a resolvable call-to-result edge", async () =>
     expect.arrayContaining([expect.objectContaining({ normalized_relation: "returned_by" })]),
   )
   expect(document.diagnostics).toEqual([])
+})
+
+test("routes semantic records to nested tool traces and resumes the parent after close", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-latest-nested-trace-"))
+  roots.push(root)
+  process.env.OPENCODE_CASE_TRACE = "1"
+  process.env.OPENCODE_CASE_ID = "case_latest_nested"
+  process.env.OPENCODE_CASE_TRACE_DIR = root
+
+  const parent = openLatestTrace({ sessionID: "ses_nested", step: 1 })!
+  const child = openLatestTrace({ sessionID: "ses_nested", step: 2 })!
+  expect(activeLatestTrace("ses_nested")?.runID).toBe(child.runID)
+  recordSessionTrace("ses_nested", {
+    operation: "skill.load",
+    component: "skill",
+    node_id: "nested_skill_load",
+    data: { name: "build" },
+  })
+  closeLatestTrace("ses_nested", child, "completed")
+  expect(activeLatestTrace("ses_nested")?.runID).toBe(parent.runID)
+  recordSessionTrace("ses_nested", {
+    operation: "agent.lifecycle",
+    component: "processor",
+    node_id: "parent_resumed",
+    data: { phase: "after_child" },
+  })
+  closeLatestTrace("ses_nested", parent, "completed")
+
+  const result = materializeTrace({ caseDir: path.join(root, "case_latest_nested") })
+  const document = JSON.parse(await fs.readFile(result.traceFile, "utf8"))
+  expect(document.nodes).toEqual(
+    expect.arrayContaining([expect.objectContaining({ metadata: expect.objectContaining({ original_node_id: "nested_skill_load" }) })]),
+  )
+  expect(document.nodes).toEqual(
+    expect.arrayContaining([expect.objectContaining({ metadata: expect.objectContaining({ original_node_id: "parent_resumed" }) })]),
+  )
 })

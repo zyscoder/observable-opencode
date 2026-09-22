@@ -3,6 +3,8 @@ import type { LLMEvent } from "@opencode-ai/llm"
 import type { CausalEdgeLike } from "./causal-ir"
 import { TraceRuntime, type TraceHandle } from "./trace-runtime"
 
+const activeTraces = new Map<string, TraceHandle[]>()
+
 const truthy = new Set(["1", "true", "yes", "on"])
 
 function enabled() {
@@ -26,7 +28,14 @@ function preview(value: unknown, limit = 512): Record<string, unknown> {
 function toolComponent(name: string) {
   if (name === "skill") return "skill" as const
   if (name === "task" || name === "subagent" || name === "subtask") return "task" as const
-  if (name.startsWith("mcp_") || name.startsWith("mcp.") || name.includes("/mcp/")) return "mcp" as const
+  if (
+    name.startsWith("mcp_") ||
+    name.startsWith("mcp.") ||
+    name.startsWith("list_mcp_") ||
+    name.startsWith("read_mcp_") ||
+    name.includes("/mcp/")
+  )
+    return "mcp" as const
   if (name.startsWith("plugin_") || name.startsWith("plugin.")) return "plugin" as const
   return "tool" as const
 }
@@ -59,7 +68,50 @@ export function openLatestTrace(input: {
         ...(input.parentSessionID ? { parent_session_id: input.parentSessionID } : {}),
       },
     })
+    const traces = activeTraces.get(input.sessionID) ?? []
+    traces.push(trace)
+    activeTraces.set(input.sessionID, traces)
     return trace
+  } catch {
+    return undefined
+  }
+}
+
+export function activeLatestTrace(sessionID: string) {
+  return activeTraces.get(sessionID)?.at(-1)
+}
+
+export function closeLatestTrace(
+  sessionID: string,
+  trace: TraceHandle | undefined,
+  status: Parameters<TraceHandle["close"]>[0],
+) {
+  try {
+    trace?.close(status)
+  } finally {
+    if (!trace) return
+    const traces = activeTraces.get(sessionID)
+    if (!traces) return
+    const remaining = traces.filter((item) => item !== trace)
+    if (remaining.length > 0) activeTraces.set(sessionID, remaining)
+    else activeTraces.delete(sessionID)
+  }
+}
+
+export function recordSessionTrace(sessionID: string, input: Parameters<TraceHandle["record"]>[0]) {
+  recordLatestTrace(activeLatestTrace(sessionID), input)
+}
+
+export function recordSessionEdge(sessionID: string, edge: CausalEdgeLike) {
+  recordLatestEdge(activeLatestTrace(sessionID), edge)
+}
+
+export function recordSessionArtifact(
+  sessionID: string,
+  input: Parameters<TraceHandle["recordArtifact"]>[0],
+) {
+  try {
+    return activeLatestTrace(sessionID)?.recordArtifact(input)
   } catch {
     return undefined
   }
@@ -92,7 +144,7 @@ export function recordPromptTrace(input: {
       ...(artifact ? { prompt_artifact_id: artifact.artifact_id } : {}),
     },
   })
-  trace.close("completed")
+  closeLatestTrace(input.sessionID, trace, "completed")
 }
 
 export function recordLatestTrace(trace: TraceHandle | undefined, input: Parameters<TraceHandle["record"]>[0]) {

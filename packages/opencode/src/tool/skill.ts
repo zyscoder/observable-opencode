@@ -4,6 +4,11 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Skill } from "../skill"
 import * as Tool from "./tool"
 import DESCRIPTION from "./skill.txt"
+import {
+  activeLatestTrace,
+  recordLatestEdge,
+  recordLatestTrace,
+} from "@opencode-ai/core/observability/latest-trace"
 
 export const Parameters = Schema.Struct({
   name: Schema.String.annotate({ description: "The name of the skill from available_skills" }),
@@ -40,6 +45,40 @@ export const SkillTool = Tool.define(
             follow: false,
             signal: ctx.abort,
             limit: 10,
+          })
+          const trace = activeLatestTrace(ctx.sessionID)
+          const traceRunID = trace?.runID ?? ctx.sessionID
+          const skillArtifact = trace?.recordArtifact({
+            value: {
+              name: info.name,
+              location: info.location,
+              base_directory: base,
+              content: info.content,
+              sampled_files: files.map((file) => path.resolve(dir, file.path)),
+            },
+            mediaType: "application/json",
+            previewLimit: 6_000,
+          })
+          recordLatestTrace(trace, {
+            operation: "skill.load",
+            component: "skill",
+            node_id: `skill_load_${traceRunID}`,
+            data: {
+              skill_name: info.name,
+              location: info.location,
+              base_directory: base,
+              content_characters: info.content.length,
+              sampled_file_count: files.length,
+              selected_by_call_id: ctx.callID,
+              skill_artifact_id: skillArtifact?.artifact_id,
+            },
+          })
+          recordLatestEdge(trace, {
+            edge_id: `tool_to_skill_load_${traceRunID}`,
+            from: { type: "node", id: `tool_exec_${traceRunID}` },
+            to: { type: "node", id: `skill_load_${traceRunID}` },
+            relation: "produced",
+            label: `skill tool loaded ${info.name} into the agent context`,
           })
 
           return {

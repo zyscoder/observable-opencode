@@ -69,3 +69,29 @@ test("creates a continuation segment without rewriting the previous segment", as
   })
   expect(await fs.readFile(firstRecordsFile, "utf8")).toContain('"run_first"')
 })
+
+test("keeps parent and subagent sessions in one logical case trace", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-latest-subagent-case-"))
+  roots.push(root)
+
+  const parent = openTraceSegment({
+    rootDir: root,
+    logicalCaseID: "case_subagent",
+    sessionID: "ses_parent",
+    runID: "run_parent",
+  })
+  parent.finalize("completed")
+
+  const child = openTraceSegment({
+    rootDir: root,
+    logicalCaseID: "case_subagent",
+    sessionID: "ses_child",
+    runID: "run_child",
+  })
+  expect(child.descriptor.session_id).toBe("ses_child")
+  child.finalize("completed")
+
+  const manifest = readTraceSessionManifest(child.sessionFile)
+  expect(manifest?.session_id).toBe("ses_parent")
+  expect(manifest?.segments.map((segment) => segment.session_id)).toEqual(["ses_parent", "ses_child"])
+})

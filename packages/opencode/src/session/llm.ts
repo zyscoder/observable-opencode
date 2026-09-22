@@ -29,7 +29,14 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
-import { openLatestTrace, recordLatestEdge, recordLatestTrace, recordLLMEvent } from "@opencode-ai/core/observability/latest-trace"
+import type { TraceHandle } from "@opencode-ai/core/observability/trace-runtime"
+import {
+  closeLatestTrace,
+  openLatestTrace,
+  recordLatestEdge,
+  recordLatestTrace,
+  recordLLMEvent,
+} from "@opencode-ai/core/observability/latest-trace"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -46,6 +53,7 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  trace?: TraceHandle
 }
 
 export type StreamRequest = StreamInput & {
@@ -117,13 +125,15 @@ const live: Layer.Layer<
       // service. Trace this boundary as a passive sidecar so request
       // preparation and the emitted LLM events are visible without changing
       // the request or execution path.
-      const trace = openLatestTrace({
-        sessionID: input.sessionID,
-        step: Date.now(),
-        agent: input.agent.name,
-        model: `${input.model.providerID}/${input.model.id}`,
-        parentSessionID: input.parentSessionID,
-      })
+      const trace =
+        input.trace ??
+        openLatestTrace({
+          sessionID: input.sessionID,
+          step: Date.now(),
+          agent: input.agent.name,
+          model: `${input.model.providerID}/${input.model.id}`,
+          parentSessionID: input.parentSessionID,
+        })
       const requestArtifact = trace?.recordArtifact({
         value: {
           system: prepared.system,
@@ -196,7 +206,7 @@ const live: Layer.Layer<
         edge_id: `prompt_assembly_to_llm_${traceRunID}`,
         from: { type: "node", id: `prompt_assembly_${traceRunID}` },
         to: { type: "node", id: `llm_call_${traceRunID}` },
-        relation: "assembled_for",
+        relation: "assembled",
         label: "assembled prompt metadata accompanied the model call",
       })
       recordLatestEdge(trace, {
@@ -385,7 +395,7 @@ const live: Layer.Layer<
                 message: String(error),
               },
             })
-            trace?.close("failed")
+            closeLatestTrace(input.sessionID, trace, "failed")
             bridge.fork(
               Effect.logError("stream error", {
                 providerID: input.model.providerID,
@@ -494,7 +504,7 @@ const live: Layer.Layer<
             if (result.type === "native") {
               return result.stream.pipe(
                 Stream.tap((event) => Effect.sync(() => recordLLMEvent(result.trace, event))),
-                Stream.ensuring(Effect.sync(() => result.trace?.close("completed"))),
+                Stream.ensuring(Effect.sync(() => closeLatestTrace(input.sessionID, result.trace, "completed"))),
               )
             }
 
@@ -507,7 +517,7 @@ const live: Layer.Layer<
               Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
               Stream.flatMap((events) => Stream.fromIterable(events)),
               Stream.tap((event) => Effect.sync(() => recordLLMEvent(result.trace, event))),
-              Stream.ensuring(Effect.sync(() => result.trace?.close("completed"))),
+              Stream.ensuring(Effect.sync(() => closeLatestTrace(input.sessionID, result.trace, "completed"))),
             )
           }),
         ),

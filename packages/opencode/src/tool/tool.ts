@@ -7,7 +7,18 @@ import type { Permission } from "../permission"
 import type { SessionID, MessageID } from "../session/schema"
 import * as Truncate from "./truncate"
 import { Agent } from "@/agent/agent"
-import { openLatestTrace, recordLatestEdge, recordLatestTrace } from "@opencode-ai/core/observability/latest-trace"
+import {
+  closeLatestTrace,
+  openLatestTrace,
+  recordLatestEdge,
+  recordLatestTrace,
+} from "@opencode-ai/core/observability/latest-trace"
+import {
+  classifyToolIntent,
+  inferVerificationStatus,
+  semanticComponent,
+  semanticToolFields,
+} from "@/observability/latest-trace-semantics"
 
 interface Metadata {
   [key: string]: any
@@ -129,18 +140,42 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
           mediaType: "application/json",
           previewLimit: 4_000,
         })
+        const intent = classifyToolIntent(id, args)
         recordLatestTrace(trace, {
           operation: "tool.call",
-          component: id === "skill" ? "skill" : id === "task" ? "task" : id.startsWith("mcp") ? "mcp" : "tool",
+          component: semanticComponent(id),
           node_id: `tool_exec_${traceRunID}`,
           data: {
             tool: id,
             call_id: ctx.callID,
             phase: "execution",
             selection_phase: "runtime_dispatch",
+            intent: intent.purpose,
+            operation_kind: intent.operation,
             input_shape: args && typeof args === "object" ? Object.keys(args as object) : typeof args,
             ...(inputArtifact ? { input_artifact_id: inputArtifact.artifact_id } : {}),
           },
+        })
+        recordLatestTrace(trace, {
+          operation: "decision",
+          component: semanticComponent(id),
+          node_id: `decision_tool_${traceRunID}`,
+          data: {
+            decision_id: `decision_tool_${traceRunID}`,
+            decision_type: "runtime_tool_dispatch",
+            chosen_action: id,
+            intent: intent.purpose,
+            rationale: "The model emitted this tool call and the runtime dispatched it to the registered implementation.",
+            call_id: ctx.callID,
+            input_artifact_id: inputArtifact?.artifact_id,
+          },
+        })
+        recordLatestEdge(trace, {
+          edge_id: `decision_to_tool_${traceRunID}`,
+          from: { type: "node", id: `decision_tool_${traceRunID}` },
+          to: { type: "node", id: `tool_exec_${traceRunID}` },
+          relation: "selected_by",
+          label: `runtime dispatched ${id} after model tool selection`,
         })
         return Effect.gen(function* () {
           const decoded = yield* decode(args).pipe(
@@ -153,20 +188,22 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             ),
           )
           const result = yield* execute(decoded as Schema.Schema.Type<Parameters>, ctx)
-          if (result.metadata.truncated !== undefined) {
-            return result
-          }
-          const agent = yield* agents.get(ctx.agent)
-          const truncated = yield* truncate.output(result.output, {}, agent)
-          const finalResult = {
-            ...result,
-            output: truncated.content,
-            metadata: {
-              ...result.metadata,
-              truncated: truncated.truncated,
-              ...(truncated.truncated && { outputPath: truncated.outputPath }),
-            },
-          }
+          const finalResult =
+            result.metadata.truncated !== undefined
+              ? result
+              : yield* Effect.gen(function* () {
+                  const agent = yield* agents.get(ctx.agent)
+                  const truncated = yield* truncate.output(result.output, {}, agent)
+                  return {
+                    ...result,
+                    output: truncated.content,
+                    metadata: {
+                      ...result.metadata,
+                      truncated: truncated.truncated,
+                      ...(truncated.truncated && { outputPath: truncated.outputPath }),
+                    },
+                  }
+                })
           const outputArtifact = trace?.recordArtifact({
             value: finalResult.output,
             mediaType: "text/plain",
@@ -177,9 +214,23 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             mediaType: "application/json",
             previewLimit: 4_000,
           })
+          const semantic = semanticToolFields(id, args, finalResult.metadata)
+          const metadata = finalResult.metadata as Record<string, unknown>
+          const semanticNodeID = `tool_semantic_${traceRunID}`
+          const semanticArtifact = trace?.recordArtifact({
+            value: {
+              tool: id,
+              args,
+              output: finalResult.output,
+              metadata: finalResult.metadata,
+              semantic,
+            },
+            mediaType: "application/json",
+            previewLimit: 6_000,
+          })
           recordLatestTrace(trace, {
             operation: "tool.result",
-            component: id === "skill" ? "skill" : id === "task" ? "task" : id.startsWith("mcp") ? "mcp" : "tool",
+            component: semanticComponent(id),
             node_id: `tool_exec_result_${traceRunID}`,
             data: {
               tool: id,
@@ -190,6 +241,102 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
               ...(metadataArtifact ? { metadata_artifact_id: metadataArtifact.artifact_id } : {}),
             },
           })
+          if (semantic.operation === "verification") {
+            recordLatestTrace(trace, {
+              operation: "verification",
+              component: "tool",
+              node_id: semanticNodeID,
+              data: {
+                tool: id,
+                command: semantic.command,
+                purpose: semantic.purpose,
+                status: inferVerificationStatus(
+                  semantic.command ?? "",
+                  typeof metadata.exit === "number" ? metadata.exit : undefined,
+                  metadata.output ?? finalResult.output,
+                  metadata.stderr,
+                ),
+                exit_code: typeof metadata.exit === "number" ? metadata.exit : undefined,
+                stdout: metadata.output ?? finalResult.output,
+                stderr: metadata.stderr,
+                result_artifact_id: outputArtifact?.artifact_id,
+                semantic_artifact_id: semanticArtifact?.artifact_id,
+              },
+            })
+          } else if (semantic.operation === "repository_change") {
+            recordLatestTrace(trace, {
+              operation: "change",
+              component: "tool",
+              node_id: semanticNodeID,
+              data: {
+                tool: id,
+                intent: semantic.purpose,
+                files: semantic.file_paths,
+                diff_artifact_id: metadataArtifact?.artifact_id,
+                verification_status: "not_observed_at_tool_boundary",
+                semantic_artifact_id: semanticArtifact?.artifact_id,
+              },
+            })
+          } else if (semantic.operation === "code_inspection") {
+            recordLatestTrace(trace, {
+              operation: "observation",
+              component: "tool",
+              node_id: semanticNodeID,
+              data: {
+                tool: id,
+                observation_type: "repository_read",
+                files: semantic.file_paths,
+                read_purpose: semantic.read_purpose,
+                read_reason: semantic.read_reason,
+                used_by_decision: null,
+                semantic_availability: "tool_contract_does_not_expose_downstream_decision_use",
+                result_artifact_id: outputArtifact?.artifact_id,
+                semantic_artifact_id: semanticArtifact?.artifact_id,
+              },
+            })
+          } else {
+            recordLatestTrace(trace, {
+              operation: "observation",
+              component: semanticComponent(id),
+              node_id: semanticNodeID,
+              data: {
+                tool: id,
+                observation_type: "tool_output",
+                purpose: semantic.purpose,
+                result_artifact_id: outputArtifact?.artifact_id,
+                semantic_artifact_id: semanticArtifact?.artifact_id,
+              },
+            })
+          }
+          if (semantic.operation === "code_inspection" || semantic.operation === "verification") {
+            const evidenceNodeID = `tool_evidence_${traceRunID}`
+            recordLatestTrace(trace, {
+              operation: "evidence.semantic_fact",
+              component: "result",
+              node_id: evidenceNodeID,
+              data: {
+                source_node_id: semanticNodeID,
+                evidence_type: semantic.operation === "verification" ? "verification_result" : "repository_observation",
+                tool: id,
+                artifact_id: outputArtifact?.artifact_id,
+                reliability: "observed_tool_output",
+              },
+            })
+            recordLatestEdge(trace, {
+              edge_id: `semantic_to_evidence_${traceRunID}`,
+              from: { type: "node", id: semanticNodeID },
+              to: { type: "node", id: evidenceNodeID },
+              relation: "derived_from",
+              label: "semantic tool result was preserved as an evidence fact",
+            })
+          }
+          recordLatestEdge(trace, {
+            edge_id: `tool_result_to_semantic_${traceRunID}`,
+            from: { type: "node", id: `tool_exec_result_${traceRunID}` },
+            to: { type: "node", id: semanticNodeID },
+            relation: "produced",
+            label: `${id} result was projected into semantic provenance`,
+          })
           recordLatestEdge(trace, {
             edge_id: `tool_exec_result_for_${traceRunID}`,
             from: { type: "node", id: `tool_exec_${traceRunID}` },
@@ -197,22 +344,28 @@ function wrap<Parameters extends Schema.Decoder<unknown>, Result extends Metadat
             relation: "returned_by",
             label: `${id} execution returned a result`,
           })
-          trace?.close("completed")
+          closeLatestTrace(ctx.sessionID, trace, "completed")
           return finalResult
         }).pipe(
           Effect.tapError((error) =>
             Effect.sync(() =>
               recordLatestTrace(trace, {
                 operation: "tool.error",
-                component: id === "skill" ? "skill" : id === "task" ? "task" : id.startsWith("mcp") ? "mcp" : "tool",
+                component: semanticComponent(id),
                 node_id: `tool_exec_error_${traceRunID}`,
-                data: { tool: id, call_id: ctx.callID, message: String(error) },
+                data: {
+                  tool: id,
+                  call_id: ctx.callID,
+                  message: String(error),
+                  intent: intent.purpose,
+                  operation_kind: intent.operation,
+                },
               }),
             ),
           ),
           Effect.orDie,
           Effect.withSpan("Tool.execute", { attributes: attrs }),
-          Effect.ensuring(Effect.sync(() => trace?.close("failed"))),
+          Effect.ensuring(Effect.sync(() => closeLatestTrace(ctx.sessionID, trace, "failed"))),
         )
       }
       return toolInfo

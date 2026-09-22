@@ -240,7 +240,6 @@ export function readTraceSessionManifest(file: string): TraceSessionManifest | u
   for (const [index, descriptor] of segments.entries()) {
     if (
       descriptor.case_id !== session.logical_case_id ||
-      descriptor.session_id !== session.session_id ||
       descriptor.continuation_of !== segments[index - 1]?.run_id ||
       runIDs.has(descriptor.run_id) ||
       segmentIDs.has(descriptor.segment_id)
@@ -535,8 +534,6 @@ function validateLogicalRoot(logicalRoot: string, sessionID: string | undefined)
   if (rootStats.isSymbolicLink()) throw symbolicLinkError(logicalRoot)
   if (!rootStats.isDirectory()) throw new Error(`${logicalRoot}: expected a logical trace directory`)
   const current = readTraceSessionManifest(path.join(logicalRoot, "session.json"))
-  if (current?.session_id && sessionID && current.session_id !== sessionID)
-    throw new Error(`${logicalRoot}: session identity changed`)
   for (const descriptor of current?.segments ?? []) {
     resolveContainedTraceManifestPath(logicalRoot, descriptor.records, { allowMissing: true })
     resolveContainedTraceManifestPath(logicalRoot, descriptor.artifacts, { allowMissing: true })
@@ -558,6 +555,7 @@ function validateLogicalRoot(logicalRoot: string, sessionID: string | undefined)
       "index",
       "started_at",
       "continuation_of",
+      "session_id",
     ] as const)
       if (physical[key] !== descriptor[key]) throw new Error(`${segmentFile}: trace segment descriptor changed`)
   }
@@ -701,7 +699,7 @@ export function openTraceSegment(input: {
     const manifest: TraceSessionManifest = {
       schema_version: "1.0",
       logical_case_id: logicalCaseID,
-      session_id: input.sessionID ?? current?.session_id,
+      session_id: current?.session_id ?? input.sessionID,
       lock_key: lockKey,
       generation: (current?.generation ?? 0) + 1,
       created_at: current?.created_at ?? now,

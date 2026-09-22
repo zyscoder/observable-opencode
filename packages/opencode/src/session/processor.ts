@@ -25,6 +25,10 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import {
+  recordSessionArtifact,
+  recordSessionTrace,
+} from "@opencode-ai/core/observability/latest-trace"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -334,6 +338,24 @@ const layer = Layer.effect(
             }
             yield* ensureToolCall(value)
             const input = isRecord(value.input) ? value.input : { value: value.input }
+            const toolInputArtifact = recordSessionArtifact(ctx.sessionID, {
+              value: input,
+              mediaType: "application/json",
+              previewLimit: 4_000,
+            })
+            recordSessionTrace(ctx.sessionID, {
+              operation: "decision",
+              component: "processor",
+              node_id: `decision_model_tool_${value.id}`,
+              data: {
+                decision_id: `decision_model_tool_${value.id}`,
+                decision_type: "model_tool_selection",
+                chosen_action: value.name,
+                rationale: "The provider emitted a tool call in the current model turn.",
+                call_id: value.id,
+                input_artifact_id: toolInputArtifact?.artifact_id,
+              },
+            })
             yield* updateToolCall(value.id, (match) => ({
               ...match,
               tool: value.name,
@@ -454,6 +476,60 @@ const layer = Layer.effect(
               usage: value.usage ?? new Usage({}),
               metadata: value.providerMetadata,
             })
+            const compactionConfig = yield* config.get()
+            const overflow = isOverflow({ cfg: compactionConfig, tokens: usage.tokens, model: ctx.model })
+            const stepTraceID = `${ctx.assistantMessage.id}_${Date.now()}`
+            recordSessionTrace(ctx.sessionID, {
+              operation: "llm.turn",
+              component: "processor",
+              node_id: `processor_turn_finished_${stepTraceID}`,
+              data: {
+                phase: "step_finished",
+                message_id: ctx.assistantMessage.id,
+                finish_reason: value.reason,
+                token_usage: usage.tokens,
+                cost: usage.cost,
+                provider_metadata_present: Boolean(value.providerMetadata),
+              },
+            })
+            recordSessionTrace(ctx.sessionID, {
+              operation: "agent.lifecycle",
+              component: "processor",
+              node_id: `agent_lifecycle_step_finished_${stepTraceID}`,
+              data: {
+                phase: "llm_step_finished",
+                status: "success",
+                session_id: ctx.sessionID,
+                message_id: ctx.assistantMessage.id,
+                finish_reason: value.reason,
+                token_usage: usage.tokens,
+                cost: usage.cost,
+              },
+            })
+            recordSessionTrace(ctx.sessionID, {
+              operation: "exit.gate",
+              component: "processor",
+              node_id: `exit_gate_step_${stepTraceID}`,
+              data: {
+                phase: "step_finished",
+                decision: "defer_to_agent_loop",
+                finish_reason: value.reason,
+                reason: "The model step finished; the outer prompt loop will decide whether to continue, compact, or stop.",
+              },
+            })
+            recordSessionTrace(ctx.sessionID, {
+              operation: "context.compaction_check",
+              component: "context",
+              node_id: `compaction_check_${stepTraceID}`,
+              data: {
+                trigger: "llm_step_finished",
+                overflow,
+                token_usage: usage.tokens,
+                context_limit: ctx.model.limit.context,
+                auto_compaction: compactionConfig.compaction?.auto !== false,
+                message_id: ctx.assistantMessage.id,
+              },
+            })
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
@@ -488,10 +564,7 @@ const layer = Layer.effect(
                 messageID: ctx.assistantMessage.parentID,
               })
               .pipe(Effect.ignore, Effect.forkIn(scope))
-            if (
-              !ctx.assistantMessage.summary &&
-              isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
-            ) {
+            if (!ctx.assistantMessage.summary && overflow) {
               ctx.needsCompaction = true
             }
             return
@@ -541,6 +614,57 @@ const layer = Layer.effect(
               ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
             }
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
+            const responseArtifact = recordSessionArtifact(ctx.sessionID, {
+              value: ctx.currentText.text,
+              mediaType: "text/plain",
+              previewLimit: 6_000,
+            })
+            recordSessionTrace(ctx.sessionID, {
+              operation: "response.output",
+              component: "result",
+              node_id: `response_output_${ctx.currentText.id}`,
+              data: {
+                phase: "completed",
+                message_id: ctx.assistantMessage.id,
+                part_id: ctx.currentText.id,
+                characters: ctx.currentText.text.length,
+                response_artifact_id: responseArtifact?.artifact_id,
+              },
+            })
+            recordSessionTrace(ctx.sessionID, {
+              operation: "response.claim",
+              component: "result",
+              node_id: `response_claim_${ctx.currentText.id}`,
+              data: {
+                source_response_node: `response_output_${ctx.currentText.id}`,
+                claim_artifact_id: responseArtifact?.artifact_id,
+                claim_characters: ctx.currentText.text.length,
+                extraction: "response_text_as_claim_candidate",
+              },
+            })
+            if (/(?:design|architecture|方案|设计|架构|implementation plan|实现计划)/i.test(ctx.currentText.text)) {
+              recordSessionTrace(ctx.sessionID, {
+                operation: "design.record",
+                component: "result",
+                node_id: `design_record_${ctx.currentText.id}`,
+                data: {
+                  source_response_node: `response_output_${ctx.currentText.id}`,
+                  design_artifact_id: responseArtifact?.artifact_id,
+                  extraction: "response_text_contains_design_markers",
+                },
+              })
+            }
+            recordSessionTrace(ctx.sessionID, {
+              operation: "agent.lifecycle",
+              component: "processor",
+              node_id: `agent_response_completed_${ctx.currentText.id}`,
+              data: {
+                phase: "response_completed",
+                status: "success",
+                message_id: ctx.assistantMessage.id,
+                response_artifact_id: responseArtifact?.artifact_id,
+              },
+            })
             yield* session.updatePart(ctx.currentText)
             ctx.currentText = undefined
             return
@@ -642,6 +766,17 @@ const layer = Layer.effect(
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
+        })
+        recordSessionTrace(input.sessionID, {
+          operation: "agent.lifecycle",
+          component: "processor",
+          node_id: `agent_lifecycle_processor_started_${input.assistantMessage.id}`,
+          data: {
+            phase: "processor_started",
+            session_id: input.sessionID,
+            message_id: input.assistantMessage.id,
+            model: `${input.model.providerID}/${input.model.id}`,
+          },
         })
         ctx.needsCompaction = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true

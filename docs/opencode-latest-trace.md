@@ -22,7 +22,7 @@ export OPENCODE_CASE_TRACE_DIR=/tmp/opencode-traces
 └── segments/<segment-id>/index.sqlite
 ```
 
-每个 LLM 回合、工具执行和上下文压缩都是独立 segment。长 session 不需要把完整历史保存在进程内，也不会在每个事件发生时生成完整 `trace.json` 或 HTML。
+每个 LLM 回合、工具执行、MCP 调用、Skill 加载、Subagent 委派和上下文压缩都是独立 segment。主 Agent 与 Subagent 可以共用一个 case；`session.json` 保留主 session 标识，而每个 segment 记录自己的 `session_id`。长 session 不需要把完整历史保存在进程内，也不会在每个事件发生时生成完整 `trace.json` 或 HTML。
 
 记录内容包括：
 
@@ -32,6 +32,17 @@ export OPENCODE_CASE_TRACE_DIR=/tmp/opencode-traces
 - LLM reasoning/text/tool 事件、token usage、provider error；
 - Skill、Task/subagent、MCP 和普通工具的输入、输出、metadata、错误和执行结果；
 - 子 Agent 的 session、父子关系和独立运行片段。
+
+旧版语义节点在最新版路径中的对应关系包括：
+
+- `agent.lifecycle`、`decision`、`exit.gate`：记录 Agent 回合开始、模型工具选择、步骤结束和继续/压缩/停止的边界；
+- `context.transform`、`context.pack`、`context.compaction_check`、`context.compaction`：记录上下文各层转换、压缩算法、压缩输入选择和摘要提示；
+- `skill.catalog.exposed`、`skill.load`：记录 Skill 是否进入上下文、实际加载的文件位置和内容 Artifact；
+- `subagent.call`、`delegated_to`、`spawned`、`reported_to`：记录父 Agent 的委派、子 session 和结果回传；
+- `observation`、`change`、`verification`：记录文件读取、文件修改、Shell 检查/测试命令及观察到的状态；
+- `response.output`、`llm.call`、`llm.turn`：记录模型请求、输出结果和 token/cost 信息。
+
+低价值的 `tool-input-delta` 等逐字符流事件不作为独立语义节点保留；完整输入/输出仍以 Artifact 方式保存并由 `tool.call`、`tool.result` 引用。
 
 大文本写入 `artifacts/`，`records.jsonl` 只保留哈希、大小、预览和 artifact 引用。
 

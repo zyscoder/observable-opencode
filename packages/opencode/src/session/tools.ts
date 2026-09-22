@@ -23,6 +23,12 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import {
+  closeLatestTrace,
+  openLatestTrace,
+  recordLatestEdge,
+  recordLatestTrace,
+} from "@opencode-ai/core/observability/latest-trace"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -395,8 +401,33 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     const schema = yield* Effect.promise(() => Promise.resolve(asSchema(item.inputSchema).jsonSchema))
     const transformed = ProviderTransform.schema(input.model, { ...schema, properties: schema.properties ?? {} })
     item.inputSchema = jsonSchema(transformed)
-    item.execute = (args, opts) =>
-      run.promise(
+    item.execute = (args, opts) => {
+      const trace = openLatestTrace({
+        sessionID: input.session.id,
+        step: Date.now(),
+        agent: input.agent.name,
+        model: `${input.model.providerID}/${input.model.api.id}`,
+      })
+      const traceRunID = trace?.runID ?? input.session.id
+      const inputArtifact = trace?.recordArtifact({
+        value: args,
+        mediaType: "application/json",
+        previewLimit: 4_000,
+      })
+      recordLatestTrace(trace, {
+        operation: "mcp.call",
+        component: "mcp",
+        node_id: `mcp_call_${traceRunID}`,
+        data: {
+          phase: "requested",
+          server: key.split(":")[1] ?? key,
+          tool: key,
+          call_id: opts.toolCallId,
+          input_artifact_id: inputArtifact?.artifact_id,
+          permission_checked: true,
+        },
+      })
+      return run.promise(
         Effect.gen(function* () {
           const ctx = context(args, opts)
           yield* plugin.trigger(
@@ -422,6 +453,25 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
             result,
           )
+
+          const outputArtifact = trace?.recordArtifact({
+            value: result,
+            mediaType: "application/json",
+            previewLimit: 6_000,
+          })
+          recordLatestTrace(trace, {
+            operation: "mcp.call",
+            component: "mcp",
+            node_id: `mcp_call_completed_${traceRunID}`,
+            data: {
+              phase: "completed",
+              server: key.split(":")[1] ?? key,
+              tool: key,
+              call_id: opts.toolCallId,
+              output_artifact_id: outputArtifact?.artifact_id,
+              content_items: result.content.length,
+            },
+          })
 
           const textParts: string[] = []
           const attachments: Omit<SessionV1.FilePart, "id" | "sessionID" | "messageID">[] = []
@@ -483,9 +533,40 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           if (opts.abortSignal?.aborted) {
             yield* input.processor.completeToolCall(opts.toolCallId, output)
           }
+          recordLatestTrace(trace, {
+            operation: "tool.result",
+            component: "mcp",
+            node_id: `mcp_result_${traceRunID}`,
+            data: {
+              tool: key,
+              call_id: opts.toolCallId,
+              output_artifact_id: outputArtifact?.artifact_id,
+            },
+          })
+          recordLatestEdge(trace, {
+            edge_id: `mcp_call_to_result_${traceRunID}`,
+            from: { type: "node", id: `mcp_call_${traceRunID}` },
+            to: { type: "node", id: `mcp_result_${traceRunID}` },
+            relation: "returned_by",
+            label: `${key} returned an MCP result`,
+          })
+          closeLatestTrace(input.session.id, trace, "completed")
           return output
-        }),
+        }).pipe(
+          Effect.tapError((error) =>
+            Effect.sync(() =>
+              recordLatestTrace(trace, {
+                operation: "tool.error",
+                component: "mcp",
+                node_id: `mcp_error_${traceRunID}`,
+                data: { tool: key, call_id: opts.toolCallId, message: String(error) },
+              }),
+            ),
+          ),
+          Effect.ensuring(Effect.sync(() => closeLatestTrace(input.session.id, trace, "failed"))),
+        ),
       )
+    }
     tools[key] = item
   }
 

@@ -14,6 +14,13 @@ import { Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import {
+  activeLatestTrace,
+  closeLatestTrace,
+  openLatestTrace,
+  recordLatestEdge,
+  recordLatestTrace,
+} from "@opencode-ai/core/observability/latest-trace"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -189,6 +196,77 @@ export const TaskTool = Tool.define(
         ...(runInBackground ? { background: true } : {}),
       }
 
+      const trace = activeLatestTrace(ctx.sessionID)
+      const traceRunID = trace?.runID ?? ctx.sessionID
+      const delegationTrace = openLatestTrace({
+        sessionID: nextSession.id,
+        step: Date.now(),
+        agent: next.name,
+        model: `${model.providerID}/${model.modelID}`,
+        parentSessionID: ctx.sessionID,
+      })
+      const delegationRunID = delegationTrace?.runID ?? nextSession.id
+      const delegationArtifact = trace?.recordArtifact({
+        value: {
+          description: params.description,
+          prompt: params.prompt,
+          subagent_type: params.subagent_type,
+          command: params.command,
+          parent_session_id: ctx.sessionID,
+          child_session_id: nextSession.id,
+          model,
+          background: runInBackground,
+          resumed: Boolean(session),
+        },
+        mediaType: "application/json",
+        previewLimit: 6_000,
+      })
+      recordLatestTrace(trace, {
+        operation: "subagent.call",
+        component: "task",
+        node_id: `subagent_call_${traceRunID}`,
+        data: {
+          phase: "requested",
+          parent_session_id: ctx.sessionID,
+          child_session_id: nextSession.id,
+          subagent_type: params.subagent_type,
+          description: params.description,
+          prompt_artifact_id: delegationArtifact?.artifact_id,
+          model,
+          background: runInBackground,
+          resumed: Boolean(session),
+          task_id: nextSession.id,
+        },
+      })
+      recordLatestEdge(trace, {
+        edge_id: `task_tool_to_subagent_${traceRunID}`,
+        from: { type: "node", id: `tool_exec_${traceRunID}` },
+        to: { type: "node", id: `subagent_call_${traceRunID}` },
+        relation: "delegated_to",
+        label: `parent agent delegated ${params.description} to ${params.subagent_type}`,
+      })
+      recordLatestEdge(trace, {
+        edge_id: `subagent_spawned_session_${traceRunID}`,
+        from: { type: "node", id: `subagent_call_${traceRunID}` },
+        to: { type: "external", id: `session:${nextSession.id}`, label: nextSession.id },
+        relation: "spawned",
+        label: "delegation created or resumed a child session",
+      })
+      recordLatestTrace(delegationTrace, {
+        operation: "subagent.call",
+        component: "task",
+        node_id: `subagent_call_child_${delegationRunID}`,
+        data: {
+          phase: "requested",
+          parent_session_id: ctx.sessionID,
+          child_session_id: nextSession.id,
+          subagent_type: params.subagent_type,
+          description: params.description,
+          prompt_artifact_id: delegationArtifact?.artifact_id,
+          task_id: nextSession.id,
+        },
+      })
+
       yield* ctx.metadata({
         title: params.description,
         metadata,
@@ -198,6 +276,18 @@ export const TaskTool = Tool.define(
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
+        recordLatestTrace(delegationTrace, {
+          operation: "agent.lifecycle",
+          component: "task",
+          node_id: `subagent_lifecycle_started_${delegationRunID}`,
+          data: {
+            phase: "subagent_started",
+            parent_session_id: ctx.sessionID,
+            child_session_id: nextSession.id,
+            subagent_type: params.subagent_type,
+            task_id: nextSession.id,
+          },
+        })
         const parts = yield* ops.resolvePromptParts(params.prompt)
         const result = yield* ops.prompt({
           messageID: MessageID.ascending(),
@@ -215,14 +305,62 @@ export const TaskTool = Tool.define(
             "message" in result.info.error.data && typeof result.info.error.data.message === "string"
               ? result.info.error.data.message
               : result.info.error.name
+          closeLatestTrace(nextSession.id, delegationTrace, "failed")
           return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
         }
         const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
         if (failed?.type === "tool" && failed.state.status === "error") {
+          closeLatestTrace(nextSession.id, delegationTrace, "failed")
           return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
         }
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const output = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        const outputArtifact = delegationTrace?.recordArtifact({
+          value: output,
+          mediaType: "text/plain",
+          previewLimit: 6_000,
+        })
+        recordLatestTrace(delegationTrace, {
+          operation: "subagent.call",
+          component: "task",
+          node_id: `subagent_call_completed_${delegationRunID}`,
+          data: {
+            phase: "completed",
+            parent_session_id: ctx.sessionID,
+            child_session_id: nextSession.id,
+            subagent_type: params.subagent_type,
+            output_artifact_id: outputArtifact?.artifact_id,
+            output_characters: output.length,
+          },
+        })
+        recordLatestEdge(delegationTrace, {
+          edge_id: `subagent_reported_to_parent_${delegationRunID}`,
+          from: { type: "node", id: `subagent_call_completed_${delegationRunID}` },
+          to: { type: "node", id: `subagent_call_child_${delegationRunID}` },
+          relation: "reported_to",
+          label: "child session returned its result to the parent task call",
+        })
+        closeLatestTrace(nextSession.id, delegationTrace, "completed")
+        return output
       })
+      const executeTask = () =>
+        runTask().pipe(
+          Effect.tapError((error) =>
+            Effect.sync(() => {
+              recordLatestTrace(delegationTrace, {
+                operation: "subagent.call",
+                component: "task",
+                node_id: `subagent_call_failed_${delegationRunID}`,
+                data: {
+                  phase: "failed",
+                  child_session_id: nextSession.id,
+                  task_id: nextSession.id,
+                  error: String(error),
+                },
+              })
+              closeLatestTrace(nextSession.id, delegationTrace, "failed")
+            }),
+          ),
+        )
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
         state: "completed" | "error",
@@ -264,7 +402,7 @@ export const TaskTool = Tool.define(
         )
       })
 
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
+      if (yield* background.extend({ id: nextSession.id, run: executeTask() })) {
         return {
           title: params.description,
           metadata: {
@@ -293,7 +431,7 @@ export const TaskTool = Tool.define(
           }),
           notify(nextSession.id),
         ]),
-        run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+        run: executeTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
       })
 
       function backgroundResult() {

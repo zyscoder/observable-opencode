@@ -39,7 +39,13 @@ import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
 import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
-import { openLatestTrace, recordLatestEdge, recordLatestTrace, recordLLMEvent } from "../../observability/latest-trace"
+import {
+  closeLatestTrace,
+  openLatestTrace,
+  recordLatestEdge,
+  recordLatestTrace,
+  recordLLMEvent,
+} from "../../observability/latest-trace"
 
 /**
  * Runs one durable coding-agent Session until it settles.
@@ -297,7 +303,7 @@ const layer = Layer.effect(
         observe: (operation, data) => recordLatestTrace(trace, { operation, component: "context", data }),
       })
       if (compacted) {
-        trace?.close("completed")
+        closeLatestTrace(session.id, trace, "completed")
         return yield* Effect.die(continueAfterCompaction(currentStep))
       }
       recordLatestTrace(trace, {
@@ -404,7 +410,7 @@ const layer = Layer.effect(
               }),
             )
             if (recovered) {
-              trace?.close("completed")
+              closeLatestTrace(session.id, trace, "completed")
               return yield* Effect.die(continueAfterOverflowCompaction(currentStep))
             }
           }
@@ -419,7 +425,7 @@ const layer = Layer.effect(
           if (settled._tag === "Failure" && isUserDeclined(settled.cause)) {
             yield* FiberSet.clear(toolFibers)
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
-            trace?.close("cancelled")
+            closeLatestTrace(session.id, trace, "cancelled")
             return yield* Effect.interrupt
           }
           if (
@@ -462,9 +468,10 @@ const layer = Layer.effect(
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
           if (stream._tag === "Success" && !publisher.hasProviderError())
             yield* withPublication(publisher.failUnsettledTools("Provider did not return a tool result", true))
-          if (stream._tag === "Failure" || publisher.hasProviderError()) trace?.close("failed")
-          else if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause)) trace?.close("cancelled")
-          else trace?.close("completed")
+          if (stream._tag === "Failure" || publisher.hasProviderError()) closeLatestTrace(session.id, trace, "failed")
+          else if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
+            closeLatestTrace(session.id, trace, "cancelled")
+          else closeLatestTrace(session.id, trace, "completed")
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)

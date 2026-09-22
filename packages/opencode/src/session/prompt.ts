@@ -56,7 +56,13 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
-import { recordPromptTrace } from "@opencode-ai/core/observability/latest-trace"
+import {
+  closeLatestTrace,
+  openLatestTrace,
+  recordLatestEdge,
+  recordLatestTrace,
+  recordPromptTrace,
+} from "@opencode-ai/core/observability/latest-trace"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1283,21 +1289,160 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
-              user: lastUser,
-              agent,
-              permission: session.permission,
+            const trace = openLatestTrace({
               sessionID,
+              step,
+              agent: agent.name,
+              model: `${model.providerID}/${model.id}`,
               parentSessionID: session.parentID,
-              system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
-              tools,
-              model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
             })
+            const traceRunID = trace?.runID ?? `${sessionID}-${step}`
+            const contextArtifact = trace?.recordArtifact({
+              value: {
+                raw_message_count: msgs.length,
+                model_message_count: modelMsgs.length,
+                environment: env,
+                instructions,
+                mcp_instructions: mcpInstructions,
+                skills,
+                tool_names: Object.keys(tools),
+              },
+              mediaType: "application/json",
+              previewLimit: 4_000,
+            })
+            const userPromptParts = msgs.findLast((message) => message.info.id === lastUser.id)?.parts ?? []
+            const userPromptText = userPromptParts
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("\n")
+            recordLatestTrace(trace, {
+              operation: "task.obligation",
+              component: "task",
+              node_id: `task_obligation_${traceRunID}`,
+              data: {
+                source: "user_message",
+                message_id: lastUser.id,
+                text_characters: userPromptText.length,
+                context_artifact_id: contextArtifact?.artifact_id,
+                semantic_status: "observed_prompt_content; interpretation_not_inferred",
+              },
+            })
+            if (instructions.length > 0) {
+              recordLatestTrace(trace, {
+                operation: "task.obligation",
+                component: "context",
+                node_id: `task_instruction_obligation_${traceRunID}`,
+                data: {
+                  source: "resolved_system_instructions",
+                  instruction_count: instructions.length,
+                  context_artifact_id: contextArtifact?.artifact_id,
+                },
+              })
+            }
+            recordLatestTrace(trace, {
+              operation: "agent.lifecycle",
+              component: "task",
+              node_id: `agent_turn_started_${traceRunID}`,
+              data: {
+                phase: "turn_started",
+                session_id: sessionID,
+                message_id: msg.id,
+                agent: agent.name,
+                step,
+                max_steps: maxSteps,
+              },
+            })
+            recordLatestTrace(trace, {
+              operation: "context.transform",
+              component: "context",
+              node_id: `prompt_context_transform_${traceRunID}`,
+              data: {
+                transformation: "SessionPrompt.system_and_model_messages",
+                raw_message_count: msgs.length,
+                model_message_count: modelMsgs.length,
+                environment_count: env.length,
+                instruction_count: instructions.length,
+                mcp_instruction_present: Boolean(mcpInstructions),
+                skill_catalog_present: Boolean(skills),
+                ...(contextArtifact ? { context_artifact_id: contextArtifact.artifact_id } : {}),
+              },
+            })
+            recordLatestTrace(trace, {
+              operation: "context.pack",
+              component: "context",
+              node_id: `prompt_context_pack_${traceRunID}`,
+              data: {
+                system_count: system.length,
+                model_message_count: modelMsgs.length,
+                tool_count: Object.keys(tools).length,
+                tool_names: Object.keys(tools),
+                skill_tool_available: Boolean(tools.skill),
+                mcp_instruction_present: Boolean(mcpInstructions),
+              },
+            })
+            if (skills) {
+              recordLatestTrace(trace, {
+                operation: "skill.catalog.exposed",
+                component: "skill",
+                node_id: `skill_catalog_${traceRunID}`,
+                data: {
+                  catalog_present: true,
+                  skill_tool_available: Boolean(tools.skill),
+                  characters: skills.length,
+                  context_artifact_id: contextArtifact?.artifact_id,
+                },
+              })
+            }
+            if (mcpInstructions) {
+              recordLatestTrace(trace, {
+                operation: "context.transform",
+                component: "mcp",
+                node_id: `mcp_instructions_${traceRunID}`,
+                data: {
+                  transformation: "SystemPrompt.mcp",
+                  characters: mcpInstructions.length,
+                  context_artifact_id: contextArtifact?.artifact_id,
+                },
+              })
+            }
+            recordLatestTrace(trace, {
+              operation: "decision",
+              component: "processor",
+              node_id: `decision_prepare_turn_${traceRunID}`,
+              data: {
+                decision_id: `decision_prepare_turn_${traceRunID}`,
+                phase: "prepare_model_turn",
+                reason: "resolved agent context layers and executable tools",
+                agent: agent.name,
+                candidate_tool_count: Object.keys(tools).length,
+                is_last_step: isLastStep,
+              },
+            })
+            recordLatestEdge(trace, {
+              edge_id: `prompt_context_to_turn_${traceRunID}`,
+              from: { type: "node", id: `prompt_context_pack_${traceRunID}` },
+              to: { type: "node", id: `decision_prepare_turn_${traceRunID}` },
+              relation: "selected_into_context",
+              label: "resolved context and tools prepared the model turn",
+            })
+            const result = yield* handle
+              .process({
+                user: lastUser,
+                agent,
+                permission: session.permission,
+                sessionID,
+                parentSessionID: session.parentID,
+                system,
+                messages: [
+                  ...modelMsgs,
+                  ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+                ],
+                tools,
+                model,
+                toolChoice: format.type === "json_schema" ? "required" : undefined,
+                trace,
+              })
+              .pipe(Effect.ensuring(Effect.sync(() => closeLatestTrace(sessionID, trace, "failed"))))
 
             if (structured !== undefined) {
               handle.message.structured = structured

@@ -22,7 +22,7 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
-import { openLatestTrace, recordLatestTrace } from "@opencode-ai/core/observability/latest-trace"
+import { closeLatestTrace, openLatestTrace, recordLatestTrace } from "@opencode-ai/core/observability/latest-trace"
 
 export const Event = SessionCompactionEvent
 
@@ -510,7 +510,7 @@ const layer = Layer.effect(
         }).toObject()
         processor.message.finish = "error"
         yield* session.updateMessage(processor.message)
-        trace?.close("failed")
+        closeLatestTrace(input.sessionID, trace, "failed")
         return "stop"
       }
 
@@ -606,13 +606,13 @@ const layer = Layer.effect(
       }
 
       if (processor.message.error) {
-        trace?.close("failed")
+        closeLatestTrace(input.sessionID, trace, "failed")
         return "stop"
       }
       if (result === "continue") {
         yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
       }
-      trace?.close("completed")
+      closeLatestTrace(input.sessionID, trace, "completed")
       return result
     })
 
