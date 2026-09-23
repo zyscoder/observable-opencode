@@ -83,6 +83,153 @@ The current release source is the repository default branch. The generated execu
 each platform archive and includes the complete semantic trace instrumentation described in
 [`docs/opencode-latest-trace.md`](docs/opencode-latest-trace.md).
 
+### Observable OpenCode Usage
+
+The release binary keeps the normal OpenCode command name and behavior. The repository is named
+`observable-opencode`; after extracting an archive, the executable itself is named `opencode`.
+
+#### Install a release binary
+
+Open the [latest observable release](https://github.com/zyscoder/observable-opencode/releases/latest), then choose the
+archive for your platform. For example:
+
+```bash
+# macOS Apple Silicon
+VERSION=v1.18.31-observable.1
+curl -fL "https://github.com/zyscoder/observable-opencode/releases/download/${VERSION}/opencode-darwin-arm64.zip" -o /tmp/opencode.zip
+unzip -q /tmp/opencode.zip -d /tmp/opencode-bin
+chmod +x /tmp/opencode-bin/opencode
+sudo install -m 0755 /tmp/opencode-bin/opencode /usr/local/bin/opencode
+opencode --version
+```
+
+Linux archives use `.tar.gz`, and Windows archives use `.zip`. The archive contains the executable directly; no Bun
+installation is required on the target machine.
+
+#### Configure any OpenAI-compatible service
+
+The configuration uses the three generic environment variables `MODEL`, `URL`, and `APIKEY`. `URL` is the provider
+base URL and normally includes `/v1`; do not append `/chat/completions` yourself.
+
+```bash
+export MODEL="deepseek-v4-flash"
+export URL="https://api.example.com/v1"
+export APIKEY="replace-with-your-api-key"
+
+export OPENCODE_CONFIG_CONTENT='{
+  "model": "compatible/{env:MODEL}",
+  "provider": {
+    "compatible": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "OpenAI Compatible",
+      "options": {
+        "baseURL": "{env:URL}",
+        "apiKey": "{env:APIKEY}"
+      },
+      "models": {
+        "{env:MODEL}": {
+          "id": "{env:MODEL}",
+          "name": "{env:MODEL}"
+        }
+      }
+    }
+  }
+}'
+
+# Optional for an offline or restricted network: use only the configured provider.
+export OPENCODE_DISABLE_MODELS_FETCH=1
+```
+
+The same JSON can be saved as `opencode.json` or `opencode.jsonc` in the project configuration directory instead of
+using `OPENCODE_CONFIG_CONTENT`. The `{env:VAR}` placeholders are expanded by OpenCode. This setup works with
+DeepSeek, GLM, or another service that exposes an OpenAI-compatible API; only `MODEL`, `URL`, and `APIKEY` change.
+
+OpenCode uses its normal data and session database locations. Do not override `XDG_DATA_HOME`, `XDG_STATE_HOME`, or
+the OpenCode config directory if the observable binary must share sessions with a regular OpenCode installation.
+
+#### Interactive sessions
+
+Enable semantic tracing before starting the session. Use a stable case ID when a session may be resumed later:
+
+```bash
+export OPENCODE_CASE_TRACE=1
+export OPENCODE_CASE_ID=my-case-001
+export OPENCODE_CASE_TRACE_DIR=/tmp/opencode-traces
+
+cd /path/to/your/project
+opencode
+```
+
+To resume a normal OpenCode session, use the same command-line option as upstream OpenCode:
+
+```bash
+opencode -s ses_XXXXXXXXXXXXXXXX
+```
+
+Press `Ctrl-C` to leave the interactive UI. The runtime keeps append-only segment journals while the session is
+running; it does not repeatedly rebuild the large `trace.json` or `trace.html` snapshot.
+
+#### HTTP server sessions
+
+The HTTP server uses the same tracing environment and the same session database:
+
+```bash
+export OPENCODE_CASE_TRACE=1
+export OPENCODE_CASE_ID=http-case-001
+export OPENCODE_CASE_TRACE_DIR=/tmp/opencode-traces
+
+opencode serve --hostname 127.0.0.1 --port 4096
+```
+
+In another terminal, create a session and send a prompt. The directory header tells the server which project should
+own the session:
+
+```bash
+BASE=http://127.0.0.1:4096
+PROJECT=/path/to/your/project
+SESSION_ID=$(curl -fsS -X POST "$BASE/session" \
+  -H "x-opencode-directory: $PROJECT" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq -r .id)
+
+curl -N -X POST "$BASE/session/$SESSION_ID/prompt" \
+  -H "x-opencode-directory: $PROJECT" \
+  -H "Content-Type: application/json" \
+  -d '{"parts":[{"type":"text","text":"Inspect the repository and summarize the build flow."}]}'
+```
+
+Stop the server after the request completes. Both interactive and HTTP execution write the same case layout:
+
+```text
+/tmp/opencode-traces/http-case-001/
+├── session.json
+├── segments/<segment-id>/records.jsonl
+├── segments/<segment-id>/artifacts/*
+└── segments/<segment-id>/index.sqlite
+```
+
+#### Finalize and inspect a trace
+
+`trace.json` and `trace.html` are generated after execution, by an explicit offline step:
+
+```bash
+CASE_DIR=/tmp/opencode-traces/my-case-001
+
+# Rebuild the canonical Causal IR. Safe to run again after a resumed session.
+opencode trace finalize "$CASE_DIR"
+
+# Generate the human-readable HTML view. The output path is positional.
+opencode trace render "$CASE_DIR" "$CASE_DIR/trace.html"
+```
+
+The case directory then contains `trace.json` for offline analysis, `manifest.json`, `partial/latest.json`,
+`provenance-trace.json`, and `trace.html` for human inspection. Large inputs and outputs remain in `artifacts/` and
+are referenced from the structured trace. A later session with the same case ID can append new segments; running
+`finalize` again updates the unified trace.
+
+`SIGINT`, `SIGTERM`, and `SIGHUP` close the active segment before the process exits. `SIGKILL` cannot be caught, so
+finalize may report an incomplete segment while preserving all journal records already written to disk.
+
 ### Desktop App (BETA)
 
 OpenCode is also available as a desktop application. Download directly from the [releases page](https://github.com/anomalyco/opencode/releases) or [opencode.ai/download](https://opencode.ai/download).
