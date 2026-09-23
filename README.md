@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
   <a href="https://www.npmjs.com/package/opencode-ai"><img alt="npm" src="https://img.shields.io/npm/v/opencode-ai?style=flat-square" /></a>
-  <a href="https://github.com/anomalyco/opencode/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opencode/publish.yml?style=flat-square&branch=dev" /></a>
+  <a href="https://github.com/zyscoder/observable-opencode/actions/workflows/release-observable-opencode.yml"><img alt="Observable release status" src="https://img.shields.io/github/actions/workflow/status/zyscoder/observable-opencode/release-observable-opencode.yml?style=flat-square" /></a>
 </p>
 
 <p align="center">
@@ -63,6 +63,25 @@ nix run nixpkgs#opencode           # or github:anomalyco/opencode for latest dev
 
 > [!TIP]
 > Remove versions older than 0.1.x before installing.
+
+### Observable Releases
+
+This fork publishes the latest OpenCode baseline with semantic trace instrumentation from the
+[`release-observable-opencode`](.github/workflows/release-observable-opencode.yml) workflow.
+
+To publish the current branch manually:
+
+1. Open the [release workflow](https://github.com/zyscoder/observable-opencode/actions/workflows/release-observable-opencode.yml).
+2. Select **Run workflow** and choose the branch to release.
+3. Leave `version` empty to generate `1.18.31-observable.<run_number>`, or provide a version without the leading `v`.
+
+The workflow creates a GitHub Release and uploads executable archives for Linux, macOS, and Windows targets.
+The same archives are also available as workflow artifacts. Release assets use `.tar.gz` on Linux and `.zip` on
+macOS and Windows.
+
+The current release source is the repository default branch. The generated executable is named `opencode` inside
+each platform archive and includes the complete semantic trace instrumentation described in
+[`docs/opencode-latest-trace.md`](docs/opencode-latest-trace.md).
 
 ### Desktop App (BETA)
 
